@@ -102,7 +102,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             ClearCharts();
 
             this.progress = ProgressFactory.Create(applicationStatusMediator, "Hocus Focus");
-
+/*
             LoadSavedAutoFocusRunCommand = new AsyncRelayCommand(() => {
                 string path = "";
                 using (var dialog = new System.Windows.Forms.FolderBrowserDialog()) {
@@ -119,6 +119,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                 return Task.Run(() => LoadSavedAutoFocusRun(path));
             });
             CancelLoadSavedAutoFocusRunCommand = new RelayCommand(CancelLoadSavedAutoFocusRun);
+*/
         }
 
         private readonly IAlglibAPI alglibAPI;

@@ -422,7 +422,7 @@ namespace NINA.Joko.Plugins.HocusFocus.Utility {
              */
 
             int size = (1 << (dyadicLayer + 2)) + 1;
-            var bicubicWavelet2D = new Mat(new Size(1, size), MatType.CV_32F, 0.0d);
+            var bicubicWavelet2D = new Mat(new Size(1, size), MatType.CV_32F, new Scalar(0.0));
             // Each successive layer is downsampled 2x. Rather than copy the matrix to convolve it, we can pad
             // the separated filter with zeroes
             unsafe {
@@ -443,7 +443,10 @@ namespace NINA.Joko.Plugins.HocusFocus.Utility {
         public static Mat Rescale(Mat src, float min = 0.0f, float max = 1.0f) {
             Cv2.MinMaxIdx(src, out double dataMin, out double dataMax);
             var scalingDenominator = dataMax - dataMin;
-            return src.Subtract(dataMin).Divide(scalingDenominator).ToMat();
+            Mat dst = new();
+            Cv2.Subtract(src, new Scalar(dataMin), dst);
+            Cv2.Divide(dst, new Scalar(scalingDenominator), dst);
+            return dst;
         }
 
         public static Mat SubtractInPlace(Mat lhs, Mat rhs, float min = 0.0f, float max = 1.0f) {

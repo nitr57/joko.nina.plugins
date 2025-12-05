@@ -105,10 +105,10 @@ namespace NINA.Joko.Plugins.HocusFocus {
             ResetStarDetectionDefaultsCommand = new RelayCommand(StarDetectionOptions.ResetDefaults);
             ResetStarAnnotatorDefaultsCommand = new RelayCommand(StarAnnotatorOptions.ResetDefaults);
             ResetAutoFocusDefaultsCommand = new RelayCommand(AutoFocusOptions.ResetDefaults);
-            ChooseIntermediatePathDiagCommand = new RelayCommand(ChooseIntermediatePathDiag);
-            ChooseSavePathDiagCommand = new RelayCommand(ChooseSavePathDiag);
+//            ChooseIntermediatePathDiagCommand = new RelayCommand(ChooseIntermediatePathDiag);
+//            ChooseSavePathDiagCommand = new RelayCommand(ChooseSavePathDiag);
         }
-
+/*
         private void ChooseIntermediatePathDiag() {
             using (var dialog = new System.Windows.Forms.FolderBrowserDialog()) {
                 dialog.SelectedPath = StarDetectionOptions.IntermediateSavePath;
@@ -128,7 +128,7 @@ namespace NINA.Joko.Plugins.HocusFocus {
                 }
             }
         }
-
+*/
         private Task ImageSaveMediator_BeforeFinalizeImageSaved(object sender, BeforeFinalizeImageSavedEventArgs e) {
             var hfAnalysis = (e.Image?.RawImageData?.StarDetectionAnalysis as HocusFocusStarDetectionAnalysis);
             if (hfAnalysis != null) {

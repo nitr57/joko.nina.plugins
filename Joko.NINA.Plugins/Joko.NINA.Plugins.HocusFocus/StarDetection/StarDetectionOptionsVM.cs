@@ -35,9 +35,9 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection {
             ImageGeometry = (System.Windows.Media.GeometryGroup)dict["HocusFocusDetectStarsSVG"];
             ImageGeometry.Freeze();
 
-            ChooseIntermediatePathDiagCommand = new RelayCommand(ChooseIntermediatePathDiag);
+//            ChooseIntermediatePathDiagCommand = new RelayCommand(ChooseIntermediatePathDiag);
         }
-
+/*
         private void ChooseIntermediatePathDiag(object obj) {
             using (var dialog = new System.Windows.Forms.FolderBrowserDialog()) {
                 dialog.SelectedPath = StarDetectionOptions.IntermediateSavePath;
@@ -47,7 +47,7 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection {
                 }
             }
         }
-
+*/
         public override bool IsTool { get; } = true;
 
         public StarDetectionOptions StarDetectionOptions { get; private set; }

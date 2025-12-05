@@ -67,7 +67,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
     [PartCreationPolicy(CreationPolicy.Shared)]
     [Export(typeof(IDockableVM))]
     [Export]
-    public class InspectorVM : DockableVM, IScottPlotController, ICameraConsumer, IFocuserConsumer, ITelescopeConsumer {
+    public class InspectorVM : DockableVM, ICameraConsumer, IFocuserConsumer, ITelescopeConsumer {
         private static readonly FocusPointComparer focusPointComparer = new FocusPointComparer();
         private static readonly PlotPointComparer plotPointComparer = new PlotPointComparer();
 
@@ -551,17 +551,11 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             }
 
             {
-                double[] xs = DataGen.Range(0, numRegionsWide);
-                double[] ys = DataGen.Range(0, numRegionsTall);
-                var vectors = new SPVector2[numRegionsWide, numRegionsTall];
-                var centerXs = new double[numRegionsWide * numRegionsTall];
-                var centerYs = new double[numRegionsWide * numRegionsTall];
                 var eccentricities = new double[numRegionsWide * numRegionsTall];
                 var rotations = new double[numRegionsWide * numRegionsTall];
 
                 double scalingFactor = 2.5;
                 int pointIndex = 0;
-                double maxMagnitude = 0.0d;
                 for (int regionRow = 0; regionRow < numRegionsTall; ++regionRow) {
                     for (int regionCol = 0; regionCol < numRegionsWide; ++regionCol) {
                         var detectedStars = regionDetectedStars[regionCol, regionRow];
@@ -575,64 +569,18 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                             double x = Math.Cos(psfRotationWeightedMean) * scaledEccentricity;
                             // Since y is inverted to render top-down, we must also invert the y part of the angle vector
                             double y = -Math.Sin(psfRotationWeightedMean) * scaledEccentricity;
-                            vectors[regionCol, regionRow] = new Vector2(x, y);
                             eccentricities[pointIndex] = eccentricityMedian;
                             rotations[pointIndex] = Angle.ByRadians(psfRotationWeightedMean).Degree;
-                            maxMagnitude = Math.Max(scaledEccentricity, maxMagnitude);
                         } else {
                             eccentricities[pointIndex] = double.NaN;
                             rotations[pointIndex] = double.NaN;
                         }
-                        centerXs[pointIndex] = regionCol;
-                        centerYs[pointIndex++] = regionRow;
                     }
                 }
 
-                var backgroundColor = GetColorFromBrushResource("BackgroundBrush", DrawingColor.White);
-                var secondaryBackgroundColor = GetColorFromBrushResource("SecondaryBackgroundBrush", DrawingColor.Gray);
-                var primaryColor = GetColorFromBrushResource("PrimaryBrush", DrawingColor.Black);
-                var secondaryColor = GetColorFromBrushResource("SecondaryBrush", DrawingColor.Red);
-
-                var plot = new SPPlot();
-                plot.Style(dataBackground: secondaryBackgroundColor, figureBackground: backgroundColor, tick: secondaryColor, grid: secondaryColor, axisLabel: primaryColor, titleLabel: primaryColor);
-
-                ScottPlot.Drawing.Colormap colormap = null;
-                if (InspectorOptions.EccentricityColorMapEnabled) {
-                    colormap = new ScottPlot.Drawing.Colormap(new LinearColormap("G2R", DrawingColor.Green, DrawingColor.GreenYellow, DrawingColor.Red));
-                }
-
-                // maxMagnitude * 1.2 is taken from the ScottPlot code to ensure no vector scaling takes place
-                var vectorField = new HFVectorField(vectors, xs, ys, colormap: colormap, scaleFactor: maxMagnitude * 1.2 * 1.5, colorScaleMin: 0.3 * 0.3 * scalingFactor, colorScaleMax: 0.6 * 0.6 * scalingFactor, defaultColor: primaryColor);
-                plot.Add(vectorField);
-
-                // Scatter points act as anchor points for mouse over events
-                var scatterPoints = plot.AddScatterPoints(centerXs, centerYs);
-                scatterPoints.IsVisible = false;
-
-                vectorField.ScaledArrowheadLength = 0;
-                vectorField.ScaledArrowheadWidth = 0;
-                vectorField.ScaledArrowheads = true;
-                vectorField.LineWidth = 3;
-                vectorField.Anchor = ArrowAnchor.Center;
-
-                var highlightedPoint = plot.AddPoint(0, 0);
-
-                highlightedPoint.Color = secondaryColor;
-                highlightedPoint.MarkerSize = 7;
-                highlightedPoint.MarkerShape = ScottPlot.MarkerShape.filledCircle;
-                highlightedPoint.IsVisible = false;
-                highlightedPoint.TextFont.Color = primaryColor;
-                highlightedPoint.TextFont.Bold = true;
-
-                plot.XAxis.Ticks(false);
-                plot.YAxis.Ticks(false);
-
                 lastHighlightedEccentricityPointIndex = -1;
-                highlightedEccentricityPoint = highlightedPoint;
-                eccentricityCenterPoints = scatterPoints;
                 eccentricityValues = eccentricities;
                 rotationValues = rotations;
-                EccentricityVectorPlot = plot;
             }
         }
 
@@ -722,6 +670,8 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             string selectedPath = "";
             SavedAutoFocusAttempt savedAttempt;
             try {
+                throw new NotImplementedException();
+/*
                 using (var dialog = new System.Windows.Forms.FolderBrowserDialog()) {
                     if (!String.IsNullOrEmpty(autoFocusOptions.LastSelectedLoadPath)) {
                         dialog.SelectedPath = autoFocusOptions.LastSelectedLoadPath;
@@ -735,6 +685,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                 }
 
                 savedAttempt = autoFocusEngine.LoadSavedAutoFocusAttempt(selectedPath);
+*/
             } catch (Exception e) {
                 Notification.ShowError(e.Message);
                 Logger.Error($"Failed to load saved auto focus attempt from {selectedPath}");
@@ -1287,42 +1238,6 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             } else {
                 return null;
             }
-        }
-
-        public void OnMouseMove(object sender, System.Windows.Input.MouseEventArgs e) {
-            var plotControl = (WpfPlot)sender;
-            var plotName = plotControl.Name;
-            if (eccentricityCenterPoints == null) {
-                return;
-            }
-
-            (double mouseCoordX, double mouseCoordY) = plotControl.GetMouseCoordinates();
-            double xyRatio = plotControl.Plot.XAxis.Dims.PxPerUnit / plotControl.Plot.YAxis.Dims.PxPerUnit;
-            (double pointX, double pointY, int pointIndex) = eccentricityCenterPoints.GetPointNearest(mouseCoordX, mouseCoordY, xyRatio);
-
-            // place the highlight over the point of interest
-            highlightedEccentricityPoint.X = pointX;
-            highlightedEccentricityPoint.Y = pointY;
-            highlightedEccentricityPoint.IsVisible = true;
-            highlightedEccentricityPoint.Text = $"{eccentricityValues[pointIndex]:0.00}, {rotationValues[pointIndex]:0.}°";
-
-            // render if the highlighted point changed
-            if (lastHighlightedEccentricityPointIndex != pointIndex) {
-                lastHighlightedEccentricityPointIndex = pointIndex;
-                RefreshScottPlot(plotName);
-            }
-        }
-
-        public void OnMouseLeave(object sender, System.Windows.Input.MouseEventArgs e) {
-            var plotControl = (WpfPlot)sender;
-            var plotName = plotControl.Name;
-            if (highlightedEccentricityPoint == null) {
-                return;
-            }
-
-            lastHighlightedEccentricityPointIndex = -1;
-            highlightedEccentricityPoint.IsVisible = false;
-            RefreshScottPlot(plotName);
         }
 
         private void RefreshScottPlot(string plotName) {
