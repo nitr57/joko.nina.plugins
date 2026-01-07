@@ -85,5 +85,6 @@
     <Exec Command="cp $(TargetDir)alglib.net.dll $HOME/.local/share/NINA/Plugins/3.0.0/Hocus\ Focus/" />
     <Exec Command="cp $(TargetDir)ILNumerics*.dll $HOME/.local/share/NINA/Plugins/3.0.0/Hocus\ Focus/" />
     <Exec Command="cp $(TargetDir)ScottPlot.dll $HOME/.local/share/NINA/Plugins/3.0.0/Hocus\ Focus/" />
+    <Exec Command="cp $(TargetDir)MathNet.Numerics.dll $HOME/.local/share/NINA/Plugins/3.0.0/Hocus\ Focus/" />
   </Target>
 </Project>
