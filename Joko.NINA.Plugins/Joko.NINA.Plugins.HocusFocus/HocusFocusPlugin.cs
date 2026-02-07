@@ -160,6 +160,8 @@ namespace NINA.Joko.Plugins.HocusFocus {
 
         public static IAlglibAPI AlglibAPI { get; private set; }
 
+        public static InspectorVM InspectorVM { get; internal set; }
+
         public ICommand ResetStarDetectionDefaultsCommand { get; private set; }
 
         public ICommand ResetStarAnnotatorDefaultsCommand { get; private set; }

@@ -22,6 +22,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
         [ImportingConstructor]
         public InspectorVMFactory(InspectorVM inspectorVM) {
             this.inspectorVM = inspectorVM;
+            HocusFocusPlugin.InspectorVM = inspectorVM;
         }
 
         public InspectorVM Create() {
