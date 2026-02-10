@@ -670,22 +670,28 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             string selectedPath = "";
             SavedAutoFocusAttempt savedAttempt;
             try {
-                throw new NotImplementedException();
-/*
-                using (var dialog = new System.Windows.Forms.FolderBrowserDialog()) {
-                    if (!String.IsNullOrEmpty(autoFocusOptions.LastSelectedLoadPath)) {
-                        dialog.SelectedPath = autoFocusOptions.LastSelectedLoadPath;
-                    }
-                    if (dialog.ShowDialog() != System.Windows.Forms.DialogResult.OK) {
+                // Check if a directory was selected from the dropdown in the web UI
+                if (!string.IsNullOrEmpty(HocusFocusPlugin.SelectedAFDirectory)) {
+                    // The selected directory is relative (e.g. AutoFocus_20260207_232705/attempt01)
+                    // We need to combine it with the SavePath to get the absolute path
+                    var relativePath = HocusFocusPlugin.SelectedAFDirectory;
+                    var savePath = autoFocusOptions.SavePath;
+
+                    if (string.IsNullOrEmpty(savePath)) {
+                        Notification.ShowError("AutoFocus SavePath is not configured");
+                        Logger.Error("AutoFocus SavePath is not configured");
                         return false;
                     }
 
-                    selectedPath = dialog.SelectedPath;
+                    selectedPath = Path.Combine(savePath, relativePath);
                     autoFocusOptions.LastSelectedLoadPath = selectedPath;
+                    Logger.Info($"Using AutoFocus directory from web UI selection: {selectedPath}");
+                    HocusFocusPlugin.SelectedAFDirectory = null; // Clear after using
+                } else {
+                    return false;
                 }
 
                 savedAttempt = autoFocusEngine.LoadSavedAutoFocusAttempt(selectedPath);
-*/
             } catch (Exception e) {
                 Notification.ShowError(e.Message);
                 Logger.Error($"Failed to load saved auto focus attempt from {selectedPath}");
