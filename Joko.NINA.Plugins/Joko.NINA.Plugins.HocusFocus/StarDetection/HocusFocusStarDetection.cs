@@ -195,6 +195,8 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection {
 
     public class HocusFocusDetectedStar : DetectedStar {
         public PSFModel PSF { get; set; }
+        public float NormalisedBrightness { get; set; }
+        public Accord.Point OriginalPosition { get; set; }
 
         public override string ToString() {
             return $"{{{nameof(PSF)}={PSF}, {nameof(HFR)}={HFR.ToString()}, {nameof(Position)}={Position.ToString()}, {nameof(AverageBrightness)}={AverageBrightness.ToString()}, {nameof(MaxBrightness)}={MaxBrightness.ToString()}, {nameof(Background)}={Background.ToString()}, {nameof(BoundingBox)}={BoundingBox.ToString()}}}";
@@ -394,7 +396,8 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection {
                 }
             }
 
-            result.StarList = starList.Select(s => ToDetectedStar(s)).ToList();
+            // TODO: Consider whether to remove the ordering to get reproducibility between runs
+            result.StarList = starList.Select(s => ToDetectedStar(s)).OrderBy(s => s.Position.Y * imageSize.Width + s.Position.X).ToList();
             if (starList.Count > 1) {
                 if (this.starDetectionOptions.MeasurementAverage == MeasurementAverageEnum.MeanOutliers) {
                     result.AverageHFR = starList.Average(s => s.HFR);
