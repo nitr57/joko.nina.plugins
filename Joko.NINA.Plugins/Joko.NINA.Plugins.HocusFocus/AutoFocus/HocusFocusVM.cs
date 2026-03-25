@@ -68,6 +68,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
         private readonly IProgress<ApplicationStatus> progress;
         private readonly IPluggableBehaviorSelector<IStarDetection> starDetectionSelector;
         public static readonly string ReportDirectory = Path.Combine(CoreUtil.APPLICATIONTEMPPATH, "AutoFocus");
+        public static HocusFocusVM Current { get; private set; }
 
         static HocusFocusVM() {
             if (!Directory.Exists(ReportDirectory)) {
@@ -100,6 +101,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             PlotFocusPoints = new AsyncObservableCollection<DataPoint>();
             PlotRejectedFocusPoints = new AsyncObservableCollection<ScatterPoint>();
             ClearCharts();
+            Current = this;
 
             this.progress = ProgressFactory.Create(applicationStatusMediator, "Hocus Focus");
 /*
