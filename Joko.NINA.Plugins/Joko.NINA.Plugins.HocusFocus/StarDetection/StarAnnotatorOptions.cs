@@ -1,7 +1,7 @@
 ﻿#region "copyright"
 
 /*
-    Copyright © 2021 - 2021 George Hilios <ghilios+NINA@googlemail.com>
+    Copyright © 2021 - 2026 George Hilios <ghilios+NINA@googlemail.com>
 
     This Source Code Form is subject to the terms of the Mozilla Public
     License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -21,17 +21,24 @@ using System.Windows.Media;
 namespace NINA.Joko.Plugins.HocusFocus.StarDetection {
 
     public class StarAnnotatorOptions : BaseINPC, IStarAnnotatorOptions {
-        private readonly PluginOptionsAccessor optionsAccessor;
+        private readonly IPluginOptionsAccessor optionsAccessor;
 
-        public StarAnnotatorOptions(IProfileService profileService) {
+        public StarAnnotatorOptions(IProfileService profileService)
+            : this(profileService, CreateDefaultAccessor(profileService)) {
+        }
+
+        internal StarAnnotatorOptions(IProfileService profileService, IPluginOptionsAccessor optionsAccessor) {
+            this.optionsAccessor = optionsAccessor ?? throw new ArgumentNullException(nameof(optionsAccessor));
+            profileService.ProfileChanged += ProfileService_ProfileChanged;
+            InitializeOptions();
+        }
+
+        private static IPluginOptionsAccessor CreateDefaultAccessor(IProfileService profileService) {
             var guid = PluginOptionsAccessor.GetAssemblyGuid(typeof(StarDetectionOptions));
             if (guid == null) {
                 throw new Exception($"Guid not found in assembly metadata");
             }
-
-            this.optionsAccessor = new PluginOptionsAccessor(profileService, guid.Value);
-            profileService.ProfileChanged += ProfileService_ProfileChanged;
-            InitializeOptions();
+            return new PluginOptionsAccessor(profileService, guid.Value);
         }
 
         private void ProfileService_ProfileChanged(object sender, EventArgs e) {

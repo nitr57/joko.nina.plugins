@@ -1,7 +1,7 @@
 ﻿#region "copyright"
 
 /*
-    Copyright © 2021 - 2021 George Hilios <ghilios+NINA@googlemail.com>
+    Copyright © 2021 - 2026 George Hilios <ghilios+NINA@googlemail.com>
 
     This Source Code Form is subject to the terms of the Mozilla Public
     License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -93,9 +93,10 @@ namespace NINA.Joko.Plugins.HocusFocus.Utility {
             }
             Array.Sort(valuesArray);
 
-            var mad = 1.483 * valuesArray.Length % 2 == 0
+            var medianAbsoluteDeviation = valuesArray.Length % 2 == 0
               ? (valuesArray[valuesArray.Length / 2 - 1] + valuesArray[valuesArray.Length / 2]) / 2.0
               : valuesArray[valuesArray.Length / 2];
+            var mad = 1.483 * medianAbsoluteDeviation;
             return (median, mad);
         }
 
@@ -145,6 +146,11 @@ namespace NINA.Joko.Plugins.HocusFocus.Utility {
             var t2 = t * t;
             var grubbZLimit = (double)(N - 1) / Math.Sqrt(N) * Math.Sqrt(t2 / (t2 + N - 2));
 
+            if (errorsStdDev == 0.0) {
+                // Perfect fit: no outliers possible.
+                return null;
+            }
+
             var maxError = errors.Select((e, i) => (e, i)).MaxBy(v => Math.Abs(v.e));
             var maxErrorZScore = Math.Abs(maxError.e) / errorsStdDev;
             if (maxErrorZScore < grubbZLimit) {
@@ -153,7 +159,7 @@ namespace NINA.Joko.Plugins.HocusFocus.Utility {
             return points[maxError.i];
         }
 
-        public static double CalcDistance(Point2D p1, Point2D p2) {
+        public static double CalcSquaredDistance(Point2D p1, Point2D p2) {
             return (p2.X - p1.X) * (p2.X - p1.X) + (p2.Y - p1.Y) * (p2.Y - p1.Y);
         }
     }

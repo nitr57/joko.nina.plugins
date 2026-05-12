@@ -1,7 +1,7 @@
 ﻿#region "copyright"
 
 /*
-    Copyright © 2021 - 2021 George Hilios <ghilios+NINA@googlemail.com>
+    Copyright © 2021 - 2026 George Hilios <ghilios+NINA@googlemail.com>
 
     This Source Code Form is subject to the terms of the Mozilla Public
     License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -25,7 +25,7 @@ namespace NINA.Joko.Plugins.HocusFocus.Converters {
 
         public object Convert(object value, Type targetType, object parameter, CultureInfo culture) {
             switch (value) {
-                case double i when i == double.NaN:
+                case double i when double.IsNaN(i):
                     return "--";
 
                 case double i:

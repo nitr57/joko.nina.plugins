@@ -1,7 +1,7 @@
 ﻿#region "copyright"
 
 /*
-    Copyright © 2021 - 2021 George Hilios <ghilios+NINA@googlemail.com>
+    Copyright © 2021 - 2026 George Hilios <ghilios+NINA@googlemail.com>
 
     This Source Code Form is subject to the terms of the Mozilla Public
     License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -108,7 +108,7 @@ namespace NINA.Joko.Plugins.HocusFocus.Utility {
 
                 foreach (var referenceStar in referenceStars) {
                     if (Math.Abs(imageStar.NormalisedBrightness - referenceStar.NormalisedBrightness) <= relativeBrightnessDiff) {
-                        double distance2 = MathUtility.CalcDistance(imageStar, referenceStar);
+                        double distance2 = MathUtility.CalcSquaredDistance(imageStar, referenceStar);
 
                         if (distance2 < bestDistance && distance2 < maxDistance2) {
                             bestDistance = distance2;
@@ -292,7 +292,7 @@ namespace NINA.Joko.Plugins.HocusFocus.Utility {
                 var searchArea = new Rect2d(pt.X - searchSquareSide, pt.Y - searchSquareSide, searchSquareSide * 2, searchSquareSide * 2);
                 var nearbyPoints = point2Ds
                     .Where(p => !pointsUsed.Contains(p) && searchArea.Contains(p.X, p.Y) && (p != pt))
-                    .OrderByDescending(p => MathUtility.CalcDistance(p, pt))
+                    .OrderByDescending(p => MathUtility.CalcSquaredDistance(p, pt))
                     .ToList();
                 if (onePerPoint) {
                     if (nearbyPoints.Count > 2) {
@@ -437,7 +437,7 @@ namespace NINA.Joko.Plugins.HocusFocus.Utility {
                 double inlierDistanceTotal = 0;
                 for (int j = 0; j < srcPoints.Count; j++) {
                     var transformedPoint = transform.Transform(srcPoints[j]);
-                    double distance = MathUtility.CalcDistance(transformedPoint, dstPoints[j]);
+                    double distance = MathUtility.CalcSquaredDistance(transformedPoint, dstPoints[j]);
                     if (distance < inlierThreshold) {
                         inlierIndices.Add(j);
                         inlierDistanceTotal += distance;
@@ -515,7 +515,7 @@ namespace NINA.Joko.Plugins.HocusFocus.Utility {
                 double inlierDistanceTotal = 0;
                 for (int j = 0; j < srcPoints.Count; j++) {
                     var transformedPoint = transform.Transform(srcPoints[j]);
-                    double distance = MathUtility.CalcDistance(transformedPoint, dstPoints[j]);
+                    double distance = MathUtility.CalcSquaredDistance(transformedPoint, dstPoints[j]);
                     if (distance < inlierThreshold) {
                         inlierIndices.Add(j);
                         inlierDistanceTotal += distance;

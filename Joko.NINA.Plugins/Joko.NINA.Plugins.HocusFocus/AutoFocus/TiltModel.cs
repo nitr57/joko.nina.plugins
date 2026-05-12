@@ -1,7 +1,7 @@
 ﻿#region "copyright"
 
 /*
-    Copyright © 2021 - 2021 George Hilios <ghilios+NINA@googlemail.com>
+    Copyright © 2021 - 2026 George Hilios <ghilios+NINA@googlemail.com>
 
     This Source Code Form is subject to the terms of the Mozilla Public
     License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -37,7 +37,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             double topRightPosition,
             double bottomLeftPosition,
             double bottomRightPosition) {
-            if (imageSize.Width == 0 || imageSize.Height <= 0) {
+            if (imageSize.Width <= 0 || imageSize.Height <= 0) {
                 throw new ArgumentException($"ImageSize ({imageSize.Width}, {imageSize.Height}) dimensions must be positive");
             }
 

@@ -1,19 +1,7 @@
 ﻿#region "copyright"
 
 /*
-    Copyright © 2021 - 2021 George Hilios <ghilios+NINA@googlemail.com>
-
-    This Source Code Form is subject to the terms of the Mozilla Public
-    License, v. 2.0. If a copy of the MPL was not distributed with this
-    file, You can obtain one at http://mozilla.org/MPL/2.0/.
-*/
-
-#endregion "copyright"
-
-#region "copyright"
-
-/*
-    Copyright © 2021 - 2025 George Hilios <ghilios+NINA@googlemail.com>
+    Copyright © 2021 - 2026 George Hilios <ghilios+NINA@googlemail.com>
 
     This Source Code Form is subject to the terms of the Mozilla Public
     License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -23,15 +11,19 @@
 #endregion "copyright"
 
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+
+// Allow the test project to access internal types
+[assembly: InternalsVisibleTo("Joko.NINA.Plugins.HocusFocus.Tests")]
 
 // [MANDATORY] The following GUID is used as a unique identifier of the plugin
 [assembly: Guid("0f1d10b6-d306-4168-b751-d454cbac9670")]
 
 // [MANDATORY] The assembly versioning
 //Should be incremented for each new release build of a plugin
-[assembly: AssemblyVersion("3.0.0.25")]
-[assembly: AssemblyFileVersion("3.0.0.25")]
+[assembly: AssemblyVersion("3.0.0.27")]
+[assembly: AssemblyFileVersion("3.0.0.27")]
 
 // [MANDATORY] The name of your plugin
 [assembly: AssemblyTitle("Hocus Focus")]
@@ -44,7 +36,7 @@ using System.Runtime.InteropServices;
 [assembly: AssemblyCompany("George Hilios (jokogeo)")]
 // The product name that this plugin is part of
 [assembly: AssemblyProduct("Hocus Focus")]
-[assembly: AssemblyCopyright("Copyright ©  2025")]
+[assembly: AssemblyCopyright("Copyright ©  2026")]
 
 // The minimum Version of N.I.N.A. that this plugin is compatible with
 [assembly: AssemblyMetadata("MinimumApplicationVersion", "3.2.0.2001")]
@@ -68,7 +60,7 @@ using System.Runtime.InteropServices;
 [assembly: AssemblyMetadata("ChangelogURL", "https://github.com/ghilios/joko.nina.plugins/commits/develop")]
 
 //[Optional] The url to a featured logo that will be displayed in the plugin list next to the name
-[assembly: AssemblyMetadata("FeaturedImageURL", "")]
+[assembly: AssemblyMetadata("FeaturedImageURL", "https://github.com/ghilios/joko.nina.plugins/releases/download/downloads/HocusFocus.jpg")]
 //[Optional] A url to an example screenshot of your plugin in action
 [assembly: AssemblyMetadata("ScreenshotURL", "")]
 //[Optional] An additional url to an example example screenshot of your plugin in action

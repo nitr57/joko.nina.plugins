@@ -1,7 +1,7 @@
 ﻿#region "copyright"
 
 /*
-    Copyright © 2021 - 2021 George Hilios <ghilios+NINA@googlemail.com>
+    Copyright © 2021 - 2026 George Hilios <ghilios+NINA@googlemail.com>
 
     This Source Code Form is subject to the terms of the Mozilla Public
     License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -342,8 +342,7 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection {
                             psfResolution: p.PSFResolution,
                             detectedStar: detectedStar,
                             srcImage: srcImage,
-                            pixelScale: p.PixelScale,
-                            useILNumerics: p.UseILNumerics);
+                            pixelScale: p.PixelScale);
                         PSFModel psf = null;
                         try {
                             psf = PSFModeler.Solve(modeler, useAbsoluteResiduals: p.UsePSFAbsoluteDeviation, noiseSigma: noiseSigma, ct: ct);
