@@ -60,7 +60,7 @@
   </ItemGroup>
   <ItemGroup Condition="$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::Linux)))">
     <ProjectReference Include="..\..\..\..\NINA.Plugin\NINA.Plugin.csproj" />
-    <ProjectReference Include="..\..\..\System.Windows.Compat\System.Windows.Compat.csproj" />
+    <ProjectReference Include="..\..\..\..\System.Windows.Compat\System.Windows.Compat.csproj" />
     <PackageReference Include="System.Drawing.Common" Version="*" ExcludeAssets="all" />
     <PackageReference Include="ScottPlot" Version="4.1.59" />
   </ItemGroup>
