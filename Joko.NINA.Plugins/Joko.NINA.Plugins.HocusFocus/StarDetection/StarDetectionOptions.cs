@@ -149,6 +149,8 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection {
             noiseReductionRadius = optionsAccessor.GetValueInt32("NoiseReductionRadius", 3);
             noiseClippingMultiplier = optionsAccessor.GetValueDouble("NoiseClippingMultiplier", 4.0);
             starClippingMultiplier = optionsAccessor.GetValueDouble("StarClippingMultiplier", 2.0);
+            contaminationSensitivity = optionsAccessor.GetValueDouble("ContaminationSensitivity", 5.0);
+            rejectContaminatedStars = optionsAccessor.GetValueBoolean("RejectContaminatedStars", true);
             structureLayers = optionsAccessor.GetValueInt32("StructureLayers", 4);
             brightnessSensitivity = optionsAccessor.GetValueDouble("BrightnessSensitivity", 10.0);
             starPeakResponse = optionsAccessor.GetValueDouble("StarPeakResponse", 0.75);
@@ -175,6 +177,7 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection {
             hotpixelThreshold = optionsAccessor.GetValueDouble(nameof(HotpixelThreshold), 0.001d);
             saturationThreshold = optionsAccessor.GetValueDouble(nameof(SaturationThreshold), 0.99d);
             measurementAverage = optionsAccessor.GetValueEnum<MeasurementAverageEnum>(nameof(MeasurementAverage), MeasurementAverageEnum.Median);
+            psfPixelIntegration = optionsAccessor.GetValueBoolean(nameof(PSFPixelIntegration), false);
             ConfigureSimpleSettings();
         }
 
@@ -193,6 +196,8 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection {
             NoiseReductionRadius = 3;
             NoiseClippingMultiplier = 4.0;
             StarClippingMultiplier = 2.0;
+            ContaminationSensitivity = 5.0;
+            RejectContaminatedStars = true;
             StructureLayers = 4;
             BrightnessSensitivity = 10.0;
             StarPeakResponse = 0.6;
@@ -216,6 +221,7 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection {
             HotpixelThreshold = 0.001d;
             SaturationThreshold = 0.99d;
             MeasurementAverage = MeasurementAverageEnum.Median;
+            PSFPixelIntegration = false;
         }
 
         private bool debugMode;
@@ -398,6 +404,33 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection {
         }
 
         private double starClippingMultiplier;
+
+        private double contaminationSensitivity;
+        public double ContaminationSensitivity {
+            get => contaminationSensitivity;
+            set {
+                if (value < 0.0) {
+                    value = 0.0;
+                }
+                if (contaminationSensitivity != value) {
+                    contaminationSensitivity = value;
+                    optionsAccessor.SetValueDouble("ContaminationSensitivity", contaminationSensitivity);
+                    RaisePropertyChanged();
+                }
+            }
+        }
+
+        private bool rejectContaminatedStars;
+        public bool RejectContaminatedStars {
+            get => rejectContaminatedStars;
+            set {
+                if (rejectContaminatedStars != value) {
+                    rejectContaminatedStars = value;
+                    optionsAccessor.SetValueBoolean("RejectContaminatedStars", rejectContaminatedStars);
+                    RaisePropertyChanged();
+                }
+            }
+        }
 
         public double StarClippingMultiplier {
             get => starClippingMultiplier;
@@ -719,5 +752,19 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection {
                 }
             }
         }
+
+        private bool psfPixelIntegration;
+
+        public bool PSFPixelIntegration {
+            get => psfPixelIntegration;
+            set {
+                if (psfPixelIntegration != value) {
+                    psfPixelIntegration = value;
+                    optionsAccessor.SetValueBoolean(nameof(PSFPixelIntegration), psfPixelIntegration);
+                    RaisePropertyChanged();
+                }
+            }
+        }
+
     }
 }

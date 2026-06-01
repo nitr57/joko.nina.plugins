@@ -62,7 +62,10 @@ namespace NINA.Joko.Plugins.HocusFocus.Interfaces {
         PSFBackground,
 
         [Description("PSF Peak")]
-        PSFPeak
+        PSFPeak,
+
+        [Description("Moffat Beta")]
+        MoffatBeta
     }
 
     public interface IStarAnnotatorOptions : INotifyPropertyChanged {
@@ -95,5 +98,7 @@ namespace NINA.Joko.Plugins.HocusFocus.Interfaces {
         bool ShowLowSensitivity { get; set; }
         bool ShowNotCentered { get; set; }
         bool ShowTooFlat { get; set; }
+        bool ShowContaminated { get; set; }
+        Color ContaminatedColor { get; set; }
     }
 }

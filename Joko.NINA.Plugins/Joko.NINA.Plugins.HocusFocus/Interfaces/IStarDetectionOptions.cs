@@ -85,6 +85,8 @@ namespace NINA.Joko.Plugins.HocusFocus.Interfaces {
         int NoiseReductionRadius { get; set; }
         double NoiseClippingMultiplier { get; set; }
         double StarClippingMultiplier { get; set; }
+        double ContaminationSensitivity { get; set; }
+        bool RejectContaminatedStars { get; set; }
         int StructureLayers { get; set; }
         double BrightnessSensitivity { get; set; }
         double StarPeakResponse { get; set; }
@@ -108,5 +110,6 @@ namespace NINA.Joko.Plugins.HocusFocus.Interfaces {
         double HotpixelThreshold { get; set; }
         double SaturationThreshold { get; set; }
         MeasurementAverageEnum MeasurementAverage { get; set; }
+        bool PSFPixelIntegration { get; set; }
     }
 }

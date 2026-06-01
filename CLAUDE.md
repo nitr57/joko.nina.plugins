@@ -37,7 +37,8 @@ Camera images may be mirrored horizontally and/or vertically depending on the op
 
 ## Plans Workflow
 
-- All implementation plans are saved in the `plans/` folder with a meaningful filename based on the plan goal (e.g., `plans/tilt-adapter-screw-calibration-wizard.md`).
+- **Every new plan MUST be written to the `plans/` folder** — never leave a plan only in chat, in another directory, or in a scratch file. This applies to all plans regardless of size or how they were produced (planning mode, brainstorming, ad-hoc requests, etc.).
+- Use a meaningful filename based on the plan goal (e.g., `plans/tilt-adapter-screw-calibration-wizard.md`).
 - **Clear your Claude Code context (`/clear`) before executing a plan** to avoid stale context from the planning session affecting implementation.
 - The user will explicitly say when a plan is ready to execute.
 
@@ -272,6 +273,15 @@ public class InspectorOptions : BaseINPC, IInspectorOptions {
 | `GetValueBoolean` / `SetValueBoolean` | `bool` |
 | `GetValueString` / `SetValueString` | `string` |
 | `GetValueEnum<T>` / `SetValueEnum<T>` | any `enum` |
+
+### Options UI Requirement
+
+Every new option added to `StarDetectionOptions` (or any other options class) **must** also have a corresponding UI control in `Resources/OptionsDataTemplates.xaml`. Options that are not exposed in the UI are invisible to users and cannot be tuned.
+
+- Boolean options → `CheckBox` bound to `StarDetectionOptions.<PropertyName>`
+- Double/numeric options → `ninactrl:UnitTextBox` with a `DoubleRangeRule` validation
+- Enum options → `ComboBox` with `util:EnumBindingSource` and `HF_EnumStaticDescriptionValueConverter`
+- Add a tooltip `TextBlock` resource (key: `<PropertyName>_Tooltip`) near the other tooltips at the top of `OptionsDataTemplates.xaml`
 
 ---
 
@@ -577,6 +587,77 @@ public class MathUtilityTests {
 
 The test project links shared source files directly (e.g., `MathUtility.cs`) rather than referencing the plugin assembly.
 
+### Star Detection Metrics UI Requirement
+
+Every new field added to `StarDetectorMetrics` (rejection counts, flags, etc.) **must** also be displayed in the star detection metrics panel in `AutoFocus/DataTemplates.xaml`. The metrics panel uses a `UniformGrid Columns="2"` with `StackPanel` pairs. Add new entries using the `HF_ZeroToDoubleDashConverter` pattern:
+
+```xaml
+<StackPanel Orientation="Horizontal">
+    <TextBlock Width="120" VerticalAlignment="Center" Text="My Metric" />
+    <TextBlock Width="70" HorizontalAlignment="Center" VerticalAlignment="Center"
+        Text="{Binding Metrics.MyMetricField, Converter={StaticResource HF_ZeroToDoubleDashConverter}}" />
+</StackPanel>
+```
+
+---
+
+## Gradient-Robust Contamination Test + Local Background Plane
+
+The star detector's contamination test is **gradient-robust** (`StarDetector.ComputeGradientContamination`):
+for each star it fits a robust plane `b0 + b1·dx + b2·dy` to the background-annulus pixels via IRLS (Huber)
+to model a smooth one-sided background (galaxy/nebula gradient), subtracts it, then flags a star **only** when
+a single octant shows a one-sided **positive** residual excess above `ContaminationSensitivity` sigma — a
+contaminant adds light, so this ignores both smooth gradients (removed by the fit) and edge-clip deficits
+(negative). The fitted plane (`LocalBackgroundPlane`, carried on `Star.BackgroundPlane`) doubles as the
+**local background** used per-pixel for centroid, flux, HFR, and PSF, so a gradient no longer biases any
+measurement; for flat fields the plane equals the annulus median (no change). The PSF fit has the gradient
+*tilt* removed before fitting (zero at the star center, so the amplitude and fitted background `B` are
+unaffected) for cleaner sigma/FWHM/eccentricity.
+
+- **Quality gate**: `StarDetectorParams.RejectContaminatedStars` (option `StarDetectionOptions.
+  RejectContaminatedStars`, **default ON**) rejects contaminated stars (metric `ContaminationRejected`);
+  when off they are kept and only flagged (`Star.StarContaminationSuspected`, metric `ContaminationSuspected`).
+- The legacy opposite-sector-median test was removed (it tripped on smooth gradients). Validated on M31 +
+  Pleiades: the gradient-robust test drops smooth-gradient/edge false positives and recovers real faint
+  companions that an opposing gradient had masked.
+
+### Headless diagnostic (`TestApp`)
+
+`TestApp` doubles as a **self-contained, headless diagnostic** for the contamination test. Use it to
+root-cause / re-tune **without launching NINA** — it loads the user's real NINA profile and builds params via
+`HocusFocusStarDetection.BuildStarDetectorParams` (the single options→params source of truth), then runs
+detection with per-star diagnostics enabled and `RejectContaminatedStars=false` (so contaminated stars are
+retained for analysis).
+
+**Run it** (WSL interop runs the Windows `.exe` directly, so paths with spaces quote cleanly):
+
+```bash
+./Joko.NINA.Plugins/TestApp/bin/Debug/net8.0-windows7.0/TestApp.exe \
+  contamination --image "C:\path\to\image.xisf" --out "C:\temp\hf-diag"
+```
+
+- Build first: `cmd.exe /c "dotnet build Joko.NINA.Plugins\TestApp\TestApp.csproj -c Debug --nologo"`.
+- Args: `--image <path>` (req; `.xisf`/`.fits`/`.tif`), `--profile-id <guid>` (default: active profile),
+  `--out <dir>` (default `%LOCALAPPDATA%\NINA\Logs\hf-diag\<timestamp>`), `--sensitivity <double>` (override),
+  `--sensitivity-sweep <a,b,step>` (per-value CSVs → `sweep.csv`).
+- No `--image`/`contamination` arg ⇒ TestApp launches its normal WPF GUI instead.
+
+**Outputs** (in `--out`): `contamination_stars.csv` (one row per accepted star — center, HFR, background
+(plane value at center), σ used, `ContaminationSuspected`, gradient-robust fields `GradientSlope`/
+`LocalSigmaResidual`/`MaxSectorResidualOverSE`/`ResidualTrippingSector`, per-octant `resid*`/`residCount*`,
+and per-star shape/proximity `Eccentricity`/`FWHMx`/`FWHMy`/`FWHMPixels`/`ThetaDeg`/`NearestNeighborDist`/
+`NearestNeighborOverHfr`/`HasCloseNeighbor`/`PsfFitOk`); `contamination_summary.txt` (settings + flag rate +
+a flagged-vs-clean profile + `MaxSectorResidualOverSE` distribution); `contamination_annotated.png` (green =
+clean, magenta = flagged-with-close-neighbor, cyan = flagged-isolated); `gr_sweep.csv` (flag rate + flagged
+set's median gradient slope/eccentricity vs sensitivity, from a single run); plus verbose TRACE in
+`%LOCALAPPDATA%\NINA\Logs`.
+
+**How the diagnostics hook works (off by default, zero overhead):** set
+`StarDetectorParams.CollectContaminationDiagnostics = true` and read
+`HocusFocusStarDetectorResult.ContaminationDiagnostics` (a `List<ContaminationDiagnosticRecord>`). When the
+flag is false the detector fills no per-sector residual arrays and skips the diagnostic record (the plane fit
++ decision always run, since they are the production background/contamination path).
+
 ---
 
 ## Key File Locations
@@ -594,6 +675,9 @@ The test project links shared source files directly (e.g., `MathUtility.cs`) rat
 | VM DataTemplates | `Joko.NINA.Plugins.HocusFocus/AutoFocus/DataTemplates.xaml` |
 | Options templates | `Joko.NINA.Plugins.HocusFocus/Resources/OptionsDataTemplates.xaml` |
 | Version (AssemblyInfo) | `Joko.NINA.Plugins.HocusFocus/Properties/AssemblyInfo.cs` |
+| Contamination diagnostic runner | `TestApp/ContaminationDiagnosticRunner.cs` |
+| Options→params source of truth | `Joko.NINA.Plugins.HocusFocus/StarDetection/HocusFocusStarDetection.cs` (`BuildStarDetectorParams`) |
+| Contamination decision + background plane | `Joko.NINA.Plugins.HocusFocus/StarDetection/StarDetector.cs` (`ComputeGradientContamination`) |
 
 ---
 

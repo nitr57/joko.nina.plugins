@@ -35,6 +35,11 @@
     <TextBlock x:Key="SensorROI_Tooltip" Text="Uses only a centered portion of the full sensor when evaluating aberration. This is useful if you have a flattener that cannot produce a flat field for your sensor." />
     <TextBlock x:Key="CornersROI_Tooltip" Text="Reduces the size of the corner regions when performing corners analysis. This can be useful if you want to evaluate only stars closer to the corners than the full 1/9th region. This can be combined with Sensor ROI." />
 
+    <TextBlock x:Key="HyperbolicMinimumStdError_Tooltip" Text="σ(focus): the standard error of the best-focus position, in focuser steps, propagated from the hyperbolic fit's covariance. This is the parametric uncertainty estimate (it assumes the model is correct and the measurement errors are Gaussian) and is the quantity that most directly indicates how well the run pinned down focus. Smaller is better. Computed for every fit model (the Uneven Blend model reports se(x0), since its best focus is exactly x0). Shown as — only when the fit is too degenerate to localize focus (e.g. a near-monotonic curve). The leave-one-out stability below is the non-parametric alternative available for every model." />
+    <TextBlock x:Key="HyperbolicReducedChiSquared_Tooltip" Text="Reduced χ² (χ² per degree of freedom) of the hyperbolic fit. ≈1 means the model fits the measured curve to within the per-point measurement uncertainties. It is a true reduced χ² only when the weighted hyperbolic fit is enabled (per-point σ from the HFR error bars); without weighting it degenerates to the residual sum of squares per degree of freedom, whose absolute scale is rig-dependent. Because the per-point σ is approximate, reduced χ² routinely runs above 1 even for good fits." />
+    <TextBlock x:Key="HyperbolicLeaveOneOutStdError_Tooltip" Text="Best-focus stability from leave-one-out refitting: the standard deviation, in focuser steps, of the predicted best-focus position across refits that each drop one measurement. This is a non-parametric robustness estimate — it shows how much the answer moves if any single point is removed. When it is much larger than the parametric σ(focus), it flags a single high-leverage point or model misspecification. Unlike σ(focus) it is available for every fit model (including Uneven Blend). Diagnostic only; it is not a rejection gate." />
+    <TextBlock x:Key="SelectedHyperbolicFitModel_Tooltip" Text="The hyperbolic model used to fit this run. For a fixed model it is that model; for the Hybrid (Best Fit) option it is the concrete model selected for this run — the one with the least expected error for the best-focus position. Shown whenever a hyperbolic fit is used." />
+
     <TextBlock x:Key="SensorModel_Tilt_Tooltip" Text="The angle the sensor is tilted. 0 indicates no tilt, and values here are typically very small" />
     <TextBlock x:Key="SensorModel_CriticalFocus_Tooltip" Text="The focuser distance a pixel can be from optimal focus before the effects can be noticed. This value increases with larger (slower) F/ratios, which can tolerate more curvature before affecting image quality" />
     <TextBlock x:Key="SensorModel_CurvatureRadius_Tooltip" Text="Near focus, the base of the sensor parabola is close to a sphere. This value represents the radius of that sphere. Larger values indicate flatter curves, which are better." />
@@ -43,8 +48,41 @@
     <TextBlock x:Key="SensorModel_TiltEffect_Tooltip" Text="The maximum nominal distance from the corners of the sensor to the center, due purely to the modeled tilt." />
     <TextBlock x:Key="SensorModel_AutoFocusOffset_Tooltip" Text="The number of focuser steps between the AutoFocus position and the Sensor Mean Focuser Position. You can set this value in the AF Offset setting in Auto Focus Options." />
     <TextBlock x:Key="SensorModel_StarsInModel_Tooltip" Text="The number of stars used in the sensor model. Each star needs to be matched across at least 5 of the frames, and some star fits are rejected as outliers during modeling." />
+    <TextBlock x:Key="SensorModel_ReducedChiSquared_Tooltip" Text="Reduced χ² measures how well the model fits the per-star best-focus positions relative to their estimated uncertainties (≈1 means it fits within measurement error). The per-star σ is approximate and does not capture model error, so reduced χ² routinely runs far above 1 even for good fits and its absolute scale is rig-dependent. It is shown for information and is only used as a rejection criterion when the R² is also very low." />
     <TextBlock x:Key="InterpolationEnabled_Tooltip" Text="Use interpolated points evenly spaced along a grid instead of the individual stars themselves. This should improve consistency of results and prevent overfitting where there are more stars." />
     <TextBlock x:Key="FixedSensorCenter_Tooltip" Text="Assume the sensor is perfectly centered in the optical train. If this option is off, the sensor location will be modeled along with the other model parameters." />
+
+    <!--  Star Detection Results pane: statistics  -->
+    <TextBlock x:Key="SDR_NrStars_Tooltip" Text="The number of stars that passed all filters and were used to compute these statistics." />
+    <TextBlock x:Key="SDR_HFR_Tooltip" Text="Half-Flux Radius — the radius within which half of a star's total flux falls, averaged across all detected stars. Lower values indicate sharper focus." />
+    <TextBlock x:Key="SDR_HFRStdDev_Tooltip" Text="The spread of HFR across the detected stars (standard deviation, or median absolute deviation when median averaging is used). Lower values indicate more uniform focus across the field." />
+    <TextBlock x:Key="SDR_PSFType_Tooltip" Text="The point-spread-function model fitted to each star (for example Gaussian or Moffat)." />
+    <TextBlock x:Key="SDR_PSFRSquared_Tooltip" Text="Goodness of fit of the PSF model, from 0 to 1. Values near 1 indicate the model closely matches the measured star profiles." />
+    <TextBlock x:Key="SDR_FWHM_Tooltip" Text="Full Width at Half Maximum of the fitted PSF, in arcseconds. A measure of focus and seeing quality; lower is sharper." />
+    <TextBlock x:Key="SDR_FWHMMAD_Tooltip" Text="Median absolute deviation of FWHM across stars, indicating how consistent the FWHM is across the field." />
+    <TextBlock x:Key="SDR_Eccentricity_Tooltip" Text="How elongated the stars are, from 0 (perfectly round) to 1 (a line). Elevated values can indicate tracking error, sensor tilt, or coma." />
+    <TextBlock x:Key="SDR_EccentricityMAD_Tooltip" Text="Median absolute deviation of eccentricity across stars, indicating how consistent star roundness is across the field." />
+    <TextBlock x:Key="SDR_Sigma_Tooltip" Text="The fitted PSF standard deviation (σ) in pixels — the Gaussian width that FWHM is derived from." />
+    <TextBlock x:Key="SDR_PixelScale_Tooltip" Text="The image scale in arcseconds per pixel, used to convert pixel measurements to arcseconds." />
+
+    <!--  Star Detection Results pane: detection metrics  -->
+    <TextBlock x:Key="SDR_TotalDetected_Tooltip" Text="The number of stars that were accepted after all rejection filters were applied." />
+    <TextBlock x:Key="SDR_StructureCandidates_Tooltip" Text="The number of bright structures evaluated as potential stars before any rejection filters." />
+    <TextBlock x:Key="SDR_TooSmall_Tooltip" Text="Candidates rejected because their bounding box was smaller than the minimum star size." />
+    <TextBlock x:Key="SDR_OnBorder_Tooltip" Text="Candidates rejected because they touched the edge of the image or detection region." />
+    <TextBlock x:Key="SDR_TooDistorted_Tooltip" Text="Candidates rejected because too little of their bounding box was filled — the shape was too irregular to be a reliable star." />
+    <TextBlock x:Key="SDR_Degenerate_Tooltip" Text="Candidates rejected because their pixels were too uniform to compute reliable star parameters (this happens most often near the image border)." />
+    <TextBlock x:Key="SDR_Saturated_Tooltip" Text="Stars containing saturated (clipped) pixels. These are not rejected — their saturated pixels are masked during PSF fitting." />
+    <TextBlock x:Key="SDR_LowSensitivity_Tooltip" Text="Candidates rejected for being too faint relative to the background noise to measure reliably." />
+    <TextBlock x:Key="SDR_NotCentered_Tooltip" Text="Candidates rejected because their measured centroid was too far from the center of the bounding box." />
+    <TextBlock x:Key="SDR_TooFlat_Tooltip" Text="Candidates rejected because their profile was too flat — the median was too close to the peak to be a real, peaked star." />
+    <TextBlock x:Key="SDR_TooLowHFR_Tooltip" Text="Stars rejected because their HFR was below the minimum threshold (typically hot pixels or noise spikes)." />
+    <TextBlock x:Key="SDR_HFRAnalysisFailed_Tooltip" Text="Stars that passed detection but failed during HFR measurement." />
+    <TextBlock x:Key="SDR_OutsideROI_Tooltip" Text="Candidates rejected because they fell outside the configured region of interest." />
+    <TextBlock x:Key="SDR_PSFFailed_Tooltip" Text="Stars whose PSF model fit failed or did not meet the R² goodness-of-fit threshold." />
+    <TextBlock x:Key="SDR_SaturatedPixels_Tooltip" Text="The total number of saturated (clipped) pixels encountered across all detected stars." />
+    <TextBlock x:Key="SDR_Hotpixels_Tooltip" Text="The number of hot pixels identified and filtered out during detection." />
+    <TextBlock x:Key="SDR_Contaminated_Tooltip" Text="Stars flagged as contaminated by a localized neighbor or hot column (after the smooth local background gradient is removed). With 'Reject Contaminated Stars' enabled they are rejected; otherwise they are kept and only flagged." />
 
     <DataTemplate x:Key="NINA.Joko.Plugins.HocusFocus.AutoFocus.HocusFocusVM_Dockable">
         <Grid>
@@ -110,6 +148,15 @@
                         MarkerStroke="Red"
                         MarkerStrokeThickness="2"
                         MarkerSize="10" />
+                    <!--  Horizontal error bar (ErrorX = σ(focus), or LOO fallback) on the final calculated point.  -->
+                    <oxy:ScatterErrorSeries
+                        DataFieldX="FocusPosition"
+                        DataFieldY="HFR"
+                        ErrorBarColor="{Binding Path=Color, Source={StaticResource NotificationErrorBrush}}"
+                        ErrorBarStopWidth="4"
+                        ErrorBarStrokeThickness="2"
+                        ItemsSource="{Binding PlotFinalFocusPointWithError}"
+                        MarkerType="None" />
                 </oxy:Plot.Series>
                 <oxy:Plot.Annotations>
                     <oxy:LineAnnotation Intercept="{Binding TrendlineFitting.LeftTrend.Offset}" Slope="{Binding TrendlineFitting.LeftTrend.Slope}">
@@ -440,6 +487,80 @@
                         <MultiBinding Converter="{StaticResource HF_AutoFocusFittingToVisibilityConverter}">
                             <Binding>
                                 <Binding.Source>
+                                    <s:String>HyperbolicFitting</s:String>
+                                </Binding.Source>
+                            </Binding>
+                            <Binding Path="AutoFocusChartMethod" />
+                            <Binding Path="AutoFocusChartCurveFitting" />
+                            <Binding Path="GaussianFitting" />
+                            <Binding Path="HyperbolicFitting" />
+                            <Binding Path="QuadraticFitting" />
+                            <Binding Path="TrendlineFitting" />
+                        </MultiBinding>
+                    </UniformGrid.Visibility>
+                    <TextBlock Text="Hyperbolic σ(focus)" ToolTip="{StaticResource HyperbolicMinimumStdError_Tooltip}" />
+                    <TextBlock Margin="5,0,0,0" ToolTip="{StaticResource HyperbolicMinimumStdError_Tooltip}" Text="{Binding HyperbolicFitting.MinimumStdError, StringFormat=± {0:0.#} steps, Converter={StaticResource NaNToDoubleDashConverter}}" />
+                </UniformGrid>
+                <UniformGrid
+                    Margin="0,5,0,0"
+                    VerticalAlignment="Center"
+                    Columns="2">
+                    <UniformGrid.Visibility>
+                        <MultiBinding Converter="{StaticResource HF_AutoFocusFittingToVisibilityConverter}">
+                            <Binding>
+                                <Binding.Source>
+                                    <s:String>HyperbolicFitting</s:String>
+                                </Binding.Source>
+                            </Binding>
+                            <Binding Path="AutoFocusChartMethod" />
+                            <Binding Path="AutoFocusChartCurveFitting" />
+                            <Binding Path="GaussianFitting" />
+                            <Binding Path="HyperbolicFitting" />
+                            <Binding Path="QuadraticFitting" />
+                            <Binding Path="TrendlineFitting" />
+                        </MultiBinding>
+                    </UniformGrid.Visibility>
+                    <TextBlock Text="Hyperbolic Reduced χ²" ToolTip="{StaticResource HyperbolicReducedChiSquared_Tooltip}" />
+                    <TextBlock Margin="5,0,0,0" ToolTip="{StaticResource HyperbolicReducedChiSquared_Tooltip}" Text="{Binding HyperbolicFitting.ReducedChiSquared, StringFormat=\{0:0.00\}, Converter={StaticResource NaNToDoubleDashConverter}}" />
+                </UniformGrid>
+                <UniformGrid
+                    Margin="0,5,0,0"
+                    VerticalAlignment="Center"
+                    Columns="2">
+                    <UniformGrid.Visibility>
+                        <MultiBinding Converter="{StaticResource HF_AutoFocusFittingToVisibilityConverter}">
+                            <Binding>
+                                <Binding.Source>
+                                    <s:String>HyperbolicFitting</s:String>
+                                </Binding.Source>
+                            </Binding>
+                            <Binding Path="AutoFocusChartMethod" />
+                            <Binding Path="AutoFocusChartCurveFitting" />
+                            <Binding Path="GaussianFitting" />
+                            <Binding Path="HyperbolicFitting" />
+                            <Binding Path="QuadraticFitting" />
+                            <Binding Path="TrendlineFitting" />
+                        </MultiBinding>
+                    </UniformGrid.Visibility>
+                    <TextBlock Text="Best-focus stability (LOO)" ToolTip="{StaticResource HyperbolicLeaveOneOutStdError_Tooltip}" />
+                    <TextBlock Margin="5,0,0,0" ToolTip="{StaticResource HyperbolicLeaveOneOutStdError_Tooltip}" Text="{Binding HyperbolicFitting.LeaveOneOutStdError, StringFormat=± {0:0.#} steps, Converter={StaticResource NaNToDoubleDashConverter}}" />
+                </UniformGrid>
+                <UniformGrid
+                    Margin="0,5,0,0"
+                    VerticalAlignment="Center"
+                    Columns="2"
+                    Visibility="{Binding SelectedHyperbolicFitModel, Converter={StaticResource HF_NullToVisibilityCollapsedConverter}}">
+                    <TextBlock Text="Hyperbolic model" ToolTip="{StaticResource SelectedHyperbolicFitModel_Tooltip}" />
+                    <TextBlock Margin="5,0,0,0" ToolTip="{StaticResource SelectedHyperbolicFitModel_Tooltip}" Text="{Binding SelectedHyperbolicFitModel, Converter={StaticResource HF_EnumStaticDescriptionValueConverter}}" />
+                </UniformGrid>
+                <UniformGrid
+                    Margin="0,5,0,0"
+                    VerticalAlignment="Center"
+                    Columns="2">
+                    <UniformGrid.Visibility>
+                        <MultiBinding Converter="{StaticResource HF_AutoFocusFittingToVisibilityConverter}">
+                            <Binding>
+                                <Binding.Source>
                                     <s:String>Trendline</s:String>
                                 </Binding.Source>
                             </Binding>
@@ -505,9 +626,10 @@
                         <UniformGrid Columns="2">
                             <StackPanel Orientation="Horizontal">
                                 <TextBlock
-                                    Width="100"
+                                    Width="120"
                                     VerticalAlignment="Center"
-                                    Text="{ns:Loc LblNrStars}" />
+                                    Text="{ns:Loc LblNrStars}"
+                                    ToolTip="{StaticResource SDR_NrStars_Tooltip}" />
                                 <TextBlock
                                     Width="70"
                                     HorizontalAlignment="Center"
@@ -518,9 +640,10 @@
                         <UniformGrid Columns="2">
                             <StackPanel Orientation="Horizontal">
                                 <TextBlock
-                                    Width="100"
+                                    Width="120"
                                     VerticalAlignment="Center"
-                                    Text="{ns:Loc LblHFR}" />
+                                    Text="{ns:Loc LblHFR}"
+                                    ToolTip="{StaticResource SDR_HFR_Tooltip}" />
                                 <TextBlock
                                     Width="70"
                                     HorizontalAlignment="Center"
@@ -530,9 +653,10 @@
                             </StackPanel>
                             <StackPanel Orientation="Horizontal">
                                 <TextBlock
-                                    Width="100"
+                                    Width="120"
                                     VerticalAlignment="Center"
-                                    Text="{Binding Statistics.StarDetectionAnalysis.MeasurementAverage, Mode=OneWay, Converter={StaticResource HF_MeasurementAverageDisplayConverter}}" />
+                                    Text="{Binding Statistics.StarDetectionAnalysis.MeasurementAverage, Mode=OneWay, Converter={StaticResource HF_MeasurementAverageDisplayConverter}}"
+                                    ToolTip="{StaticResource SDR_HFRStdDev_Tooltip}" />
                                 <TextBlock
                                     Width="70"
                                     HorizontalAlignment="Center"
@@ -543,21 +667,22 @@
                         <UniformGrid Columns="2">
                             <StackPanel Orientation="Horizontal">
                                 <TextBlock
-                                    Width="100"
+                                    Width="120"
                                     VerticalAlignment="Center"
-                                    Text="PSF Type" />
+                                    Text="PSF Type"
+                                    ToolTip="{StaticResource SDR_PSFType_Tooltip}" />
                                 <TextBlock
-                                    Width="70"
-                                    HorizontalAlignment="Center"
+                                    HorizontalAlignment="Left"
                                     VerticalAlignment="Center"
                                     Text="{Binding PSFType, Mode=OneWay, Converter={StaticResource HF_EnumStaticDescriptionValueConverter}}"
                                     Visibility="{Binding FWHM, Mode=OneWay, Converter={StaticResource NaNToVisibilityConverter}}" />
                             </StackPanel>
                             <StackPanel Orientation="Horizontal">
                                 <TextBlock
-                                    Width="100"
+                                    Width="120"
                                     VerticalAlignment="Center"
-                                    Text="PSF R²" />
+                                    Text="PSF R²"
+                                    ToolTip="{StaticResource SDR_PSFRSquared_Tooltip}" />
                                 <TextBlock
                                     Width="70"
                                     HorizontalAlignment="Center"
@@ -568,9 +693,10 @@
                         <UniformGrid Columns="2">
                             <StackPanel Orientation="Horizontal">
                                 <TextBlock
-                                    Width="100"
+                                    Width="120"
                                     VerticalAlignment="Center"
-                                    Text="FWHM" />
+                                    Text="FWHM"
+                                    ToolTip="{StaticResource SDR_FWHM_Tooltip}" />
                                 <TextBlock
                                     Width="70"
                                     HorizontalAlignment="Center"
@@ -580,9 +706,10 @@
                             </StackPanel>
                             <StackPanel Orientation="Horizontal">
                                 <TextBlock
-                                    Width="100"
+                                    Width="120"
                                     VerticalAlignment="Center"
-                                    Text="FWHM MAD" />
+                                    Text="FWHM MAD"
+                                    ToolTip="{StaticResource SDR_FWHMMAD_Tooltip}" />
                                 <TextBlock
                                     Width="70"
                                     HorizontalAlignment="Center"
@@ -593,9 +720,10 @@
                         <UniformGrid Columns="2">
                             <StackPanel Orientation="Horizontal">
                                 <TextBlock
-                                    Width="100"
+                                    Width="120"
                                     VerticalAlignment="Center"
-                                    Text="Eccentricity" />
+                                    Text="Eccentricity"
+                                    ToolTip="{StaticResource SDR_Eccentricity_Tooltip}" />
                                 <TextBlock
                                     Width="70"
                                     HorizontalAlignment="Center"
@@ -604,9 +732,10 @@
                             </StackPanel>
                             <StackPanel Orientation="Horizontal">
                                 <TextBlock
-                                    Width="100"
+                                    Width="120"
                                     VerticalAlignment="Center"
-                                    Text="Eccentricity MAD" />
+                                    Text="Eccentricity MAD"
+                                    ToolTip="{StaticResource SDR_EccentricityMAD_Tooltip}" />
                                 <TextBlock
                                     Width="70"
                                     HorizontalAlignment="Center"
@@ -617,9 +746,10 @@
                         <UniformGrid Columns="2">
                             <StackPanel Orientation="Horizontal">
                                 <TextBlock
-                                    Width="100"
+                                    Width="120"
                                     VerticalAlignment="Center"
-                                    Text="Sigma" />
+                                    Text="Sigma"
+                                    ToolTip="{StaticResource SDR_Sigma_Tooltip}" />
                                 <TextBlock
                                     Width="70"
                                     HorizontalAlignment="Center"
@@ -628,9 +758,10 @@
                             </StackPanel>
                             <StackPanel Orientation="Horizontal">
                                 <TextBlock
-                                    Width="100"
+                                    Width="120"
                                     VerticalAlignment="Center"
-                                    Text="Pixel Scale" />
+                                    Text="Pixel Scale"
+                                    ToolTip="{StaticResource SDR_PixelScale_Tooltip}" />
                                 <TextBlock
                                     Width="70"
                                     HorizontalAlignment="Center"
@@ -649,7 +780,8 @@
                                 <TextBlock
                                     Width="120"
                                     VerticalAlignment="Center"
-                                    Text="Total Detected" />
+                                    Text="Total Detected"
+                                    ToolTip="{StaticResource SDR_TotalDetected_Tooltip}" />
                                 <TextBlock
                                     Width="70"
                                     HorizontalAlignment="Center"
@@ -660,7 +792,8 @@
                                 <TextBlock
                                     Width="120"
                                     VerticalAlignment="Center"
-                                    Text="Structure Candidates" />
+                                    Text="Structure Candidates"
+                                    ToolTip="{StaticResource SDR_StructureCandidates_Tooltip}" />
                                 <TextBlock
                                     Width="70"
                                     HorizontalAlignment="Center"
@@ -673,7 +806,8 @@
                                 <TextBlock
                                     Width="120"
                                     VerticalAlignment="Center"
-                                    Text="Too Small" />
+                                    Text="Too Small"
+                                    ToolTip="{StaticResource SDR_TooSmall_Tooltip}" />
                                 <TextBlock
                                     Width="70"
                                     HorizontalAlignment="Center"
@@ -684,7 +818,8 @@
                                 <TextBlock
                                     Width="120"
                                     VerticalAlignment="Center"
-                                    Text="On Border" />
+                                    Text="On Border"
+                                    ToolTip="{StaticResource SDR_OnBorder_Tooltip}" />
                                 <TextBlock
                                     Width="70"
                                     HorizontalAlignment="Center"
@@ -697,7 +832,8 @@
                                 <TextBlock
                                     Width="120"
                                     VerticalAlignment="Center"
-                                    Text="Too Distorted" />
+                                    Text="Too Distorted"
+                                    ToolTip="{StaticResource SDR_TooDistorted_Tooltip}" />
                                 <TextBlock
                                     Width="70"
                                     HorizontalAlignment="Center"
@@ -708,7 +844,8 @@
                                 <TextBlock
                                     Width="120"
                                     VerticalAlignment="Center"
-                                    Text="Degenerate" />
+                                    Text="Degenerate"
+                                    ToolTip="{StaticResource SDR_Degenerate_Tooltip}" />
                                 <TextBlock
                                     Width="70"
                                     HorizontalAlignment="Center"
@@ -721,7 +858,8 @@
                                 <TextBlock
                                     Width="120"
                                     VerticalAlignment="Center"
-                                    Text="Saturated" />
+                                    Text="Saturated"
+                                    ToolTip="{StaticResource SDR_Saturated_Tooltip}" />
                                 <TextBlock
                                     Width="70"
                                     HorizontalAlignment="Center"
@@ -732,7 +870,8 @@
                                 <TextBlock
                                     Width="120"
                                     VerticalAlignment="Center"
-                                    Text="Low Sensitivity" />
+                                    Text="Low Sensitivity"
+                                    ToolTip="{StaticResource SDR_LowSensitivity_Tooltip}" />
                                 <TextBlock
                                     Width="70"
                                     HorizontalAlignment="Center"
@@ -745,7 +884,8 @@
                                 <TextBlock
                                     Width="120"
                                     VerticalAlignment="Center"
-                                    Text="Not Centered" />
+                                    Text="Not Centered"
+                                    ToolTip="{StaticResource SDR_NotCentered_Tooltip}" />
                                 <TextBlock
                                     Width="70"
                                     HorizontalAlignment="Center"
@@ -756,7 +896,8 @@
                                 <TextBlock
                                     Width="120"
                                     VerticalAlignment="Center"
-                                    Text="Too Flat" />
+                                    Text="Too Flat"
+                                    ToolTip="{StaticResource SDR_TooFlat_Tooltip}" />
                                 <TextBlock
                                     Width="70"
                                     HorizontalAlignment="Center"
@@ -769,7 +910,8 @@
                                 <TextBlock
                                     Width="120"
                                     VerticalAlignment="Center"
-                                    Text="HFR Too Low" />
+                                    Text="HFR Too Low"
+                                    ToolTip="{StaticResource SDR_TooLowHFR_Tooltip}" />
                                 <TextBlock
                                     Width="70"
                                     HorizontalAlignment="Center"
@@ -780,7 +922,8 @@
                                 <TextBlock
                                     Width="120"
                                     VerticalAlignment="Center"
-                                    Text="Failed Star Analysis" />
+                                    Text="Failed Star Analysis"
+                                    ToolTip="{StaticResource SDR_HFRAnalysisFailed_Tooltip}" />
                                 <TextBlock
                                     Width="70"
                                     HorizontalAlignment="Center"
@@ -793,7 +936,8 @@
                                 <TextBlock
                                     Width="120"
                                     VerticalAlignment="Center"
-                                    Text="Outside ROI" />
+                                    Text="Outside ROI"
+                                    ToolTip="{StaticResource SDR_OutsideROI_Tooltip}" />
                                 <TextBlock
                                     Width="70"
                                     HorizontalAlignment="Center"
@@ -804,7 +948,8 @@
                                 <TextBlock
                                     Width="120"
                                     VerticalAlignment="Center"
-                                    Text="PSF Failed" />
+                                    Text="PSF Failed"
+                                    ToolTip="{StaticResource SDR_PSFFailed_Tooltip}" />
                                 <TextBlock
                                     Width="70"
                                     HorizontalAlignment="Center"
@@ -817,7 +962,8 @@
                                 <TextBlock
                                     Width="120"
                                     VerticalAlignment="Center"
-                                    Text="Saturated Pixels" />
+                                    Text="Saturated Pixels"
+                                    ToolTip="{StaticResource SDR_SaturatedPixels_Tooltip}" />
                                 <TextBlock
                                     Width="70"
                                     HorizontalAlignment="Center"
@@ -828,12 +974,27 @@
                                 <TextBlock
                                     Width="120"
                                     VerticalAlignment="Center"
-                                    Text="Hotpixels" />
+                                    Text="Hotpixels"
+                                    ToolTip="{StaticResource SDR_Hotpixels_Tooltip}" />
                                 <TextBlock
                                     Width="70"
                                     HorizontalAlignment="Center"
                                     VerticalAlignment="Center"
                                     Text="{Binding Metrics.HotpixelCount, Converter={StaticResource HF_ZeroToDoubleDashConverter}}" />
+                            </StackPanel>
+                        </UniformGrid>
+                        <UniformGrid Columns="2">
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock
+                                    Width="120"
+                                    VerticalAlignment="Center"
+                                    Text="Contaminated"
+                                    ToolTip="{StaticResource SDR_Contaminated_Tooltip}" />
+                                <TextBlock
+                                    Width="70"
+                                    HorizontalAlignment="Center"
+                                    VerticalAlignment="Center"
+                                    Text="{Binding Metrics.ContaminationSuspected, Converter={StaticResource HF_ZeroToDoubleDashConverter}}" />
                             </StackPanel>
                         </UniformGrid>
                     </StackPanel>
@@ -1515,7 +1676,8 @@
                                     Grid.Column="0"
                                     Margin="5"
                                     VerticalAlignment="Center"
-                                    Text="Align images before matching" />
+                                    Text="Align images before matching"
+                                    ToolTip="When on, each frame's stars are aligned to the reference frame (using a RANSAC similarity transform) before they are matched, correcting for small drift, rotation, or flexure between exposures in the autofocus run. Enable this when there is movement between frames; it allows stars to be matched with a tighter search radius and generally produces a more reliable model." />
                                 <StackPanel
                                     Grid.Row="0"
                                     Grid.Column="1"
@@ -1523,11 +1685,28 @@
                                     <CheckBox Margin="5,0,0,0" IsChecked="{Binding InspectorOptions.UseRANSAC}" />
                                 </StackPanel>
                                 <TextBlock
+                                    Grid.Row="0"
+                                    Grid.Column="2"
+                                    Margin="5"
+                                    VerticalAlignment="Center"
+                                    Text="Use affine alignment (diagnostic)"
+                                    ToolTip="When off (default), images are aligned with a 4-DOF similarity transform (translation, rotation, uniform scale), which is the physically correct model for a single autofocus run and gives more robust, repeatable results. Enable only to diagnose alignment by allowing the less-constrained 6-DOF affine transform (adds shear and anisotropic scale)." />
+                                <StackPanel
+                                    Grid.Row="0"
+                                    Grid.Column="3"
+                                    Orientation="Horizontal">
+                                    <CheckBox
+                                        Margin="5,0,0,0"
+                                        IsChecked="{Binding InspectorOptions.UseAffineAlignment}"
+                                        IsEnabled="{Binding InspectorOptions.UseRANSAC}" />
+                                </StackPanel>
+                                <TextBlock
                                     Grid.Row="1"
                                     Grid.Column="0"
                                     Margin="5"
                                     VerticalAlignment="Center"
-                                    Text="Outlier rejection" />
+                                    Text="Outlier rejection"
+                                    ToolTip="When on, measurement points that fit poorly to a star's hyperbolic focus curve are iteratively rejected before that star's best-focus position is used, so a few bad measurements do not bias the result. Slightly increases per-star fitting time." />
                                 <StackPanel
                                     Grid.Row="1"
                                     Grid.Column="1"
@@ -1538,11 +1717,26 @@
                                 </StackPanel>
 
                                 <TextBlock
+                                    Grid.Row="1"
+                                    Grid.Column="2"
+                                    Margin="5"
+                                    VerticalAlignment="Center"
+                                    Text="Astigmatic field curvature"
+                                    ToolTip="When off (default), field curvature is modeled as rotationally symmetric (a single curvature coefficient), which fits a typical refractor or reflector. Enable to fit independent X and Y curvature, representing the saddle-shaped field of an astigmatic optical train. Adds one free parameter to the surface fit." />
+                                <StackPanel
+                                    Grid.Row="1"
+                                    Grid.Column="3"
+                                    Orientation="Horizontal">
+                                    <CheckBox Margin="5,0,0,0" IsChecked="{Binding InspectorOptions.AstigmaticCurvatureEnabled}" />
+                                </StackPanel>
+
+                                <TextBlock
                                     Grid.Row="2"
                                     Grid.Column="0"
                                     Margin="5"
                                     VerticalAlignment="Center"
-                                    Text="Match using brightness" />
+                                    Text="Match using brightness"
+                                    ToolTip="When on, candidate star matches whose relative brightness differs by more than the brightness tolerance are rejected, reducing mismatches in crowded fields. The tolerance is searched automatically, starting from the 'Starting Brightness Tolerance' value." />
                                 <StackPanel
                                     Grid.Row="2"
                                     Grid.Column="1"
@@ -1555,7 +1749,8 @@
                                     Grid.Column="2"
                                     Margin="5"
                                     VerticalAlignment="Center"
-                                    Text="Starting Brightness Tolerance" />
+                                    Text="Starting Brightness Tolerance"
+                                    ToolTip="The starting point for the automatic brightness-tolerance search used to match stars across all regions of all images. Leave blank to start from a fixed default. Only used when 'Match using brightness' is enabled." />
                                 <StackPanel
                                     Grid.Row="2"
                                     Grid.Column="3"
@@ -1569,7 +1764,7 @@
                                         Foreground="{StaticResource PrimaryBrush}"
                                         HintText="{Binding InspectorOptions.BrightnessToleranceHint}"
                                         TextAlignment="Left"
-                                        ToolTip="If set, this value may be used as a starting point by the process to achieve a good set of matched stars across all regions of all images.  Leave this blank to use the previously successful value as the starting point">
+                                        ToolTip="If set, this value is used as the starting point for the automatic search that finds a brightness tolerance giving a good set of matched stars across all regions of all images. Leave this blank to start from a fixed default.">
                                         <ninactrl:HintTextBox.Text>
                                             <Binding
                                                 Converter="{StaticResource HF_DoubleNegativeToEmptyStringConverter}"
@@ -1585,7 +1780,8 @@
                                     Grid.Column="0"
                                     Margin="5"
                                     VerticalAlignment="Center"
-                                    Text="Save annotated images when rerunning a saved autofocus" />
+                                    Text="Save annotated images when rerunning a saved autofocus"
+                                    ToolTip="When on, re-running a previously saved autofocus run also writes the annotated star-detection images to that run's folder. A fresh run always saves them; this controls whether reruns do too. Off by default to avoid rewriting files on every rerun." />
                                 <StackPanel
                                     Grid.Row="3"
                                     Grid.Column="1"
@@ -1597,12 +1793,50 @@
                                     Grid.Column="2"
                                     Margin="5"
                                     VerticalAlignment="Center"
-                                    Text="Save alignment images" />
+                                    Text="Save alignment images"
+                                    ToolTip="When on, also saves the per-frame alignment images (each frame's detected stars transformed onto the reference frame, with matched triangles overlaid) when images are written, for diagnosing registration. Off by default." />
                                 <StackPanel
                                     Grid.Row="3"
                                     Grid.Column="3"
                                     Orientation="Horizontal">
                                     <CheckBox Margin="5,0,0,0" IsChecked="{Binding InspectorOptions.SaveAlignmentImages}" />
+                                </StackPanel>
+
+                                <TextBlock
+                                    Grid.Row="4"
+                                    Grid.Column="0"
+                                    Margin="5"
+                                    VerticalAlignment="Center"
+                                    Text="Min R² (rejection)"
+                                    ToolTip="The smallest R² (fraction of best-focus variance explained) the model may have before its low R² is allowed to contribute to rejection. On its own a low R² never rejects the model — a near-flat sensor legitimately scores a low R². The model is rejected only when R² falls below this value AND the reduced χ² is also high (above a fixed sanity cap of 5)." />
+                                <StackPanel
+                                    Grid.Row="4"
+                                    Grid.Column="1"
+                                    Orientation="Horizontal">
+                                    <ninactrl:UnitTextBox
+                                        MinWidth="40"
+                                        Margin="5,0,0,0"
+                                        VerticalAlignment="Center"
+                                        HorizontalContentAlignment="Left"
+                                        VerticalContentAlignment="Center"
+                                        Foreground="{StaticResource PrimaryBrush}"
+                                        TextAlignment="Left"
+                                        ToolTip="The smallest R² (fraction of best-focus variance explained) the model may have before its low R² is allowed to contribute to rejection. On its own a low R² never rejects the model — a near-flat sensor legitimately scores a low R². The model is rejected only when R² falls below this value AND the reduced χ² is also high (above a fixed sanity cap of 5).">
+                                        <ninactrl:UnitTextBox.Text>
+                                            <Binding
+                                                Mode="TwoWay"
+                                                Path="InspectorOptions.AcceptableRSquaredMin"
+                                                UpdateSourceTrigger="LostFocus">
+                                                <Binding.ValidationRules>
+                                                    <rules:DoubleRangeRule>
+                                                        <rules:DoubleRangeRule.ValidRange>
+                                                            <rules:DoubleRangeChecker Maximum="0.9999" Minimum="0" />
+                                                        </rules:DoubleRangeRule.ValidRange>
+                                                    </rules:DoubleRangeRule>
+                                                </Binding.ValidationRules>
+                                            </Binding>
+                                        </ninactrl:UnitTextBox.Text>
+                                    </ninactrl:UnitTextBox>
                                 </StackPanel>
                             </Grid>
                         </Expander>
@@ -2707,7 +2941,7 @@
                                 Margin="5"
                                 VerticalAlignment="Center"
                                 ToolTip="{StaticResource SensorModel_Tilt_Tooltip}">
-                                <Run Text="{Binding SensorModel.SensorModelResult.Tilt.Degree, StringFormat=\{0:0.000\}, Mode=OneWay}" /><Run Text="°" />
+                                <Run Text="{Binding SensorModel.SensorModelResult.Tilt.Degree, StringFormat=\{0:0.000\}, Mode=OneWay}" /><Run Text="°" /><Run Text=" ± " /><Run Text="{Binding SensorModel.SensorModelResult.TiltStdError.Degree, StringFormat=\{0:0.000\}, Converter={StaticResource NaNToDoubleDashConverter}, Mode=OneWay}" /><Run Text="°" />
                             </TextBlock>
                             <TextBlock
                                 Grid.Row="1"
@@ -2722,7 +2956,7 @@
                                 Margin="5"
                                 VerticalAlignment="Center"
                                 ToolTip="{StaticResource SensorModel_CurvatureRadius_Tooltip}">
-                                <Run Text="{Binding SensorModel.SensorModelResult.CurvatureRadiusMillimeters, StringFormat=\{0:0.\}, Mode=OneWay}" /> <Run Text="mm" />
+                                <Run Text="{Binding SensorModel.SensorModelResult.CurvatureRadiusMillimeters, StringFormat=\{0:0.\}, Mode=OneWay}" /><Run Text=" ± " /><Run Text="{Binding SensorModel.SensorModelResult.CurvatureRadiusStdErrorMillimeters, StringFormat=\{0:0.\}, Converter={StaticResource NaNToDoubleDashConverter}, Mode=OneWay}" /> <Run Text="mm" />
                             </TextBlock>
                             <TextBlock
                                 Grid.Row="1"
@@ -2837,6 +3071,20 @@
                                 ToolTip="{StaticResource SensorModel_CriticalFocus_Tooltip}">
                                 <Run Text="{Binding SensorModel.SensorModelResult.CriticalFocusMicrons, StringFormat=\{0:0.0\}, Mode=OneWay}" /> <Run Text="microns" />
                             </TextBlock>
+                            <TextBlock
+                                Grid.Row="4"
+                                Grid.Column="2"
+                                Margin="5"
+                                VerticalAlignment="Center"
+                                Text="Reduced χ²"
+                                ToolTip="{StaticResource SensorModel_ReducedChiSquared_Tooltip}" />
+                            <TextBlock
+                                Grid.Row="4"
+                                Grid.Column="3"
+                                Margin="5"
+                                VerticalAlignment="Center"
+                                Text="{Binding SensorModel.SensorModelResult.Model.ReducedChiSquared, StringFormat=\{0:0.00\}, Mode=OneWay}"
+                                ToolTip="{StaticResource SensorModel_ReducedChiSquared_Tooltip}" />
                         </Grid>
                         <Grid
                             Grid.Row="4"

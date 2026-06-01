@@ -31,6 +31,7 @@
     <hfconverters:DoubleNegativeToEmptyStringConverter x:Key="HF_DoubleNegativeToEmptyStringConverter" />
     <hfconverters:InterpolateColorConverter x:Key="HF_InterpolateColorConverter" />
     <hfconverters:InverseNaNToVisibilityCollapsedConverter x:Key="HF_InverseNaNToVisibilityCollapsedConverter" />
+    <hfconverters:NullToVisibilityCollapsedConverter x:Key="HF_NullToVisibilityCollapsedConverter" />
     <hfconverters:InverseBooleanConverter x:Key="HF_InverseBooleanConverter" />
     <hfconverters:MultiBooleanToVisibilityCollapsedConverter x:Key="HF_MultiBooleanToVisibilityCollapsedConverter" />
     <hfconverters:MultiBooleanToZeroConverter x:Key="HF_MultiBooleanToZeroConverter" />
@@ -413,12 +414,15 @@
     <TextBlock x:Key="AutoFocusTimeoutSeconds_Tooltip" Text="How long an Auto Focus operation can take before we cancel it and move on." />
     <TextBlock x:Key="ValidateHfrImprovement_Tooltip" Text="If enabled, takes an extra exposure before and after to ensure HFR improved. This check may be done in addition to the R² validation configured in NINA's Auto Focus options." />
     <TextBlock x:Key="HFRImprovementThreshold_Tooltip" Text="How much wiggle room when validating HFR improvements. The default value of 15% means that the Auto Focus fails if the initial HFR is 15% or more better than the final HFR" />
-    <TextBlock x:Key="UnevenHyperbolicFit_Tooltip" Text="Allows hyperbolic fits to have different slopes on either end of the minima. Enabled by default, as outfocus HFR seems to typically exhibit different behavior than infocus." />
+    <TextBlock x:Key="HyperbolicFitModel_Tooltip" Text="Which hyperbolic model is fit to the focus curve. Hybrid (Best Fit) is the recommended default: the curve is rendered live with the Tilted Hyperbola, then at run completion every model is refit and the one with the least expected error for the best-focus position is kept — so each run self-selects its most trustworthy fit. The fixed choices: Symmetric is the classic 4-parameter hyperbola; the others are asymmetric (different slope on either side of focus, common because out-of-focus HFR behaves differently than in-focus): Tilted Hyperbola is a single smooth curve with a linear skew, Smooth Blend smoothly blends two hyperbolas, and Uneven Blend is the original blended fit." />
     <TextBlock x:Key="WeightedHyperbolicFit_Tooltip" Text="Weights each point in the hyperbolic fit based on measurement error." />
+    <TextBlock x:Key="FitRejectionCriterion_Tooltip" Text="Which goodness-of-fit metric decides whether an auto-focus run is rejected. R² (default) keeps the existing behavior, rejecting when the fit's R² falls below NINA's R² threshold (Focuser settings). Reduced χ² instead rejects when the hyperbolic fit's reduced χ² exceeds the threshold below — a more meaningful test for a focus curve, but it is only valid when 'Weighted Hyperbolic Fit' is enabled (it relies on per-point measurement σ). Quadratic and trendline fits always use R² regardless of this setting." />
+    <TextBlock x:Key="ReducedChiSquaredRejectionThreshold_Tooltip" Text="Upper bound on the hyperbolic fit's reduced χ² (χ² per degree of freedom) above which the run is rejected, when the rejection criterion is set to Reduced χ². Reduced χ² ≈ 1 means the model fits the measured curve to within the per-point measurement uncertainties; because that σ is approximate, reduced χ² routinely runs above 1 even for good fits, so the default of 5 is a generous sanity bound. Set to 0 to disable. Meaningful only with weighted fits." />
+    <TextBlock x:Key="RSquaredRejectionThreshold_Tooltip" Text="The minimum R² (coefficient of determination) below which an auto-focus run is rejected, when the rejection criterion is set to R². This is NINA's own R² threshold from the Focuser settings; editing it here changes that same profile setting. R² closer to 1 indicates a better fit to the measured focus curve." />
     <TextBlock x:Key="HotpixelFiltering_Tooltip" Text="Uses a 3x3 box median convolution to filter out hotpixels. This should be on, unless you're working with a calibrated image with hotpixels removed" />
     <TextBlock x:Key="HotpixelThresholdingEnabled_Tooltip" Text="A more sophisticated version of hotpixel filtering that limits pixel replacement to those where the median is far off of the pixel value. This prevents the whole image from being blurred, which can have a negative effect on HFR and PSF measurement accuracy" />
     <TextBlock x:Key="HotpixelThreshold_Tooltip" Text="A percentage representing the cutoff threshold for detecting a hotpixel. It's the percentage of full well difference between the 3x3 median blurred value and the pixel value" />
-    <TextBlock x:Key="SaturationThreshold_Tooltip" Text="A percentage representing the cutoff threshold for detecting a saturated pixel. Star candidates containing any saturated pixels are rejected" />
+    <TextBlock x:Key="SaturationThreshold_Tooltip" Text="A percentage representing the cutoff threshold for detecting a saturated pixel. Star candidates containing saturated pixels are processed with those pixels masked during PSF fitting" />
     <TextBlock x:Key="UseAutoFocusCrop_Tooltip" Text="Uses the inner and outer crop from the Auto Focus options for regular exposures (ie, those that aren't done during focusing)" />
     <TextBlock x:Key="SavePath_Tooltip" Text="The folder to save Auto Focus runs" />
     <TextBlock x:Key="SaveAutoFocus_Tooltip" Text="Saves details about every Auto Focus run, including a copy of the image, the star detection results, and the stretched annotated image" />
@@ -426,6 +430,8 @@
     <TextBlock x:Key="StarMeasurementNoiseReductionEnabled_Tooltip" Text="Apply noise detection settings to the pixels used during star measurement. By default, it is applied only to the structure detection image." />
     <TextBlock x:Key="NoiseClippingMultiplier_Tooltip" Text="Structure map generation binarizes pixels above the noise floor after noise detection and before star detection. This floor is calculated based on the background (median of the whole image) + this multiplier times the noise standard deviation, as calculated using the Kappa-Sigma algorithm. Increasing this value more aggressively clips the background, which can be useful if star bounding boxes include too much background data." />
     <TextBlock x:Key="StarClippingMultiplier_Tooltip" Text="Number of noise standard deviations above the local background median to filter star candidate pixels out from star consideration and HFR analysis. Decrease this if there are a large number of stars excluded for being degenerate and you can see many clear dim stars that are not detected." />
+    <TextBlock x:Key="ContaminationSensitivity_Tooltip" Text="How aggressively to flag stars whose background annulus is brighter on one side — a sign of a nearby star, hot column, or steep gradient. Value is the required asymmetry in multiples of the local background scatter (measured per star from the annulus itself); higher = fewer flags; 0 disables. Default 5." />
+    <TextBlock x:Key="RejectContaminatedStars_Tooltip" Text="When enabled (default), stars flagged as contaminated are rejected outright so their one-sided contamination does not skew HFR and PSF statistics. When disabled, contaminated stars are kept and only flagged. A smooth one-sided background gradient (galaxy/nebula) is removed before the test, so only genuine localized contaminants trip it." />
     <TextBlock x:Key="StructureLayers_Tooltip" Text="The number of dyadic (power of 2) layers to include in structure detection. At the default of 5 (2⁵=32), structures larger than 32 pixels in size are excluded from structure detection" />
     <TextBlock x:Key="FocuserOffset_Tooltip" Text="Advanced Only! Moves the focuser this fixed amount at the end of an AutoFocus" />
     <TextBlock x:Key="BrightnessSensitivity_Tooltip">
@@ -460,7 +466,7 @@
     <TextBlock x:Key="TooDistortedColor_Tooltip" Text="The color of the failed star bounding box" />
     <TextBlock x:Key="ShowDegenerate_Tooltip" Text="Whether to show the failed degenerate stars" />
     <TextBlock x:Key="DegenerateColor_Tooltip" Text="The color of the failed star bounding box" />
-    <TextBlock x:Key="ShowSaturated_Tooltip" Text="Whether to show the failed saturated stars" />
+    <TextBlock x:Key="ShowSaturated_Tooltip" Text="Whether to show the partially-saturated stars that were processed with masked pixels" />
     <TextBlock x:Key="SaturatedColor_Tooltip" Text="The color of the failed star bounding box" />
     <TextBlock x:Key="ShowLowSensitivity_Tooltip" Text="Whether to show the failed low sensitivity stars" />
     <TextBlock x:Key="LowSensitivityColor_Tooltip" Text="The color of the failed star bounding box" />
@@ -468,6 +474,8 @@
     <TextBlock x:Key="NotCenteredColor_Tooltip" Text="The color of the failed star bounding box" />
     <TextBlock x:Key="ShowTooFlat_Tooltip" Text="Whether to show the failed too flat stars" />
     <TextBlock x:Key="TooFlatColor_Tooltip" Text="The color of the failed star bounding box" />
+    <TextBlock x:Key="ShowContaminated_Tooltip" Text="Whether to mark stars flagged as possibly contaminated by a neighbor, background gradient, or hot column. The marker is shown whether or not 'Reject Contaminated Stars' is enabled, so you can see which stars were flagged even when they are excluded from measurements" />
+    <TextBlock x:Key="ContaminatedColor_Tooltip" Text="The color used to outline contaminated stars. The marker is drawn as the star's bounding box" />
     <TextBlock x:Key="ShowStructureMap_Tooltip" Text="Overlays the structure map to aide debugging. Original shows the initial structure map after noise clipping and binarization, and Dilated shows it after dilation has been performed" />
     <TextBlock x:Key="StructureMapColor_Tooltip" Text="The color of the overlayed structure map" />
     <TextBlock x:Key="SaveIntermediatePath_Tooltip" Text="When Save Intermediate Files is enabled, they are written to this path the next time star detection runs" />
@@ -477,6 +485,9 @@
     <TextBlock x:Key="PSFFitType_Tooltip" Text="What type of PSF model to fit. Moffat 0.4 more closely resembles real stars and is the default used by PixInsight" />
     <TextBlock x:Key="PSFResolution_Tooltip" Text="The number of pixels of the width of a nominal square to sample star bounding boxes for the purposes of PSF model fitting. Higher resolution may be more accurate, but takes longer to calculate" />
     <TextBlock x:Key="PSFFitThreshold_Tooltip" Text="The minimum goodness of fit (R²) required for a PSF" />
+    <TextBlock
+        x:Key="PSFPixelIntegration_Tooltip"
+        Text="When enabled, PSF model values are computed as the integral over the pixel area rather than sampled at the pixel centre. Reduces sigma error on undersampled rigs (FWHM ≈ 1.5 px) from ~8% to less than 5%. Leave off for well-sampled rigs." />
     <TextBlock x:Key="PSFParallelPartitionSize_Tooltip" Text="Enables parallel processing of PSF modeling by partitioning the detected stars into batches of this size. Set to 0 to disable parallelism" />
     <TextBlock x:Key="SimpleNoiseLevel_Tooltip" Text="Controls the amount of blurring done on the source image before beginning the star detection process. Increase this if you have a particularly noisy sensor or shoot at a very high focal ratio" />
     <TextBlock x:Key="SimpleFocusRange_Tooltip" Text="As you get further from critical focus, stars become large donuts. Star detection will typically consider them too large to be stars when you're far enough from focus. Enabling a wide range increases the number of layers considered for star detection" />
@@ -493,6 +504,23 @@
                     <Setter Property="Height" Value="Auto" />
                     <Style.Triggers>
                         <DataTrigger Binding="{Binding AutoFocusOptions.Save}" Value="False">
+                            <Setter Property="Height" Value="0" />
+                        </DataTrigger>
+                    </Style.Triggers>
+                </Style>
+                <!--  Only the rejection-threshold row matching the selected Fit Rejection Criterion is shown.  -->
+                <Style x:Key="ShowOnRSquaredCriterion" TargetType="{x:Type RowDefinition}">
+                    <Setter Property="Height" Value="Auto" />
+                    <Style.Triggers>
+                        <DataTrigger Binding="{Binding AutoFocusOptions.FitRejectionCriterion}" Value="{x:Static interfaces:FitRejectionCriterion.ReducedChiSquared}">
+                            <Setter Property="Height" Value="0" />
+                        </DataTrigger>
+                    </Style.Triggers>
+                </Style>
+                <Style x:Key="ShowOnReducedChiSquaredCriterion" TargetType="{x:Type RowDefinition}">
+                    <Setter Property="Height" Value="Auto" />
+                    <Style.Triggers>
+                        <DataTrigger Binding="{Binding AutoFocusOptions.FitRejectionCriterion}" Value="{x:Static interfaces:FitRejectionCriterion.RSquared}">
                             <Setter Property="Height" Value="0" />
                         </DataTrigger>
                     </Style.Triggers>
@@ -518,7 +546,8 @@
                 <RowDefinition />
                 <RowDefinition />
                 <RowDefinition />
-                <RowDefinition />
+                <RowDefinition Style="{StaticResource ShowOnReducedChiSquaredCriterion}" />
+                <RowDefinition Style="{StaticResource ShowOnRSquaredCriterion}" />
             </Grid.RowDefinitions>
             <TextBlock
                 Grid.Row="0"
@@ -753,17 +782,24 @@
                 Grid.Row="11"
                 Grid.Column="0"
                 VerticalAlignment="Center"
-                Text="Uneven Hyperbolic Fit"
-                ToolTip="{StaticResource UnevenHyperbolicFit_Tooltip}" />
-            <CheckBox
+                Text="Hyperbolic Fit Model"
+                ToolTip="{StaticResource HyperbolicFitModel_Tooltip}" />
+            <ComboBox
                 Grid.Row="11"
                 Grid.Column="1"
                 MinWidth="80"
                 Margin="5,5,0,0"
                 HorizontalAlignment="Left"
                 VerticalAlignment="Center"
-                IsChecked="{Binding AutoFocusOptions.UnevenHyperbolicFitEnabled}"
-                ToolTip="{StaticResource UnevenHyperbolicFit_Tooltip}" />
+                ItemsSource="{Binding Source={util:EnumBindingSource {x:Type interfaces:HyperbolicFitModel}}}"
+                SelectedItem="{Binding AutoFocusOptions.HyperbolicFitModel}"
+                ToolTip="{StaticResource HyperbolicFitModel_Tooltip}">
+                <ComboBox.ItemTemplate>
+                    <DataTemplate>
+                        <TextBlock Text="{Binding Converter={StaticResource HF_EnumStaticDescriptionValueConverter}}" />
+                    </DataTemplate>
+                </ComboBox.ItemTemplate>
+            </ComboBox>
 
             <TextBlock
                 Grid.Row="12"
@@ -780,6 +816,79 @@
                 VerticalAlignment="Center"
                 IsChecked="{Binding AutoFocusOptions.WeightedHyperbolicFitEnabled}"
                 ToolTip="{StaticResource WeightedHyperbolicFit_Tooltip}" />
+
+            <TextBlock
+                Grid.Row="13"
+                Grid.Column="0"
+                VerticalAlignment="Center"
+                Text="Fit Rejection Criterion"
+                ToolTip="{StaticResource FitRejectionCriterion_Tooltip}" />
+            <ComboBox
+                Grid.Row="13"
+                Grid.Column="1"
+                MinWidth="80"
+                Margin="5,5,0,0"
+                HorizontalAlignment="Left"
+                VerticalAlignment="Center"
+                ItemsSource="{Binding Source={util:EnumBindingSource {x:Type interfaces:FitRejectionCriterion}}}"
+                SelectedItem="{Binding AutoFocusOptions.FitRejectionCriterion}"
+                ToolTip="{StaticResource FitRejectionCriterion_Tooltip}">
+                <ComboBox.ItemTemplate>
+                    <DataTemplate>
+                        <TextBlock Text="{Binding Converter={StaticResource HF_EnumStaticDescriptionValueConverter}}" />
+                    </DataTemplate>
+                </ComboBox.ItemTemplate>
+            </ComboBox>
+
+            <TextBlock
+                Grid.Row="14"
+                Grid.Column="0"
+                VerticalAlignment="Center"
+                Text="Reduced χ² Rejection Threshold"
+                ToolTip="{StaticResource ReducedChiSquaredRejectionThreshold_Tooltip}" />
+            <ninactrl:UnitTextBox
+                Grid.Row="14"
+                Grid.Column="1"
+                MinWidth="80"
+                Margin="5,5,0,0"
+                HorizontalAlignment="Left"
+                VerticalAlignment="Center"
+                ToolTip="{StaticResource ReducedChiSquaredRejectionThreshold_Tooltip}">
+                <Binding Path="AutoFocusOptions.ReducedChiSquaredRejectionThreshold" UpdateSourceTrigger="LostFocus">
+                    <Binding.ValidationRules>
+                        <rules:DoubleRangeRule>
+                            <rules:DoubleRangeRule.ValidRange>
+                                <rules:DoubleRangeChecker Maximum="1000.0" Minimum="0" />
+                            </rules:DoubleRangeRule.ValidRange>
+                        </rules:DoubleRangeRule>
+                    </Binding.ValidationRules>
+                </Binding>
+            </ninactrl:UnitTextBox>
+
+            <TextBlock
+                Grid.Row="15"
+                Grid.Column="0"
+                VerticalAlignment="Center"
+                Text="R² Rejection Threshold"
+                ToolTip="{StaticResource RSquaredRejectionThreshold_Tooltip}" />
+            <ninactrl:UnitTextBox
+                Grid.Row="15"
+                Grid.Column="1"
+                MinWidth="80"
+                Margin="5,5,0,0"
+                HorizontalAlignment="Left"
+                VerticalAlignment="Center"
+                ToolTip="{StaticResource RSquaredRejectionThreshold_Tooltip}">
+                <Binding Path="AutoFocusOptions.RSquaredRejectionThreshold" UpdateSourceTrigger="LostFocus">
+                    <Binding.ValidationRules>
+                        <rules:DoubleRangeRule>
+                            <rules:DoubleRangeRule.ValidRange>
+                                <rules:DoubleRangeChecker Maximum="1.0" Minimum="0" />
+                            </rules:DoubleRangeRule.ValidRange>
+                        </rules:DoubleRangeRule>
+                    </Binding.ValidationRules>
+                </Binding>
+            </ninactrl:UnitTextBox>
         </Grid>
     </DataTemplate>
     <DataTemplate x:Key="HocusFocus_StarDetection_Options">
@@ -863,7 +972,8 @@
                 <RowDefinition Style="{StaticResource ShowOnUseAdvanced}" />
                 <RowDefinition Style="{StaticResource ShowOnUseAdvanced}" />
                 <RowDefinition Style="{StaticResource ShowOnUseAdvanced}" />
-                <!--  31  -->
+                <RowDefinition Style="{StaticResource ShowOnUseAdvanced}" />
+                <!--  33  -->
                 <RowDefinition Style="{StaticResource ShowOnUseHotpixelThresholding_Advanced}" />
 
                 <RowDefinition Style="{StaticResource ShowOnUseAdvanced}" />
@@ -874,7 +984,7 @@
                 <RowDefinition Style="{StaticResource ShowOnUseAdvanced}" />
                 <RowDefinition />
 
-                <!--  37  -->
+                <!--  39  -->
                 <RowDefinition Style="{StaticResource HideOnSaveIntermediateOff}" />
                 <RowDefinition />
                 <RowDefinition />
@@ -1113,6 +1223,48 @@
                     </Binding.ValidationRules>
                 </Binding>
             </ninactrl:UnitTextBox>
+
+            <TextBlock
+                Grid.Row="35"
+                Grid.Column="0"
+                VerticalAlignment="Center"
+                Text="Contamination Sensitivity"
+                ToolTip="{StaticResource ContaminationSensitivity_Tooltip}" />
+            <ninactrl:UnitTextBox
+                Grid.Row="35"
+                Grid.Column="1"
+                MinWidth="80"
+                Margin="5,5,0,0"
+                HorizontalAlignment="Left"
+                VerticalAlignment="Center"
+                ToolTip="{StaticResource ContaminationSensitivity_Tooltip}"
+                Unit="σ">
+                <Binding Path="StarDetectionOptions.ContaminationSensitivity" UpdateSourceTrigger="LostFocus">
+                    <Binding.ValidationRules>
+                        <rules:DoubleRangeRule>
+                            <rules:DoubleRangeRule.ValidRange>
+                                <rules:DoubleRangeChecker Maximum="20.0" Minimum="0" />
+                            </rules:DoubleRangeRule.ValidRange>
+                        </rules:DoubleRangeRule>
+                    </Binding.ValidationRules>
+                </Binding>
+            </ninactrl:UnitTextBox>
+
+            <TextBlock
+                Grid.Row="36"
+                Grid.Column="0"
+                VerticalAlignment="Center"
+                Text="Reject Contaminated Stars"
+                ToolTip="{StaticResource RejectContaminatedStars_Tooltip}" />
+            <CheckBox
+                Grid.Row="36"
+                Grid.Column="1"
+                MinWidth="80"
+                Margin="5,5,0,0"
+                HorizontalAlignment="Left"
+                VerticalAlignment="Center"
+                IsChecked="{Binding StarDetectionOptions.RejectContaminatedStars}"
+                ToolTip="{StaticResource RejectContaminatedStars_Tooltip}" />
 
             <TextBlock
                 Grid.Row="15"
@@ -1475,10 +1627,26 @@
                 Grid.Row="30"
                 Grid.Column="0"
                 VerticalAlignment="Center"
+                Text="PSF Pixel Integration"
+                ToolTip="{StaticResource PSFPixelIntegration_Tooltip}" />
+            <CheckBox
+                Grid.Row="30"
+                Grid.Column="1"
+                MinWidth="80"
+                Margin="5,5,0,0"
+                HorizontalAlignment="Left"
+                VerticalAlignment="Center"
+                IsChecked="{Binding StarDetectionOptions.PSFPixelIntegration}"
+                ToolTip="{StaticResource PSFPixelIntegration_Tooltip}" />
+
+            <TextBlock
+                Grid.Row="31"
+                Grid.Column="0"
+                VerticalAlignment="Center"
                 Text="PSF MAD Fitting"
                 ToolTip="{StaticResource UsePSFAbsoluteDeviation_Tooltip}" />
             <CheckBox
-                Grid.Row="30"
+                Grid.Row="31"
                 Grid.Column="1"
                 MinWidth="80"
                 Margin="5,5,0,0"
@@ -1488,13 +1656,13 @@
                 ToolTip="{StaticResource UsePSFAbsoluteDeviation_Tooltip}" />
 
             <TextBlock
-                Grid.Row="31"
+                Grid.Row="32"
                 Grid.Column="0"
                 VerticalAlignment="Center"
                 Text="Hotpixel Threshold"
                 ToolTip="{StaticResource HotpixelThreshold_Tooltip}" />
             <ninactrl:UnitTextBox
-                Grid.Row="31"
+                Grid.Row="32"
                 Grid.Column="1"
                 MinWidth="80"
                 Margin="5,5,0,0"
@@ -1517,13 +1685,13 @@
             </ninactrl:UnitTextBox>
 
             <TextBlock
-                Grid.Row="32"
+                Grid.Row="33"
                 Grid.Column="0"
                 VerticalAlignment="Center"
                 Text="Saturation Threshold"
                 ToolTip="{StaticResource SaturationThreshold_Tooltip}" />
             <ninactrl:UnitTextBox
-                Grid.Row="32"
+                Grid.Row="33"
                 Grid.Column="1"
                 MinWidth="80"
                 Margin="5,5,0,0"
@@ -1546,14 +1714,14 @@
             </ninactrl:UnitTextBox>
 
             <TextBlock
-                Grid.Row="33"
+                Grid.Row="34"
                 Grid.Column="0"
                 VerticalAlignment="Center"
                 Text="Measurement Averaging"
                 ToolTip="{StaticResource MeasurementAverage_Tooltip}" />
             <ComboBox
                 Name="PART_MeasurementAverageTypeList"
-                Grid.Row="33"
+                Grid.Row="34"
                 Grid.Column="1"
                 MinWidth="80"
                 Margin="5,5,0,0"
@@ -1570,13 +1738,13 @@
             </ComboBox>
 
             <TextBlock
-                Grid.Row="36"
+                Grid.Row="38"
                 Grid.Column="0"
                 VerticalAlignment="Center"
                 Text="Debug Mode"
                 ToolTip="{StaticResource DebugMode_Tooltip}" />
             <CheckBox
-                Grid.Row="36"
+                Grid.Row="38"
                 Grid.Column="1"
                 MinWidth="80"
                 Margin="5,5,0,0"
@@ -1586,13 +1754,13 @@
                 ToolTip="{StaticResource DebugMode_Tooltip}" />
 
             <TextBlock
-                Grid.Row="37"
+                Grid.Row="39"
                 Grid.Column="0"
                 VerticalAlignment="Center"
                 Text="Intermediate Path"
                 ToolTip="{StaticResource SaveIntermediatePath_Tooltip}" />
             <TextBox
-                Grid.Row="37"
+                Grid.Row="39"
                 Grid.Column="1"
                 Margin="5,5,0,0"
                 VerticalAlignment="Center"
@@ -1616,7 +1784,7 @@
                 </TextBox.Style>
             </TextBox>
             <Button
-                Grid.Row="37"
+                Grid.Row="39"
                 Grid.Column="2"
                 HorizontalAlignment="Center"
                 VerticalAlignment="Center"
@@ -1643,13 +1811,13 @@
             </Button>
 
             <TextBlock
-                Grid.Row="38"
+                Grid.Row="40"
                 Grid.Column="0"
                 VerticalAlignment="Center"
                 Text="Save Intermediate"
                 ToolTip="{StaticResource SaveIntermediateFiles_Tooltip}" />
             <CheckBox
-                Grid.Row="38"
+                Grid.Row="40"
                 Grid.Column="1"
                 MinWidth="80"
                 Margin="5,5,0,0"
@@ -2158,6 +2326,39 @@
                 SelectedColor="{Binding TooFlatColor}"
                 ToolTip="{StaticResource TooFlatColor_Tooltip}"
                 Visibility="{Binding ShowTooFlat, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
+
+            <TextBlock
+                Grid.Row="25"
+                Grid.Column="0"
+                VerticalAlignment="Center"
+                Text="Show Contaminated"
+                ToolTip="{StaticResource ShowContaminated_Tooltip}" />
+            <CheckBox
+                Grid.Row="25"
+                Grid.Column="1"
+                MinWidth="80"
+                Margin="5,5,0,0"
+                HorizontalAlignment="Left"
+                VerticalAlignment="Center"
+                IsChecked="{Binding ShowContaminated}"
+                ToolTip="{StaticResource ShowContaminated_Tooltip}" />
+            <TextBlock
+                Grid.Row="26"
+                Grid.Column="0"
+                VerticalAlignment="Center"
+                Text="Contaminated Box Color"
+                ToolTip="{StaticResource ContaminatedColor_Tooltip}"
+                Visibility="{Binding ShowContaminated, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
+            <xceed:ColorPicker
+                Grid.Row="26"
+                Grid.Column="1"
+                Width="80"
+                Margin="5,5,0,0"
+                HorizontalAlignment="Left"
+                VerticalAlignment="Center"
+                SelectedColor="{Binding ContaminatedColor}"
+                ToolTip="{StaticResource ContaminatedColor_Tooltip}"
+                Visibility="{Binding ShowContaminated, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
 
             <TextBlock
                 Grid.Row="27"
