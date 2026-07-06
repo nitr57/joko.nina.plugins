@@ -59,6 +59,10 @@
     <PackageReference Condition="!$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::Linux)))"  Include="ScottPlot.WPF" Version="4.1.59" />
   </ItemGroup>
   <ItemGroup Condition="$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::Linux)))">
+    <!-- WPF/Win32-only helpers consumed exclusively from XAML, which is excluded on Linux -->
+    <Compile Remove="Controls\IconizedText.cs" />
+    <Compile Remove="StarDetection\Optimization\ClampWindowToWorkArea.cs" />
+    <Compile Remove="StarDetection\Optimization\Review\ReviewViewportHostBase.cs" />
     <ProjectReference Include="..\..\..\..\NINA.Plugin\NINA.Plugin.csproj" />
     <ProjectReference Include="..\..\..\..\System.Windows.Compat\System.Windows.Compat.csproj" />
     <PackageReference Include="System.Drawing.Common" Version="*" ExcludeAssets="all" />
