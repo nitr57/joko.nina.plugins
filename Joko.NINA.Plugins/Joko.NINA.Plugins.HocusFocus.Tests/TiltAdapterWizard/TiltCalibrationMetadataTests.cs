@@ -1,3 +1,4 @@
+using NINA.Joko.Plugins.HocusFocus.AutoFocus.Replay;
 using NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard;
 using NUnit.Framework;
 using System;
@@ -55,6 +56,47 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
                 Assert.That(back.PerStep[0].CurvatureEffectMicronsAtScrewRadius, Is.EqualTo(5.5).Within(1e-9));
                 Assert.That(back.Calibration.MeasuredHardwareMicrons, Is.EqualTo(400).Within(1e-9));
                 Assert.That(back.Calibration.CurvatureSign, Is.EqualTo(-1));
+            });
+        }
+
+        [Test]
+        public void ResultRecord_RoundTripsConfidenceFields() {
+            var meta = new TiltCalibrationMetadata {
+                NumberOfScrews = 3, ScrewRadiusMillimeters = 44, PixelSizeMicrons = 3.76,
+                FocuserStepSizeMicrons = 3.6, CalibrationAppliedAmount = 1.0,
+                Calibration = new TiltCalibrationResultRecord {
+                    Screw1AngleDegrees = 67.1, SignalToNoise = 2.16,
+                    PredictedAngleUncertaintyDeg = 24.9, PitchUncertaintyMicrons = 43.0, ConfidenceIsReliable = true
+                }
+            };
+            var back = TiltCalibrationMetadata.Deserialize(meta.Serialize());
+            Assert.Multiple(() => {
+                Assert.That(back.Calibration.SignalToNoise, Is.EqualTo(2.16).Within(1e-9));
+                Assert.That(back.Calibration.PredictedAngleUncertaintyDeg, Is.EqualTo(24.9).Within(1e-9));
+                Assert.That(back.Calibration.PitchUncertaintyMicrons, Is.EqualTo(43.0).Within(1e-9));
+                Assert.That(back.Calibration.ConfidenceIsReliable, Is.True);
+            });
+        }
+
+        [Test]
+        public void MeasurementContext_RoundTrips() {
+            var meta = new TiltCalibrationMetadata {
+                NumberOfScrews = 3, ScrewRadiusMillimeters = 44, PixelSizeMicrons = 3.76,
+                FocuserStepSizeMicrons = 3.6, CalibrationAppliedAmount = 1.0,
+                MeasurementContext = new TiltMeasurementContext {
+                    MicronsPerFocuserStep = 3.6, FocalRatio = 7, FocalLengthMm = 703,
+                    UseRANSAC = true, FixedSensorCenter = false, AstigmaticCurvatureEnabled = false,
+                    AcceptableRSquaredMin = 0.8, WeightedHyperbolicFitEnabled = true,
+                    MaxOutlierRejections = 3, OutlierRejectionConfidence = 0.9,
+                    HyperbolicFitModel = "Hybrid", SensorROI = 1.0, CornersROI = 1.0
+                }
+            };
+            var back = TiltCalibrationMetadata.Deserialize(meta.Serialize());
+            Assert.Multiple(() => {
+                Assert.That(back.MeasurementContext.MicronsPerFocuserStep, Is.EqualTo(3.6).Within(1e-9));
+                Assert.That(back.MeasurementContext.FocalRatio, Is.EqualTo(7).Within(1e-9));
+                Assert.That(back.MeasurementContext.HyperbolicFitModel, Is.EqualTo("Hybrid"));
+                Assert.That(back.MeasurementContext.UseRANSAC, Is.True);
             });
         }
 
@@ -125,6 +167,24 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
             // A folder on a different volume can't be made relative; keep it absolute rather than emit "..\..".
             var other = @"D:\external\01_Baseline\AutoFocus_x";
             Assert.That(TiltCalibrationMetadata.ToRelativeStepFolder(@"C:\runs\run1", other), Is.EqualTo(other));
+        }
+
+        [Test]
+        public void StarDetectionSnapshot_RoundTrips() {
+            var meta = new TiltCalibrationMetadata {
+                NumberOfScrews = 3, ScrewRadiusMillimeters = 44, PixelSizeMicrons = 3.76,
+                FocuserStepSizeMicrons = 3.6, CalibrationAppliedAmount = 1.0,
+                StarDetectionSnapshot = new StarDetectionSettingsSnapshot {
+                    BrightnessSensitivity = 42.5, LocallyAdaptiveBinarization = true, AdaptiveNoiseBlockSize = 256
+                }
+            };
+            var back = TiltCalibrationMetadata.Deserialize(meta.Serialize());
+            Assert.That(back.StarDetectionSnapshot, Is.Not.Null);
+            Assert.Multiple(() => {
+                Assert.That(back.StarDetectionSnapshot.BrightnessSensitivity, Is.EqualTo(42.5).Within(1e-9));
+                Assert.That(back.StarDetectionSnapshot.LocallyAdaptiveBinarization, Is.True);
+                Assert.That(back.StarDetectionSnapshot.AdaptiveNoiseBlockSize, Is.EqualTo(256));
+            });
         }
     }
 }

@@ -551,6 +551,10 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
         // its robust tilt. Transient and not persisted; the wizard sets it only for the duration of each analysis call.
         public bool ForceSensorCurveModelGeneration { get; set; }
 
+        // Transient replay overrides for the sensor-model inputs otherwise read live (null = use profile/inspector).
+        public double? SensorModelFocuserSizeOverrideMicrons { get; set; }
+        public double? SensorModelFRatioOverride { get; set; }
+
         private bool ResolveSensorCurveModelEnabled() =>
             inspectorOptions.SensorCurveModelEnabled || ForceSensorCurveModelGeneration;
 
@@ -575,7 +579,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             // Resolve the definitive review request from the SAME flag that gates this block (capture-time flag on replay).
             frameReviewRequestedForRun = IsFrameReviewRequested(inspectorOptions.FrameReviewEnabled, sensorCurveModelEnabled);
             if (sensorCurveModelEnabled) {
-                double focuserSizeMicrons = InspectorOptions.MicronsPerFocuserStep;
+                double focuserSizeMicrons = SensorModelFocuserSizeOverrideMicrons ?? InspectorOptions.MicronsPerFocuserStep;
                 if (double.IsNaN(focuserSizeMicrons) || focuserSizeMicrons <= 0.0) {
                     if (!focuserStepSizeWarningShowed) {
                         Notification.ShowWarning("Focuser Step Size not set. Assuming 1 micron per focuser step. This message won't be shown again.");
@@ -589,7 +593,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                 try {
                     await SensorModel.UpdateModel(
                         FullSensorDetectedStars,
-                        fRatio: profileService.ActiveProfile.TelescopeSettings.FocalRatio,
+                        fRatio: SensorModelFRatioOverride ?? profileService.ActiveProfile.TelescopeSettings.FocalRatio,
                         focuserSizeMicrons: focuserSizeMicrons,
                         finalFocusPosition: finalFocuserPosition,
                         stepSize: result.StepSize,
@@ -1066,13 +1070,16 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             if (inspectorOptions.StepSize > 0 && savedAutoFocusAttempt != null) {
                 options.AutoFocusStepSize = inspectorOptions.StepSize;
             }
-            // Signal amplification: capture more, finer-spaced points over the same sweep range by dividing the step
-            // size and multiplying the step count by the factor. Only meaningful for LIVE captures — a replay re-uses
-            // the saved frames' fixed focuser positions (savedAutoFocusAttempt != null), so those stay untouched.
-            ApplySignalAmplification(options, inspectorOptions.SignalAmplification, isLiveCapture: savedAutoFocusAttempt == null);
+            // Resolve the base autofocus timeout (inspector override, else the profile default GetOptions already put
+            // on the options) BEFORE amplification, so signal amplification scales the resolved value by its factor.
             if (inspectorOptions.TimeoutSeconds > 0) {
                 options.AutoFocusTimeout = TimeSpan.FromSeconds(inspectorOptions.TimeoutSeconds);
             }
+            // Signal amplification: capture more, finer-spaced points over the same sweep range by dividing the step
+            // size and multiplying the step count by the factor, and scale the autofocus timeout by that same factor so
+            // the longer sweep does not time out. Only meaningful for LIVE captures — a replay re-uses the saved frames'
+            // fixed focuser positions (savedAutoFocusAttempt != null), so those stay untouched.
+            ApplySignalAmplification(options, inspectorOptions.SignalAmplification, isLiveCapture: savedAutoFocusAttempt == null);
             if (inspectorOptions.DetailedAnalysisExposureSeconds > 0) {
                 options.OverrideAutoFocusExposureTime = TimeSpan.FromSeconds(inspectorOptions.DetailedAnalysisExposureSeconds);
             }
@@ -1090,13 +1097,17 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
 
         // Applies the Signal Amplification factor to a live sensor-model / tilt sweep: divides the focuser step size
         // and multiplies the step count by the factor, so the same sweep range is covered with more, finer-spaced
-        // points (more signal, smaller defocus jumps between adjacent frames). No-op at factor <= 1 or on replay
-        // (isLiveCapture == false), since replay re-uses the saved frames' fixed focuser positions. Internal for tests.
+        // points (more signal, smaller defocus jumps between adjacent frames). Those extra points multiply the sweep's
+        // exposure count, so the autofocus timeout is scaled by the same factor to keep the longer sweep from timing
+        // out. The timeout is scaled on the per-run options override (never the persisted AutoFocusTimeoutSeconds), so
+        // there is nothing to restore afterward. No-op at factor <= 1 or on replay (isLiveCapture == false), since
+        // replay re-uses the saved frames' fixed focuser positions. Internal for tests.
         internal static void ApplySignalAmplification(AutoFocusEngineOptions options, int signalAmplification, bool isLiveCapture) {
             var amp = Math.Max(1, signalAmplification);
             if (amp > 1 && isLiveCapture) {
                 options.AutoFocusInitialOffsetSteps *= amp;
                 options.AutoFocusStepSize = Math.Max(1, (int)Math.Round(options.AutoFocusStepSize / (double)amp));
+                options.AutoFocusTimeout *= amp;
             }
         }
 
@@ -1417,7 +1428,9 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
 
             var reportText = JsonConvert.SerializeObject(regionReports[0], Formatting.Indented);
             string path = Path.Combine(HocusFocusVM.ReportDirectory, DateTime.Now.ToString("yyyy-MM-dd--HH-mm-ss") + ".json");
-            File.WriteAllText(path, reportText);
+            // Atomic write: NINA core watches ReportDirectory and File.OpenText's new reports; a plain
+            // File.WriteAllText's open write handle races that reader into a sharing-violation IOException.
+            PathUtility.WriteAllTextAtomic(path, reportText);
 
             var firstRegionReport = regionReports[0];
             var autoFocusInfo = new AutoFocusInfo(firstRegionReport.Temperature, firstRegionReport.CalculatedFocusPoint.Position, firstRegionReport.Filter, firstRegionReport.Timestamp);
@@ -1474,7 +1487,10 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             var report = GenerateReportForRegion(e, 0);
             var reportText = JsonConvert.SerializeObject(report, Formatting.Indented);
             string path = Path.Combine(HocusFocusVM.ReportDirectory, DateTime.Now.ToString("yyyy-MM-dd--HH-mm-ss") + ".json");
-            File.WriteAllText(path, reportText);
+            // Atomic write (see the success-path write above): avoids the ReportDirectory read-while-write race
+            // with NINA core's AutoFocusToolVM.LoadChart. This is the exact site that produced the reported
+            // IOException on the AF-failed path.
+            PathUtility.WriteAllTextAtomic(path, reportText);
         }
 
         private HocusFocusReport GenerateReportForRegion(AutoFocusFinishedEventArgsBase e, int regionIndex) {
