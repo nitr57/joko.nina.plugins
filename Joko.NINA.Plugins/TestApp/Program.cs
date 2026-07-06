@@ -18,6 +18,7 @@ using NINA.Image.ImageAnalysis;
 using NINA.Joko.Plugins.HocusFocus.Inspection;
 using NINA.Joko.Plugins.HocusFocus.Interfaces;
 using NINA.Joko.Plugins.HocusFocus.StarDetection;
+using NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization.Review;
 using NINA.Joko.Plugins.HocusFocus.Utility;
 using NINA.WPF.Base.Utility.AutoFocus;
 using OpenCvSharp;
@@ -109,6 +110,113 @@ namespace TestApp {
                 return;
             }
 
+            // Headless focus-sweep diagnostic mode: `TestApp focus-sweep --af-run <dir> ...`
+            if (args.Length > 0 && args[0].Equals("focus-sweep", StringComparison.OrdinalIgnoreCase)) {
+                await FocusSweepDiagnosticRunner.Run(args);
+                return;
+            }
+
+            // Headless AF fit + outlier-rejection diagnostic mode: `TestApp af-fit --af-run <dir> ...`
+            if (args.Length > 0 && args[0].Equals("af-fit", StringComparison.OrdinalIgnoreCase)) {
+                await AfFitDiagnosticRunner.Run(args);
+                return;
+            }
+
+            // Headless star-detection optimizer harness: `TestApp optimize --runs <dir> ...`
+            if (args.Length > 0 && args[0].Equals("optimize", StringComparison.OrdinalIgnoreCase)) {
+                await OptimizationDiagnosticRunner.Run(args);
+                return;
+            }
+
+            // Headless label-classification diagnostic: `TestApp diagnose-labels --runs <dir> --labels <dir> ...`.
+            // Classifies each human-labeled review box (missed/shouldReject/wronglyRejected) against a fresh
+            // detection: ACCEPTED / REJECTED:<reason> / NO CANDIDATE (structure gap).
+            if (args.Length > 0 && args[0].Equals("diagnose-labels", StringComparison.OrdinalIgnoreCase)) {
+                DiagnoseLabelsRunner.Run(args);
+                return;
+            }
+
+            // Headless label-driven gate RECOMMENDER: `TestApp recommend --runs <dir> --labels <dir> ...`. Runs the
+            // analyzer + recommender the in-wizard "Optimize with feedback" uses, printing the per-gate breakdown
+            // and the recommended threshold changes (precision-bounded) without launching NINA.
+            if (args.Length > 0 && args[0].Equals("recommend", StringComparison.OrdinalIgnoreCase)) {
+                RecommendRunner.Run(args);
+                return;
+            }
+
+            // Interactive two-pass star-review labeling tool: `TestApp review --runs <dir> ...`. The runner does its
+            // async loading/detection on this thread, then constructs and shows the WPF window on a dedicated STA
+            // thread it creates internally — so it is correct regardless of this thread's apartment (an async Main
+            // can resume off the [STAThread] main thread after an await, which would otherwise crash window ctor).
+            if (args.Length > 0 && args[0].Equals("review", StringComparison.OrdinalIgnoreCase)) {
+                StarReview.StarReviewRunner.Run(args);
+                return;
+            }
+
+            // Minimal CSV-driven annotator: `TestApp annotate --image <frame> --stars <csv> ...` (or --runs).
+            // Overlays an external star list on the real plugin MTF stretch; also exports plain stretched PNGs.
+            if (args.Length > 0 && args[0].Equals("annotate", StringComparison.OrdinalIgnoreCase)) {
+                await AnnotateRunner.Run(args);
+                return;
+            }
+
+            // AF-bank verification orchestrators (Steps 1-5 of plans/autofocus-bank-verification-plan.md):
+            //   bank-clean    — idempotent dry-run-first cleanup of stale per-config clutter in each run folder.
+            //   export-linear — write linear mono-FITS sidecars (NINA loader: XISF + debayer) so the golden
+            //                   reference detector can read every run, not just the mono-FITS ones.
+            //   bank-donut-meta — per-run donut-aware decision -> run_meta.json (refined heuristic).
+            //   bank-verify   — per run x config {C0 as-default, A optimized, B optimized+donut} metrics ->
+            //                   timestamped verification_<UTC>.{json,md} at the bank root.
+            if (args.Length > 0 && args[0].Equals("bank-clean", StringComparison.OrdinalIgnoreCase)) {
+                BankCleanRunner.Run(args);
+                return;
+            }
+            if (args.Length > 0 && args[0].Equals("export-linear", StringComparison.OrdinalIgnoreCase)) {
+                await ExportLinearRunner.Run(args);
+                return;
+            }
+            if (args.Length > 0 && args[0].Equals("bank-donut-meta", StringComparison.OrdinalIgnoreCase)) {
+                await BankDonutMetaRunner.Run(args);
+                return;
+            }
+            if (args.Length > 0 && args[0].Equals("bank-verify", StringComparison.OrdinalIgnoreCase)) {
+                await BankVerifyRunner.Run(args);
+                return;
+            }
+
+            // Headless aberration-inspector alignment reproducer: `TestApp inspect-align --runs <folder> ...`.
+            // Drives the real SensorModel.RegisterStarsAndFit RANSAC alignment and reports the reference frame,
+            // per-frame triangle counts, frames aligned, and every registration warning.
+            if (args.Length > 0 && args[0].Equals("inspect-align", StringComparison.OrdinalIgnoreCase)) {
+                await InspectAlignRunner.Run(args);
+                return;
+            }
+
+            // Headless tilt-calibration validator: `TestApp tilt --dataset <folder> ...`. Reproduces the Tilt
+            // Adapter Wizard's calibration over a bank of saved AF runs and reports computed screw angles +
+            // recovered hardware against ground-truth metadata. Optionally runs (and persists) star-detection
+            // optimization first.
+            if (args.Length > 0 && args[0].Equals("tilt", StringComparison.OrdinalIgnoreCase)) {
+                await TiltCalibrationRunner.Run(args);
+                return;
+            }
+
+            // Golden-set audit tools: `TestApp golden tiles --runs <dir> ...` renders MTF-stretched tiles for
+            // visual golden-set authoring (no detection); `TestApp golden eval --runs <dir> ...` runs the real
+            // detector and scores precision/recall against the visual golden.json. See .claude/docs/golden-star-set.md.
+            if (args.Length > 0 && args[0].Equals("golden", StringComparison.OrdinalIgnoreCase)) {
+                var sub = args.Length > 1 ? args[1] : "";
+                if (sub.Equals("tiles", StringComparison.OrdinalIgnoreCase)) {
+                    await GoldenRunner.Run(args);
+                } else if (sub.Equals("eval", StringComparison.OrdinalIgnoreCase)) {
+                    await GoldenEvalRunner.Run(args);
+                } else {
+                    Console.Error.WriteLine("Usage: TestApp golden tiles|eval --runs <dir> ...");
+                    Environment.ExitCode = 2;
+                }
+                return;
+            }
+
             // Headless contamination diagnostic mode: `TestApp contamination --image <path> ...` (or any
             // invocation that passes --image). Otherwise fall through to the existing WPF GUI.
             bool diagnosticMode = args.Length > 0 &&
@@ -161,15 +269,9 @@ namespace TestApp {
             }
         }
 
-        public static BitmapSource ToBitmapSource(Mat src, PixelFormat pf) {
-            int stride = (src.Width * pf.BitsPerPixel + 7) / 8;
-            double dpi = 96;
-
-            var dataSize = (long)src.DataEnd - (long)src.DataStart;
-            var source = BitmapSource.Create(src.Width, src.Height, dpi, dpi, pf, null, src.DataStart, (int)dataSize, stride);
-            source.Freeze();
-            return source;
-        }
+        // Delegates to the shared plugin helper so the Mat->BitmapSource conversion lives in one place (the same
+        // helper the review UI/wizard use). Kept here for TestApp's existing GUI/annotation path callers.
+        public static BitmapSource ToBitmapSource(Mat src, PixelFormat pf) => StarReviewImaging.ToBitmapSource(src, pf);
 
         public static void ConvertToFloat(Mat src, Mat dst) {
             if (src.Size() != dst.Size() || dst.Type() != MatType.CV_32F) {

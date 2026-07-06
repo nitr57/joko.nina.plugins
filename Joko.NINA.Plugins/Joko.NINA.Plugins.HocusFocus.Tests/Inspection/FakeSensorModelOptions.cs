@@ -8,6 +8,8 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.Inspection {
 
         public int StepCount { get; set; }
         public int StepSize { get; set; }
+        public int SignalAmplification { get; set; } = 2;
+        public bool CenterFocuserBeforeRun { get; set; } = false;
         public int FramesPerPoint { get; set; }
         public int TimeoutSeconds { get; set; }
         public int NumRegionsWide { get; set; } = 7;
@@ -34,6 +36,7 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.Inspection {
         public double StartingBrightnessDiff { get; set; } = -1;
         public bool SaveImagesOnReruns { get; set; }
         public bool SaveAlignmentImages { get; set; }
+        public bool FrameReviewEnabled { get; set; }
         public int MaxStarsPerRegion { get; set; } = -1;
         public double AcceptableRSquaredMin { get; set; } = 0.05;
     }
@@ -53,6 +56,7 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.Inspection {
         public int AutoFocusTimeoutSeconds { get; set; }
         public string SavePath { get; set; }
         public bool Save { get; set; }
+        public bool KeepFramesForReview { get; set; }
         public string LastSelectedLoadPath { get; set; }
         public int FocuserOffset { get; set; }
         public int MaxOutlierRejections { get; set; }

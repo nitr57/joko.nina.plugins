@@ -116,5 +116,84 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.AutoFocus {
             var vm = Build();
             Assert.That(vm.IsTool, Is.True);
         }
+
+        [Test]
+        public void ApplySignalAmplification_LiveRun_DividesStepSizeAndMultipliesStepCount() {
+            var options = new AutoFocusEngineOptions { AutoFocusInitialOffsetSteps = 4, AutoFocusStepSize = 100 };
+            InspectorVM.ApplySignalAmplification(options, signalAmplification: 2, isLiveCapture: true);
+            Assert.Multiple(() => {
+                Assert.That(options.AutoFocusInitialOffsetSteps, Is.EqualTo(8));
+                Assert.That(options.AutoFocusStepSize, Is.EqualTo(50));
+            });
+        }
+
+        [TestCase(1)]   // factor of 1 disables amplification
+        [TestCase(0)]   // clamped to 1 -> no-op
+        [TestCase(-3)]  // clamped to 1 -> no-op
+        public void ApplySignalAmplification_FactorOfOneOrLess_IsNoOp(int amp) {
+            var options = new AutoFocusEngineOptions { AutoFocusInitialOffsetSteps = 4, AutoFocusStepSize = 100 };
+            InspectorVM.ApplySignalAmplification(options, signalAmplification: amp, isLiveCapture: true);
+            Assert.Multiple(() => {
+                Assert.That(options.AutoFocusInitialOffsetSteps, Is.EqualTo(4));
+                Assert.That(options.AutoFocusStepSize, Is.EqualTo(100));
+            });
+        }
+
+        [Test]
+        public void ApplySignalAmplification_Replay_IsNoOp() {
+            // On replay the saved frames' focuser positions are fixed, so amplification must not change the sweep.
+            var options = new AutoFocusEngineOptions { AutoFocusInitialOffsetSteps = 4, AutoFocusStepSize = 100 };
+            InspectorVM.ApplySignalAmplification(options, signalAmplification: 3, isLiveCapture: false);
+            Assert.Multiple(() => {
+                Assert.That(options.AutoFocusInitialOffsetSteps, Is.EqualTo(4));
+                Assert.That(options.AutoFocusStepSize, Is.EqualTo(100));
+            });
+        }
+
+        [Test]
+        public void ApplySignalAmplification_StepSizeFloorsAtOne() {
+            var options = new AutoFocusEngineOptions { AutoFocusInitialOffsetSteps = 5, AutoFocusStepSize = 1 };
+            InspectorVM.ApplySignalAmplification(options, signalAmplification: 4, isLiveCapture: true);
+            Assert.Multiple(() => {
+                Assert.That(options.AutoFocusInitialOffsetSteps, Is.EqualTo(20));
+                Assert.That(options.AutoFocusStepSize, Is.EqualTo(1));
+            });
+        }
+
+        [Test]
+        public void EstimateImagesPerRun_UsesOverridesThenProfileFallbacks() {
+            Assert.Multiple(() => {
+                // StepCount/FramesPerPoint unset (-1) => profile values; amp 2 doubles offset steps.
+                Assert.That(InspectorVM.EstimateImagesPerRun(-1, -1, 2, 4, 1), Is.EqualTo((17, 17)));
+                // Explicit overrides win over profile values.
+                Assert.That(InspectorVM.EstimateImagesPerRun(3, 2, 1, 4, 1), Is.EqualTo((7, 14)));
+                // Unknown when neither source is positive.
+                Assert.That(InspectorVM.EstimateImagesPerRun(-1, 1, 2, 0, 1), Is.EqualTo((0, 0)));
+            });
+        }
+
+        [Test]
+        public void BuildSignalAmplificationSummary_DescribesImageCount() {
+            var text = InspectorVM.BuildSignalAmplificationSummary(-1, -1, 2, 4, 1);
+            Assert.Multiple(() => {
+                Assert.That(text, Does.Contain("~17 images"));
+                Assert.That(text, Does.Contain("17 focus positions"));
+                Assert.That(text, Does.Contain("1 runs a regular autofocus"));
+            });
+            Assert.That(InspectorVM.BuildSignalAmplificationSummary(-1, -1, 2, 0, 0), Is.Empty);
+        }
+
+        [Test]
+        public void HasInspectorRegionLayout_RequiresFullSixRegionGrid() {
+            // The region report indexes RegionHFRs[1..5], so fewer than 6 regions (e.g. a reprocessed single-region
+            // regular-AF run) must be rejected — the guard that turns the old IndexOutOfRange crash into a clean log.
+            Assert.Multiple(() => {
+                Assert.That(InspectorVM.HasInspectorRegionLayout(0), Is.False);
+                Assert.That(InspectorVM.HasInspectorRegionLayout(1), Is.False);
+                Assert.That(InspectorVM.HasInspectorRegionLayout(5), Is.False);
+                Assert.That(InspectorVM.HasInspectorRegionLayout(6), Is.True);
+                Assert.That(InspectorVM.HasInspectorRegionLayout(7), Is.True);
+            });
+        }
     }
 }

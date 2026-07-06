@@ -7,6 +7,8 @@
     xmlns:hfenum="clr-namespace:NINA.Joko.Plugins.HocusFocus.Interfaces"
     xmlns:hfrules="clr-namespace:NINA.Joko.Plugins.HocusFocus.ValidationRules"
     xmlns:local="clr-namespace:NINA.Joko.Plugins.HocusFocus.AutoFocus"
+    xmlns:afreview="clr-namespace:NINA.Joko.Plugins.HocusFocus.AutoFocus.Review"
+    xmlns:replay="clr-namespace:NINA.Joko.Plugins.HocusFocus.AutoFocus.Replay"
     xmlns:ninactrl="clr-namespace:NINA.CustomControlLibrary;assembly=NINA.CustomControlLibrary"
     xmlns:ns="clr-namespace:NINA.Core.Locale;assembly=NINA.Core"
     xmlns:oxy="clr-namespace:OxyPlot.Wpf;assembly=OxyPlot.Contrib.Wpf"
@@ -15,6 +17,7 @@
     xmlns:util="clr-namespace:NINA.Core.Utility;assembly=NINA.Core">
     <ResourceDictionary.MergedDictionaries>
         <ResourceDictionary Source="../Resources/OptionsDataTemplates.xaml" />
+        <ResourceDictionary Source="../Resources/SharedTooltips.xaml" />
     </ResourceDictionary.MergedDictionaries>
     <TextBlock x:Key="ClearAnalyses_Tooltip" Text="Clear charts and analyses. This can be useful if the chart rendering is slowing NINA down, especially after you're finished with aberration inspection" />
     <TextBlock x:Key="DetailedAnalysis_Tooltip" Text="Run an autofocus to detect various aberrations, such as tilt, incorrect backfocus, and field curvature" />
@@ -83,9 +86,26 @@
     <TextBlock x:Key="SDR_SaturatedPixels_Tooltip" Text="The total number of saturated (clipped) pixels encountered across all detected stars." />
     <TextBlock x:Key="SDR_Hotpixels_Tooltip" Text="The number of hot pixels identified and filtered out during detection." />
     <TextBlock x:Key="SDR_Contaminated_Tooltip" Text="Stars flagged as contaminated by a localized neighbor or hot column (after the smooth local background gradient is removed). With 'Reject Contaminated Stars' enabled they are rejected; otherwise they are kept and only flagged." />
+    <TextBlock x:Key="SDR_TooElongated_Tooltip" Text="Candidates rejected as diffraction spikes or satellite/aircraft trails because their shape was too linear (high eccentricity). Only active when Defocus-Aware Donut Detection and the streak gate are enabled." />
+    <TextBlock x:Key="SDR_BloomSuppressed_Tooltip" Text="Candidates rejected because they fell within the saturation bloom radius of a bright saturated star (halo/bloom fragments). Only active when Defocus-Aware Donut Detection and a bloom radius are enabled." />
+    <TextBlock x:Key="SDR_RelaxationAdmitted_Tooltip" Text="Accepted stars that were admitted only because a defocus-aware gate (distortion and/or centering) relaxed its threshold — they would have failed the strict gate. Always zero when the defocus-aware gates are off. Large near-focus values can indicate the relaxation is admitting junk blobs." />
+
+    <!--  The manual AutoFocus "Review Frames" window content. Implicit DataType template so the WindowService's
+          ContentPresenter resolves it by VM type (same mechanism as the Aberration Inspector's Review Frames).  -->
+    <DataTemplate DataType="{x:Type afreview:AutoFocusFrameReviewVM}">
+        <!--  No fixed min size: the control sizes its host window to fit the screen on load (see code-behind), and the
+              layout shrinks the image column first so the legend stays visible when the window is made smaller.  -->
+        <afreview:AutoFocusFrameReviewControl />
+    </DataTemplate>
+
+    <!--  The replay-settings prompt (use current / use captured in-memory / update profile) shown when replaying a
+          saved run that has a metadata.json. Implicit DataType template resolved by the WindowService, same as above.  -->
+    <DataTemplate DataType="{x:Type replay:ReplaySettingsPromptVM}">
+        <replay:ReplaySettingsPromptControl />
+    </DataTemplate>
 
     <DataTemplate x:Key="NINA.Joko.Plugins.HocusFocus.AutoFocus.HocusFocusVM_Dockable">
-        <Grid>
+        <Grid local:InteractiveHostBehavior.HostInteractive="True">
             <Grid.RowDefinitions>
                 <RowDefinition MinHeight="150" />
                 <RowDefinition Height="Auto" />
@@ -598,13 +618,40 @@
                 Padding="5,0,5,0"
                 HorizontalAlignment="Left"
                 VerticalAlignment="Bottom"
-                ButtonText="Reprocess Saved Run"
+                ButtonText="Replay Saved AF"
                 CancelButtonImage="{StaticResource CancelSVG}"
                 CancelCommand="{Binding CancelLoadSavedAutoFocusRunCommand}"
                 CancelToolTip="{ns:Loc LblCancel}"
                 Command="{Binding LoadSavedAutoFocusRunCommand}"
-                IsEnabled="{Binding AutoFocusInProgress, Converter={StaticResource InverseBooleanConverter}}"
-                ToolTip="Reprocesses AutoFocus images saved by having Save enabled in Hocus Focus -&gt; Auto Focus Options. This produces an auto focus curve using whatever the current star detection and fit settings are" />
+                ToolTip="Replays saved AutoFocus images (Save enabled in Hocus Focus -&gt; Auto Focus Options) to produce an auto focus curve using whatever the current star detection and fit settings are" />
+            <StackPanel
+                Grid.Row="3"
+                Margin="0,15,10,5"
+                HorizontalAlignment="Right"
+                VerticalAlignment="Bottom"
+                Orientation="Horizontal">
+                <Button
+                    Height="25"
+                    Padding="5,0,5,0"
+                    VerticalAlignment="Center"
+                    Command="{Binding ReviewFramesCommand}"
+                    ToolTip="Open the Review Frames window to inspect each frame of the last auto-focus run started from this pane (a live run or a Replay Saved AF) — its detected stars with the Hocus Focus Star Annotator's bounds, per-star text, rejection-reason and ROI boxes, plus per-frame HFR statistics. Enabled after such a run completes with &quot;Keep frames for review&quot; turned on.">
+                    <TextBlock Margin="5,0,5,0" Text="Review Frames" />
+                </Button>
+                <StackPanel
+                    Margin="12,0,0,0"
+                    VerticalAlignment="Center"
+                    Orientation="Horizontal"
+                    ToolTip="When on, the per-frame images from an auto-focus run started here in the AutoFocus pane — a live run or a Replay Saved AF — are kept in memory so the &quot;Review Frames&quot; button can show each frame with its detected stars and HFRs. Only applies to runs from this pane — auto-focus during an imaging sequence never keeps frames (it would use too much memory). The frames are released when you start a new run or close the review window. Off by default; saved in your profile.">
+                    <CheckBox
+                        VerticalAlignment="Center"
+                        IsChecked="{Binding AutoFocusOptions.KeepFramesForReview}" />
+                    <TextBlock
+                        Margin="5,0,0,0"
+                        VerticalAlignment="Center"
+                        Text="Keep frames for review" />
+                </StackPanel>
+            </StackPanel>
         </Grid>
     </DataTemplate>
     <DataTemplate DataType="{x:Type local:HocusFocusVM}">
@@ -910,6 +957,32 @@
                                 <TextBlock
                                     Width="120"
                                     VerticalAlignment="Center"
+                                    Text="Too Elongated"
+                                    ToolTip="{StaticResource SDR_TooElongated_Tooltip}" />
+                                <TextBlock
+                                    Width="70"
+                                    HorizontalAlignment="Center"
+                                    VerticalAlignment="Center"
+                                    Text="{Binding Metrics.TooElongated, Converter={StaticResource HF_ZeroToDoubleDashConverter}}" />
+                            </StackPanel>
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock
+                                    Width="120"
+                                    VerticalAlignment="Center"
+                                    Text="Bloom Suppressed"
+                                    ToolTip="{StaticResource SDR_BloomSuppressed_Tooltip}" />
+                                <TextBlock
+                                    Width="70"
+                                    HorizontalAlignment="Center"
+                                    VerticalAlignment="Center"
+                                    Text="{Binding Metrics.BloomSuppressed, Converter={StaticResource HF_ZeroToDoubleDashConverter}}" />
+                            </StackPanel>
+                        </UniformGrid>
+                        <UniformGrid Columns="2">
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock
+                                    Width="120"
+                                    VerticalAlignment="Center"
                                     Text="HFR Too Low"
                                     ToolTip="{StaticResource SDR_TooLowHFR_Tooltip}" />
                                 <TextBlock
@@ -995,6 +1068,18 @@
                                     HorizontalAlignment="Center"
                                     VerticalAlignment="Center"
                                     Text="{Binding Metrics.ContaminationSuspected, Converter={StaticResource HF_ZeroToDoubleDashConverter}}" />
+                            </StackPanel>
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock
+                                    Width="120"
+                                    VerticalAlignment="Center"
+                                    Text="Relaxation Admitted"
+                                    ToolTip="{StaticResource SDR_RelaxationAdmitted_Tooltip}" />
+                                <TextBlock
+                                    Width="70"
+                                    HorizontalAlignment="Center"
+                                    VerticalAlignment="Center"
+                                    Text="{Binding Metrics.RelaxationAdmittedCount, Converter={StaticResource HF_ZeroToDoubleDashConverter}}" />
                             </StackPanel>
                         </UniformGrid>
                     </StackPanel>
@@ -1275,6 +1360,113 @@
                             Text="Clear Analyses"
                             TextWrapping="Wrap" />
                     </Button>
+                    <Button
+                        Grid.Row="3"
+                        Grid.Column="1"
+                        Margin="5"
+                        HorizontalAlignment="Center"
+                        VerticalAlignment="Center"
+                        Command="{Binding ReviewFramesCommand}"
+                        ToolTip="Open the Review Frames window to inspect each Sensor Curve Model frame — its detected stars, HFRs, and cross-frame registration (with alignment arrows when RANSAC alignment is on). Enabled after a run completes with &quot;Keep frames for Review&quot; turned on.">
+                        <TextBlock
+                            Margin="10,5,10,5"
+                            Foreground="{StaticResource ButtonForegroundBrush}"
+                            Text="Review Frames"
+                            TextWrapping="Wrap" />
+                    </Button>
+                    <StackPanel
+                        Grid.Row="3"
+                        Grid.Column="2"
+                        Margin="5"
+                        VerticalAlignment="Center"
+                        Orientation="Horizontal"
+                        ToolTip="When on, the per-frame images from a Sensor Curve Model run are retained in memory so the &quot;Review Frames&quot; button can show each frame with its detected stars, HFRs, and cross-frame registration. Requires the Sensor Curve Model to be enabled. Increases memory use while the run's results are kept (the frames are released when you clear the analysis, start a new run, or close the review window). Off by default.">
+                        <CheckBox
+                            VerticalAlignment="Center"
+                            IsChecked="{Binding InspectorOptions.FrameReviewEnabled}"
+                            IsEnabled="{Binding InspectorOptions.SensorCurveModelEnabled}" />
+                        <TextBlock
+                            Margin="5,0,0,0"
+                            VerticalAlignment="Center"
+                            Text="Keep frames for Review" />
+                    </StackPanel>
+
+                    <!--  Sweep-cost settings: kept out of the Options expander because they directly
+                          control how long every sensor-model / tilt-calibration run takes.  -->
+                    <Grid
+                        Grid.Row="4"
+                        Grid.ColumnSpan="4"
+                        Margin="0,4,0,0">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock
+                            Grid.Row="0"
+                            Grid.Column="0"
+                            Margin="5"
+                            VerticalAlignment="Center"
+                            Text="Signal Amplification"
+                            ToolTip="{StaticResource SignalAmplification_Tooltip}" />
+                        <ninactrl:UnitTextBox
+                            Grid.Row="0"
+                            Grid.Column="1"
+                            MinWidth="40"
+                            VerticalAlignment="Center"
+                            HorizontalContentAlignment="Left"
+                            VerticalContentAlignment="Center"
+                            Foreground="{StaticResource PrimaryBrush}"
+                            TextAlignment="Left"
+                            ToolTip="{StaticResource SignalAmplification_Tooltip}"
+                            Unit="x">
+                            <Binding
+                                Mode="TwoWay"
+                                Path="InspectorOptions.SignalAmplification"
+                                UpdateSourceTrigger="LostFocus" />
+                        </ninactrl:UnitTextBox>
+                        <TextBlock
+                            Grid.Row="0"
+                            Grid.Column="2"
+                            MaxWidth="400"
+                            Margin="10,5,5,5"
+                            HorizontalAlignment="Left"
+                            VerticalAlignment="Center"
+                            FontStyle="Italic"
+                            Opacity="0.7"
+                            Text="{Binding SignalAmplificationSummary}"
+                            TextWrapping="Wrap" />
+                        <TextBlock
+                            Grid.Row="1"
+                            Grid.Column="0"
+                            Margin="5"
+                            VerticalAlignment="Center"
+                            Text="Center Focuser First"
+                            ToolTip="{StaticResource CenterFocuserBeforeRun_Tooltip}" />
+                        <CheckBox
+                            Grid.Row="1"
+                            Grid.Column="1"
+                            Margin="5,0,0,0"
+                            HorizontalAlignment="Left"
+                            VerticalAlignment="Center"
+                            IsChecked="{Binding InspectorOptions.CenterFocuserBeforeRun}"
+                            ToolTip="{StaticResource CenterFocuserBeforeRun_Tooltip}" />
+                        <TextBlock
+                            Grid.Row="1"
+                            Grid.Column="2"
+                            MaxWidth="400"
+                            Margin="10,5,5,5"
+                            HorizontalAlignment="Left"
+                            VerticalAlignment="Center"
+                            FontStyle="Italic"
+                            Opacity="0.7"
+                            Text="Runs one standard autofocus to center the focuser before each measurement sweep. Turn on if your focuser drifts between runs or starts far from best focus; leave off to save time."
+                            TextWrapping="Wrap" />
+                    </Grid>
                 </Grid>
                 <Expander
                     Grid.Row="1"
@@ -2639,6 +2831,13 @@
                         </TextBlock>
                         <!--  Calibrated guidance branch  -->
                         <StackPanel Visibility="{Binding HasTiltAdapterCalibration, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}">
+                            <!--  Direction legend: ⬆/⬇ = adapter motion, ⟳/⟲ = screw rotation. First
+                                  element so the conventions are read before the table.  -->
+                            <TextBlock
+                                Margin="5,4,5,2"
+                                controls:IconizedText.Text="{Binding TiltGuidance.DirectionLegend}"
+                                TextWrapping="Wrap"
+                                Visibility="{Binding TiltGuidance.HasDirectionLegend, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
                             <!--  No measurement yet  -->
                             <TextBlock
                                 Margin="5"
@@ -2761,23 +2960,65 @@
                                     Grid.Column="4"
                                     HorizontalAlignment="Center"
                                     FontSize="18"
-                                    Text="{Binding TiltGuidance.Screw4BackfocusArrow}">
-                                    <TextBlock.Style>
-                                        <Style TargetType="TextBlock">
-                                            <Setter Property="Visibility" Value="Collapsed" />
-                                            <Style.Triggers>
-                                                <MultiDataTrigger>
-                                                    <MultiDataTrigger.Conditions>
-                                                        <Condition Binding="{Binding TiltGuidance.HasFourScrews}" Value="True" />
-                                                        <Condition Binding="{Binding TiltGuidance.HasBackfocusRow}" Value="True" />
-                                                    </MultiDataTrigger.Conditions>
-                                                    <Setter Property="Visibility" Value="Visible" />
-                                                </MultiDataTrigger>
-                                            </Style.Triggers>
-                                        </Style>
-                                    </TextBlock.Style>
-                                </TextBlock>
+                                    Text="{Binding TiltGuidance.Screw4BackfocusArrow}"
+                                    Visibility="{Binding TiltGuidance.HasFourScrewBackfocus, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
                             </Grid>
+
+                            <!--  Precise numeric adjustments, each with its rotation glyph / step sign — shown when adapter hardware is configured  -->
+                            <Grid
+                                Margin="5,8,5,0"
+                                Visibility="{Binding TiltGuidance.HasNumericGuidance, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="75" />
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                </Grid.RowDefinitions>
+                                <!--  Header  -->
+                                <TextBlock Grid.Row="0" Grid.Column="1" HorizontalAlignment="Center" FontWeight="SemiBold" Text="Screw 1" />
+                                <TextBlock Grid.Row="0" Grid.Column="2" HorizontalAlignment="Center" FontWeight="SemiBold" Text="Screw 2" />
+                                <TextBlock Grid.Row="0" Grid.Column="3" HorizontalAlignment="Center" FontWeight="SemiBold" Text="Screw 3" />
+                                <TextBlock Grid.Row="0" Grid.Column="4" HorizontalAlignment="Center" FontWeight="SemiBold" Text="Screw 4"
+                                    Visibility="{Binding TiltGuidance.HasFourScrews, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
+                                <!--  Tilt amounts — ⟳/⟲ in the bound strings render as icons via IconizedText  -->
+                                <TextBlock Grid.Row="1" Grid.Column="0" VerticalAlignment="Center" Text="Tilt" />
+                                <TextBlock Grid.Row="1" Grid.Column="1" HorizontalAlignment="Center" controls:IconizedText.Text="{Binding TiltGuidance.Screw1TiltAmount}" />
+                                <TextBlock Grid.Row="1" Grid.Column="2" HorizontalAlignment="Center" controls:IconizedText.Text="{Binding TiltGuidance.Screw2TiltAmount}" />
+                                <TextBlock Grid.Row="1" Grid.Column="3" HorizontalAlignment="Center" controls:IconizedText.Text="{Binding TiltGuidance.Screw3TiltAmount}" />
+                                <TextBlock Grid.Row="1" Grid.Column="4" HorizontalAlignment="Center" controls:IconizedText.Text="{Binding TiltGuidance.Screw4TiltAmount}"
+                                    Visibility="{Binding TiltGuidance.HasFourScrews, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
+                                <!--  Backfocus amounts — ⟳/⟲ render as icons via IconizedText  -->
+                                <TextBlock Grid.Row="2" Grid.Column="0" VerticalAlignment="Center" Text="Backfocus" />
+                                <TextBlock Grid.Row="2" Grid.Column="1" HorizontalAlignment="Center" controls:IconizedText.Text="{Binding TiltGuidance.Screw1BackfocusAmount}" />
+                                <TextBlock Grid.Row="2" Grid.Column="2" HorizontalAlignment="Center" controls:IconizedText.Text="{Binding TiltGuidance.Screw2BackfocusAmount}" />
+                                <TextBlock Grid.Row="2" Grid.Column="3" HorizontalAlignment="Center" controls:IconizedText.Text="{Binding TiltGuidance.Screw3BackfocusAmount}" />
+                                <TextBlock Grid.Row="2" Grid.Column="4" HorizontalAlignment="Center" controls:IconizedText.Text="{Binding TiltGuidance.Screw4BackfocusAmount}"
+                                    Visibility="{Binding TiltGuidance.HasFourScrews, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
+                                <!--  Total — ⟳/⟲ render as icons via IconizedText; SemiBold on the cell carries to the Run  -->
+                                <TextBlock Grid.Row="3" Grid.Column="0" VerticalAlignment="Center" FontWeight="SemiBold" Text="Total" />
+                                <TextBlock Grid.Row="3" Grid.Column="1" HorizontalAlignment="Center" FontWeight="SemiBold" controls:IconizedText.Text="{Binding TiltGuidance.Screw1TotalAmount}" />
+                                <TextBlock Grid.Row="3" Grid.Column="2" HorizontalAlignment="Center" FontWeight="SemiBold" controls:IconizedText.Text="{Binding TiltGuidance.Screw2TotalAmount}" />
+                                <TextBlock Grid.Row="3" Grid.Column="3" HorizontalAlignment="Center" FontWeight="SemiBold" controls:IconizedText.Text="{Binding TiltGuidance.Screw3TotalAmount}" />
+                                <TextBlock Grid.Row="3" Grid.Column="4" HorizontalAlignment="Center" FontWeight="SemiBold" controls:IconizedText.Text="{Binding TiltGuidance.Screw4TotalAmount}"
+                                    Visibility="{Binding TiltGuidance.HasFourScrews, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
+                            </Grid>
+
+                            <!--  Saved-vs-measured pitch mismatch warning  -->
+                            <Border
+                                Margin="5,6,5,0"
+                                Padding="5"
+                                BorderBrush="{StaticResource NotificationWarningBrush}"
+                                BorderThickness="1"
+                                Visibility="{Binding TiltGuidance.HasPitchMismatch, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}">
+                                <TextBlock Text="{Binding TiltGuidance.PitchMismatchWarning}" TextWrapping="Wrap" />
+                            </Border>
                         </StackPanel>
                     </StackPanel>
                 </Expander>

@@ -18,19 +18,19 @@
     <OutputPath>bin\x64\Debug\</OutputPath>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <NoStdLib>true</NoStdLib>
-    <NoWarn>1701;1702;CA1416</NoWarn>
+    <NoWarn>1701;1702;CA1416;NU1701</NoWarn>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)' == 'Release|x64'">
     <OutputPath>bin\x64\Release\</OutputPath>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <NoStdLib>true</NoStdLib>
-    <NoWarn>1701;1702;CA1416</NoWarn>
+    <NoWarn>1701;1702;CA1416;NU1701</NoWarn>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|AnyCPU'">
-    <NoWarn>1701;1702;CA1416</NoWarn>
+    <NoWarn>1701;1702;CA1416;NU1701</NoWarn>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|AnyCPU'">
-    <NoWarn>1701;1702;CA1416</NoWarn>
+    <NoWarn>1701;1702;CA1416;NU1701</NoWarn>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\Joko.NINA.Plugins.HocusFocus\Joko.NINA.Plugins.HocusFocus.csproj" />
@@ -60,5 +60,19 @@
   </ItemGroup>
   <Target Name="PostBuild" AfterTargets="PostBuildEvent">
     <Exec Command="echo TargetPath3: $(TargetPath)" />
+  </Target>
+  <!-- NINA.Image's FITS loader P/Invokes cfitsionative.dll (plus pthreadVC2/zlib) from
+       <appdir>\External\x64\Cfitsio, a tree NINA's installer deploys but no NuGet package ships —
+       without it TestApp's headless diagnostics die on .fits with DllNotFoundException. Mirror it
+       from a local NINA installation; when NINA isn't installed the wildcard expands empty and the
+       copy is a quiet no-op (.xisf/.tif still work). Override NinaInstallDir if installed elsewhere. -->
+  <PropertyGroup>
+    <NinaInstallDir Condition="'$(NinaInstallDir)' == ''">$(ProgramFiles)\N.I.N.A. - Nighttime Imaging 'N' Astronomy</NinaInstallDir>
+  </PropertyGroup>
+  <Target Name="CopyNinaCfitsioNatives" AfterTargets="Build">
+    <ItemGroup>
+      <NinaCfitsioNatives Include="$(NinaInstallDir)\External\x64\Cfitsio\**\*.*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(NinaCfitsioNatives)" DestinationFiles="@(NinaCfitsioNatives->'$(OutDir)External\x64\Cfitsio\%(RecursiveDir)%(Filename)%(Extension)')" SkipUnchangedFiles="true" />
   </Target>
 </Project>

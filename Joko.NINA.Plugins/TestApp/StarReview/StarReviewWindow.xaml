@@ -1,0 +1,14 @@
+<Window
+    x:Class="TestApp.StarReview.StarReviewWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:review="clr-namespace:NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization.Review;assembly=NINA.Joko.Plugins.HocusFocus"
+    Title="Star Detection Review — label missed / should-reject"
+    Width="1280"
+    Height="900"
+    Background="#FF1E2125">
+    <!-- Thin host: the reusable review UI now lives in the plugin (so the in-NINA wizard can reuse it). This window
+         only sizes/titles it and forwards its DataContext (the plugin StarReviewVM). Save-on-close is wired in the
+         runner's STA host (window.Closing -> vm.SaveAll). -->
+    <review:StarReviewControl DataContext="{Binding}" />
+</Window>

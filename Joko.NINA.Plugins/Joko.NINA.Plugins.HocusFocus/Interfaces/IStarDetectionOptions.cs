@@ -13,6 +13,7 @@
 using NINA.Core.Utility;
 using NINA.Joko.Plugins.HocusFocus.Converters;
 using NINA.Joko.Plugins.HocusFocus.StarDetection;
+using NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization;
 using System.ComponentModel;
 
 namespace NINA.Joko.Plugins.HocusFocus.Interfaces {
@@ -88,9 +89,22 @@ namespace NINA.Joko.Plugins.HocusFocus.Interfaces {
         double ContaminationSensitivity { get; set; }
         bool RejectContaminatedStars { get; set; }
         int StructureLayers { get; set; }
+        bool DefocusAwareStructure { get; set; }
+        int StructureLayerBoost { get; set; }
         double BrightnessSensitivity { get; set; }
         double StarPeakResponse { get; set; }
         double MaxDistortion { get; set; }
+        bool DefocusAwareGates { get; set; }
+        double DefocusDistortionSizeReference { get; set; }
+        double DefocusDistortionMinFactor { get; set; }
+        double DefocusCenteringToleranceFactor { get; set; }
+        bool DefocusAwareDonutDetection { get; set; }
+        int DonutMorphCloseSize { get; set; }
+        bool LocallyAdaptiveBinarization { get; set; }
+        int AdaptiveNoiseBlockSize { get; set; }
+        double DonutMinAnnularityHoleFraction { get; set; }
+        double DonutMaxStreakEccentricity { get; set; }
+        double DonutSaturationBloomRadius { get; set; }
         double StarCenterTolerance { get; set; }
         int StarBackgroundBoxExpansion { get; set; }
         int MinStarBoundingBoxSize { get; set; }
@@ -109,7 +123,17 @@ namespace NINA.Joko.Plugins.HocusFocus.Interfaces {
         bool UsePSFAbsoluteDeviation { get; set; }
         double HotpixelThreshold { get; set; }
         double SaturationThreshold { get; set; }
+        bool ExcludeSaturatedStarsFromHFR { get; set; }
         MeasurementAverageEnum MeasurementAverage { get; set; }
         bool PSFPixelIntegration { get; set; }
+
+        // Optimized settings snapshot (Star Detection Optimization Wizard)
+        bool HasOptimizedSettings { get; }
+
+        bool UseOptimizedSettings { get; set; }
+
+        OptimizedStarDetectionSettings GetOptimizedSettings();
+
+        void ApplyOptimizedSettings(OptimizedStarDetectionSettings settings);
     }
 }

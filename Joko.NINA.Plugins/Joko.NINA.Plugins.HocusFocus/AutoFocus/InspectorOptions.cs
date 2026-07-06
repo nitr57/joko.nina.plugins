@@ -45,9 +45,24 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             RaiseAllPropertiesChanged();
         }
 
+        // StepCount is a per-side AF offset-step count: -1 = use the profile's AutoFocus value, real
+        // values are small (single/double digits). Neither the setter nor the UI (a plain HintTextBox)
+        // constrains it, so 50 is a generous sanity bound used only to catch corrupted stores.
+        private const int MaxPlausibleStepCount = 50;
+
         private void InitializeOptions() {
             stepCount = optionsAccessor.GetValueInt32(nameof(StepCount), -1);
+            // Profiles written by builds with the old TimeoutSeconds bug (it persisted under the
+            // StepCount key) can hold a timeout value (e.g. 300) here. Reset implausible values to -1
+            // and write the correction back so the store is healed once instead of on every load.
+            if (stepCount < -1 || stepCount > MaxPlausibleStepCount) {
+                Logger.Warning($"InspectorOptions.StepCount loaded an implausible value ({stepCount}) — likely a TimeoutSeconds value written under the StepCount key by an older build. Resetting to -1 (use the profile's AutoFocus value).");
+                stepCount = -1;
+                optionsAccessor.SetValueInt32(nameof(StepCount), stepCount);
+            }
             stepSize = optionsAccessor.GetValueInt32(nameof(StepSize), -1);
+            signalAmplification = Math.Max(1, optionsAccessor.GetValueInt32(nameof(SignalAmplification), 2));
+            centerFocuserBeforeRun = optionsAccessor.GetValueBoolean(nameof(CenterFocuserBeforeRun), false);
             framesPerPoint = optionsAccessor.GetValueInt32(nameof(FramesPerPoint), -1);
             timeoutSeconds = optionsAccessor.GetValueInt32(nameof(TimeoutSeconds), -1);
             simpleExposureSeconds = optionsAccessor.GetValueDouble(nameof(SimpleExposureSeconds), -1);
@@ -73,6 +88,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             astigmaticCurvatureEnabled = optionsAccessor.GetValueBoolean(nameof(AstigmaticCurvatureEnabled), false);
             saveImagesOnReruns = optionsAccessor.GetValueBoolean(nameof(SaveImagesOnReruns), false);
             saveAlignmentImages = optionsAccessor.GetValueBoolean(nameof(SaveAlignmentImages), false);
+            frameReviewEnabled = optionsAccessor.GetValueBoolean(nameof(FrameReviewEnabled), false);
             maxStarsPerRegion = optionsAccessor.GetValueInt32(nameof(MaxStarsPerRegion), -1);
             acceptableRSquaredMin = optionsAccessor.GetValueDouble(nameof(AcceptableRSquaredMin), SensorAberrationCalculator.DefaultAcceptableRSquaredMin);
         }
@@ -80,6 +96,8 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
         public void ResetDefaults() {
             StepCount = -1;
             StepSize = -1;
+            SignalAmplification = 2;
+            CenterFocuserBeforeRun = false;
             FramesPerPoint = -1;
             TimeoutSeconds = -1;
             SimpleExposureSeconds = -1;
@@ -102,6 +120,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             useRANSAC = true;
             useAffineAlignment = false;
             astigmaticCurvatureEnabled = false;
+            FrameReviewEnabled = false;
             AcceptableRSquaredMin = SensorAberrationCalculator.DefaultAcceptableRSquaredMin;
         }
 
@@ -131,6 +150,40 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             }
         }
 
+        // Signal amplification factor for sensor-model / tilt calibration sweeps: divides the focuser step size and
+        // multiplies the step count by this factor, so a live run captures more, finer-spaced points over the same
+        // range. More points => more signal and smaller defocus jumps between adjacent frames (easier RANSAC
+        // alignment). Clamped to >= 1; 1 disables amplification. Applied only to live captures, never on replay.
+        private int signalAmplification = 2;
+
+        public int SignalAmplification {
+            get => signalAmplification;
+            set {
+                var clamped = Math.Max(1, value);
+                if (signalAmplification != clamped) {
+                    signalAmplification = clamped;
+                    optionsAccessor.SetValueInt32(nameof(SignalAmplification), signalAmplification);
+                    RaisePropertyChanged();
+                }
+            }
+        }
+
+        // When on, a quick standard autofocus is run before each live sensor-model / tilt sweep to center
+        // the focuser at best focus, so the sweep brackets focus symmetrically (fewer extreme one-sided defocus
+        // frames that fail to align). Off by default — it adds a full AF run to every sweep. No effect on replay.
+        private bool centerFocuserBeforeRun = false;
+
+        public bool CenterFocuserBeforeRun {
+            get => centerFocuserBeforeRun;
+            set {
+                if (centerFocuserBeforeRun != value) {
+                    centerFocuserBeforeRun = value;
+                    optionsAccessor.SetValueBoolean(nameof(CenterFocuserBeforeRun), centerFocuserBeforeRun);
+                    RaisePropertyChanged();
+                }
+            }
+        }
+
         private int framesPerPoint;
 
         public int FramesPerPoint {
@@ -151,7 +204,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             set {
                 if (timeoutSeconds != value) {
                     timeoutSeconds = value;
-                    optionsAccessor.SetValueInt32(nameof(StepCount), timeoutSeconds);
+                    optionsAccessor.SetValueInt32(nameof(TimeoutSeconds), timeoutSeconds);
                     RaisePropertyChanged();
                 }
             }
@@ -485,6 +538,19 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                 if (saveAlignmentImages != value) {
                     saveAlignmentImages = value;
                     optionsAccessor.SetValueBoolean(nameof(SaveAlignmentImages), saveAlignmentImages);
+                    RaisePropertyChanged();
+                }
+            }
+        }
+
+        private bool frameReviewEnabled = false;
+
+        public bool FrameReviewEnabled {
+            get => frameReviewEnabled;
+            set {
+                if (frameReviewEnabled != value) {
+                    frameReviewEnabled = value;
+                    optionsAccessor.SetValueBoolean(nameof(FrameReviewEnabled), frameReviewEnabled);
                     RaisePropertyChanged();
                 }
             }

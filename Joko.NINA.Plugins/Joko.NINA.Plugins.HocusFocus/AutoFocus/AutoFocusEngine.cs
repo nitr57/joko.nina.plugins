@@ -24,6 +24,7 @@ using NINA.Equipment.Model;
 using NINA.Image.FileFormat;
 using NINA.Image.ImageAnalysis;
 using NINA.Image.Interfaces;
+using NINA.Joko.Plugins.HocusFocus.AutoFocus.Replay;
 using NINA.Joko.Plugins.HocusFocus.Interfaces;
 using NINA.Joko.Plugins.HocusFocus.StarDetection;
 using NINA.Joko.Plugins.HocusFocus.Utility;
@@ -56,7 +57,6 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
         private readonly IImagingMediator imagingMediator;
         private readonly IImageDataFactory imageDataFactory;
         private readonly IPluggableBehaviorSelector<IStarDetection> starDetectionSelector;
-        private readonly IPluggableBehaviorSelector<IStarAnnotator> starAnnotatorSelector;
         private readonly IAutoFocusOptions autoFocusOptions;
         private readonly IAlglibAPI alglibAPI;
 
@@ -69,7 +69,6 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             IImagingMediator imagingMediator,
             IImageDataFactory imageDataFactory,
             IPluggableBehaviorSelector<IStarDetection> starDetectionSelector,
-            IPluggableBehaviorSelector<IStarAnnotator> starAnnotatorSelector,
             IAutoFocusOptions autoFocusOptions,
             IAlglibAPI alglibAPI) {
             this.profileService = profileService;
@@ -80,7 +79,6 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             this.guiderMediator = guiderMediator;
             this.imageDataFactory = imageDataFactory;
             this.starDetectionSelector = starDetectionSelector;
-            this.starAnnotatorSelector = starAnnotatorSelector;
             this.autoFocusOptions = autoFocusOptions;
             this.alglibAPI = alglibAPI;
         }
@@ -99,7 +97,18 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                 AFMethodEnum method,
                 AFCurveFittingEnum fitting,
                 List<ScatterErrorPoint> focusPoints) {
-                var validFocusPoints = focusPoints.Where(p => p.Y > 0.0).ToList();
+                // Canonicalize point order (by focuser position) so the fit and its iterative Grubbs outlier
+                // rejection are independent of the order measurements arrive in. During replay the points
+                // complete concurrently, so MeasurementsByFocuserPoint (a Dictionary) enumerates them in
+                // nondeterministic completion order; the alglib fit (residual/Jacobian summation roundoff) and
+                // RejectionTest (first-of-ties MaxBy) are order-sensitive, which would otherwise flip a borderline
+                // outlier between otherwise-identical replays.
+                focusPoints = focusPoints.OrderBy(p => p.X).ToList();
+                // Weighted fitters — ours and NINA core's Trendline/QuadraticFitting, which weight by
+                // 1/ErrorY² — must never see a degenerate σ: fit on regularized copies. Raw points
+                // still feed reports/charts upstream; rejected points recorded from this path carry
+                // the regularized σ.
+                var validFocusPoints = WeightRegularization.Regularize(focusPoints.Where(p => p.Y > 0.0).ToList());
                 if (validFocusPoints.Count < 3) {
                     return null;
                 }
@@ -120,7 +129,13 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                         if (validFocusPoints.Count >= 3) {
                             if (AFCurveFittingEnum.PARABOLIC == fitting || AFCurveFittingEnum.TRENDPARABOLIC == fitting) {
                                 fittings.QuadraticFitting = new QuadraticFitting().Calculate(validFocusPoints);
-                                rejectedPoint = MathUtility.RejectionTest(points: validFocusPoints, fitting: fittings.QuadraticFitting.Fitting, confidence: rejectionConfidence);
+                                // NINA core's QuadraticFitting always weights by 1/ErrorY² (it has no unweighted
+                                // mode), so its Grubbs test must be weighted too — unconditionally, unlike the
+                                // hyperbolic site below where WeightedHyperbolicFitEnabled gates it. BuildResidualWeights
+                                // yields the matching standardized-residual weight (1/ErrorY): a 1/ErrorY²-weighted fit
+                                // makes (Y−f)/ErrorY the natural residual, which is what RejectionTest then ranks
+                                // (analysis F12).
+                                rejectedPoint = MathUtility.RejectionTest(points: validFocusPoints, fitting: fittings.QuadraticFitting.Fitting, confidence: rejectionConfidence, weights: AlglibHyperbolicFitting.BuildResidualWeights(validFocusPoints, useWeights: true));
                             }
 
                             if (AFCurveFittingEnum.HYPERBOLIC == fitting || AFCurveFittingEnum.TRENDHYPERBOLIC == fitting) {
@@ -266,7 +281,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                     return;
                 }
 
-                var validPoints = lastValidFocusPoints.Where(p => p.Y > 0.0).ToList();
+                var validPoints = WeightRegularization.Regularize(lastValidFocusPoints.Where(p => p.Y > 0.0).ToList());
                 if (validPoints.Count < 3) {
                     return;
                 }
@@ -317,7 +332,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                 // Use the model actually chosen for this run (Hybrid resolves to a concrete model in
                 // SelectBestHyperbolicModel); for non-Hybrid runs this is the option model, preserving prior behavior.
                 var modelForLoo = selectedHyperbolicModel ?? State.Options.HyperbolicFitModel;
-                var validPoints = lastValidFocusPoints.Where(p => p.Y > 0.0).ToList();
+                var validPoints = WeightRegularization.Regularize(lastValidFocusPoints.Where(p => p.Y > 0.0).ToList());
                 hyperbolicFitting.LeaveOneOutStdError = AlglibHyperbolicFitting.ComputeLeaveOneOutBestFocusStdError(
                     State.AlglibAPI, modelForLoo, validPoints, State.Options.AutoFocusStepSize, State.Options.WeightedHyperbolicFitEnabled);
             }
@@ -381,7 +396,22 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             public int FrameNumber { get; private set; }
             public int FocuserPosition { get; private set; }
             public bool FinalValidation { get; private set; }
-            public StarDetectionResult StarDetectionResult { get; set; }
+
+            // Per-region star detection results. The 7 region-analysis tasks of a single frame run concurrently and
+            // all share this one AutoFocusImageState, so a single shared StarDetectionResult field was written by one
+            // region and read back by another (HFR misattribution). Keyed by region index so each region reads its own
+            // result. Only feeds the SubMeasurementPointCompleted event (the Inspector's sensor model); the AF curve
+            // consumes the pooled MeasureAndError via SubMeasurementsByFocuserPoints instead, so this is independent.
+            private readonly PerRegionStarDetectionResults starDetectionResults = new PerRegionStarDetectionResults();
+
+            public void SetStarDetectionResult(int regionIndex, StarDetectionResult result) {
+                starDetectionResults.Set(regionIndex, result);
+            }
+
+            public StarDetectionResult GetStarDetectionResult(int regionIndex) {
+                return starDetectionResults.Get(regionIndex);
+            }
+
             public IRenderedImage PreservedExposure { get; set; }
 
             private bool measurementStarted = false;
@@ -413,6 +443,35 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                 measurementStarted = true;
                 state.MeasurementStarted();
             }
+        }
+
+        // Distinguishes WHY ValidateCalculatedFocusPosition rejected a run so RunAutoFocus can decide whether a
+        // re-centered retry is worthwhile. HfrRegression and FinalPointOutOfBounds are symptoms of a blind sweep
+        // that started far from focus (e.g. a screw adjustment shoved the focuser), which re-centering the sweep on
+        // the just-calculated focus point can fix. The other modes indicate bad data / a bad fit where re-centering
+        // would not help, so they are not retry-eligible.
+        internal enum AutoFocusFailureMode {
+            None,
+            FitQuality,
+            InitialHfrFailed,
+            FinalPointOutOfBounds,
+            HfrRegression,
+            FinalHfrMissing
+        }
+
+        // Decides whether a final-validation failure should trigger the single-shot retry that re-centers the blind
+        // sweep on the just-calculated focus point. Pure so it is unit-testable without a full sweep harness.
+        internal static bool ShouldRetryFromCalculatedPoint(AutoFocusFailureMode mode, int calculatedPoint, int currentSweepCenter, bool calculatedPointRetryUsed) {
+            if (calculatedPointRetryUsed) {
+                return false;
+            }
+            var retryEligibleMode = mode == AutoFocusFailureMode.HfrRegression
+                                 || mode == AutoFocusFailureMode.FinalPointOutOfBounds;
+            if (!retryEligibleMode) {
+                return false;
+            }
+            // Guard a no-op / runaway re-sweep: require a valid point that differs from the center we just swept.
+            return calculatedPoint >= 0 && calculatedPoint != currentSweepCenter;
         }
 
         private class AutoFocusState {
@@ -449,6 +508,13 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             public object StatesLock { get; private set; } = new object();
             public SemaphoreSlim ExposureSemaphore { get; private set; }
             public int InitialFocuserPosition { get; set; }
+
+            // Set by ValidateCalculatedFocusPosition at each failure site so RunAutoFocus can branch on the cause.
+            // LastCalculatedFocusPoint is the pre-offset region-0 fit center captured on a retry-eligible failure, so
+            // a re-centered retry sweeps around the actual estimated focus rather than the contaminated start.
+            public AutoFocusFailureMode LastFailureMode { get; set; } = AutoFocusFailureMode.None;
+            public int LastCalculatedFocusPoint { get; set; } = -1;
+
             public List<Task> InitialHFRTasks { get; private set; } = new List<Task>();
             public List<Task> AnalysisTasks { get; private set; } = new List<Task>();
             public AsyncAutoResetEvent MeasurementCompleteEvent { get; private set; }
@@ -468,6 +534,8 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
 
             public void OnNextAttempt() {
                 ResetFocusMeasurements();
+                LastFailureMode = AutoFocusFailureMode.None;
+                LastCalculatedFocusPoint = -1;
                 ImageNumber = 0;
                 ++AttemptNumber;
             }
@@ -510,7 +578,8 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             AutoFocusRegionState regionState,
             AutoFocusImageState imageState,
             IRenderedImage image,
-            CancellationToken token) {
+            CancellationToken token,
+            SavedDetectionCacheSource cacheSource = null) {
             Logger.Trace($"Evaluating auto focus exposure at position {imageState.FocuserPosition}");
 
             var imageProperties = image.RawImageData.Properties;
@@ -545,45 +614,65 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                         analysisParams.InnerCropRatio = profileService.ActiveProfile.FocuserSettings.AutoFocusInnerCropRatio;
                         analysisParams.OuterCropRatio = profileService.ActiveProfile.FocuserSettings.AutoFocusOuterCropRatio;
                     }
-                    analysisResult = await starDetection.Detect(image, pixelFormat, analysisParams, progress: null, token);
+                    // For a Review-Frames run, model PSFs (auto-focus normally skips them) so the review shows the
+                    // PSF-derived per-star properties — detection is otherwise identical, so the HFR curve is unaffected.
+                    if (state.Options.ModelPSF && starDetection is IHocusFocusStarDetection hfReviewDetection) {
+                        analysisResult = await hfReviewDetection.Detect(image, pixelFormat, analysisParams, null, token, modelPSFForAutoFocus: true);
+                    } else {
+                        analysisResult = await starDetection.Detect(image, pixelFormat, analysisParams, progress: null, token);
+                    }
                 } else {
                     var hfStarDetection = (IHocusFocusStarDetection)starDetection;
                     var hfParams = hfStarDetection.ToHocusFocusParams(analysisParams);
-                    var starDetectorParams = hfStarDetection.GetStarDetectorParams(image, regionState.Region, true);
-                    var hfAnalysisResult = (HocusFocusStarDetectionResult)await hfStarDetection.Detect(image, hfParams, starDetectorParams, null, token);
+                    // When replaying with capture-time settings (option b), state.Options.StarDetectionOptionsOverride
+                    // carries a detached snapshot; params are built from it instead of the live detector options. The
+                    // overload delegates to the no-override path when it is null (live capture / "use current settings").
+                    var starDetectorParams = hfStarDetection.GetStarDetectorParams(image, regionState.Region, true, state.Options.StarDetectionOptionsOverride);
+                    // Review-Frames runs request PSF modeling (which GetStarDetectorParams forces off for auto-focus) so
+                    // the review can show PSF-derived per-star properties. The region==null path lifts this via the
+                    // modelPSFForAutoFocus Detect overload; do the equivalent here so a capture-time replay routed
+                    // through the explicit-region path (option b) keeps PSF data in the review. Detection HFR is unaffected.
+                    if (state.Options.ModelPSF) {
+                        starDetectorParams.ModelPSF = true;
+                    }
+
+                    // Replay reuse cache (Task 8, default OFF): when replaying a saved run and the option is on, reuse
+                    // the saved per-region detection JSON in place of re-running the (expensive) Detect — but ONLY when
+                    // TryLoadValidCachedDetection confirms the saved result's detector version + params (region
+                    // included) still match. cacheSource is null on the live path, so the && short-circuits before any
+                    // disk access and detection runs exactly as before. Any miss/mismatch/error ⇒ cached is null ⇒ we
+                    // fall through to Detect. The cached result is a HocusFocusStarDetectionResult whose StarList is
+                    // HocusFocusDetectedStar, so the downstream SubMeasurementPointCompleted event feeds the sensor
+                    // model identically to a fresh detection.
+                    HocusFocusStarDetectionResult hfAnalysisResult;
+                    if (state.Options.ReuseSavedDetection
+                        && cacheSource != null
+                        && TryLoadValidCachedDetection(cacheSource.SourceFolder, cacheSource.ImageNumber, cacheSource.FrameNumber, regionState.RegionIndex, starDetectorParams, out var cachedResult)) {
+                        Logger.Debug($"Reusing saved star detection result for image {cacheSource.ImageNumber}, frame {cacheSource.FrameNumber}, region {regionState.RegionIndex} (focuser {imageState.FocuserPosition})");
+                        hfAnalysisResult = cachedResult;
+                    } else {
+                        hfAnalysisResult = (HocusFocusStarDetectionResult)await hfStarDetection.Detect(image, hfParams, starDetectorParams, null, token);
+                    }
                     hfAnalysisResult.FocuserPosition = imageState.FocuserPosition;
                     analysisResult = hfAnalysisResult;
                 }
 
-                if (!string.IsNullOrWhiteSpace(state.SaveFolder)) {
+                if (!state.Options.SaveExposuresOnly && !string.IsNullOrWhiteSpace(state.SaveFolder)) {
                     var saveAttemptFolder = GetSaveAttemptFolder(state, imageState.AttemptNumber, imageState.FinalValidation);
-                    var resultFileName = $"{imageState.ImageNumber:00}_Frame{imageState.FrameNumber:00}_Region{regionState.RegionIndex:00}_star_detection_result.json";
+                    var resultFileName = BuildStarDetectionResultFileName(imageState.ImageNumber, imageState.FrameNumber, regionState.RegionIndex);
                     var resultTargetPath = Path.Combine(saveAttemptFolder, resultFileName);
-                    File.WriteAllText(resultTargetPath, JsonConvert.SerializeObject(analysisResult, Formatting.Indented));
+                    // Use the dedicated cache serializer (not default Json.NET settings) so the polymorphic
+                    // StarList entries (HocusFocusDetectedStar, incl. PSF) and the DetectorVersion/CacheKey
+                    // survive a future reload — see StarDetectionResultCacheSerializer. The format change is
+                    // safe today because nothing reads this file back yet.
+                    File.WriteAllText(resultTargetPath, StarDetectionResultCacheSerializer.Serialize(analysisResult));
 
-                    var annotatedFileName = $"{imageState.ImageNumber:00}_Frame{imageState.FrameNumber:00}_Region{regionState.RegionIndex:00}_annotated.tiff";
-                    var annotatedTargetPath = Path.Combine(saveAttemptFolder, annotatedFileName);
-                    var annotator = starAnnotatorSelector.GetBehavior();
-                    var annotatedImage = await annotator.GetAnnotatedImage(analysisParams, analysisResult, image.Image);
-
-                    // If this is null, then we didn't subsample the image. Thus we can crop the annotated image and save only the relevant part
-                    if (!IsSubSampleEnabled(state)) {
-                        var starDetectionRegion = regionState.Region ?? StarDetectionRegion.FromStarDetectionParams(analysisParams);
-                        if (!starDetectionRegion.IsFull()) {
-                            var imageSize = new System.Drawing.Size(width: image.RawImageData.Properties.Width, height: image.RawImageData.Properties.Height);
-                            var cropRect = starDetectionRegion.OuterBoundary.ToInt32Rect(imageSize);
-                            annotatedImage = new CroppedBitmap(annotatedImage, cropRect);
-                        }
-                    }
-
-                    using (var fileStream = new FileStream(annotatedTargetPath, FileMode.Create)) {
-                        var encoder = new TiffBitmapEncoder();
-                        encoder.Frames.Add(BitmapFrame.Create(annotatedImage));
-                        encoder.Save(fileStream);
-                    }
+                    // Per-region annotated TIFFs are no longer written: the "Review Frames" feature re-renders the
+                    // annotator overlays live (from raw frames + capture-time settings on replay), so a baked-in
+                    // annotated image is redundant — and rendering/encoding it per frame was a needless cost.
                 }
 
-                imageState.StarDetectionResult = analysisResult;
+                imageState.SetStarDetectionResult(regionState.RegionIndex, analysisResult);
                 if (state.Options.PreserveExposures) {
                     imageState.PreservedExposure = image;
                 }
@@ -687,15 +776,15 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                 // A focuser position can be revisited - most commonly when reprocessing a saved run whose frames
                 // map more than one measurement point to the same focuser position. Complete each position only
                 // once; the second completion previously threw "An item with the same key has already been added".
-                if (!TryCompleteFocuserPoint(regionState.MeasurementsByFocuserPoint, focuserPosition, values)) {
+                if (!TryCompleteFocuserPoint(regionState.MeasurementsByFocuserPoint, focuserPosition, values, out var pooledMeasurement)) {
                     Logger.Trace($"Ignoring duplicate completion at focuser position {focuserPosition}");
                     return Task.CompletedTask;
                 }
 
-                var focusPoints = regionState.MeasurementsByFocuserPoint.Select(fp => new ScatterErrorPoint(fp.Key, fp.Value.Measure, 0, Math.Max(0.001, fp.Value.Stdev))).ToList();
+                var focusPoints = regionState.MeasurementsByFocuserPoint.Select(fp => new ScatterErrorPoint(fp.Key, fp.Value.Measure, 0, SafeDisplayError(fp.Value.Stdev))).ToList();
                 regionState.UpdateCurveFittings(focusPoints);
 
-                this.OnMeasurementPointCompleted(imageState, regionState, measurement);
+                this.OnMeasurementPointCompleted(imageState, regionState, pooledMeasurement);
             }
             return Task.CompletedTask;
         }
@@ -704,12 +793,113 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
         /// Records the averaged sub-measurements for a focuser position, completing that point exactly once.
         /// Returns false (leaving the map unchanged) when the position was already completed, which happens when
         /// a saved run being reprocessed maps more than one measurement point to the same focuser position.
+        /// <paramref name="pooledMeasurement"/> is set to the pooled (averaged) value stored in the map on new
+        /// completion, or the previously stored value on a duplicate — on new completion, callers should forward
+        /// this to the MeasurementPointCompleted event so that charts, the NINA broadcast point, and saved-report
+        /// MeasurePoints agree with the fit inputs when FramesPerPoint > 1.
         /// </summary>
-        internal static bool TryCompleteFocuserPoint(Dictionary<int, MeasureAndError> measurementsByFocuserPoint, int focuserPosition, List<MeasureAndError> subMeasurements) {
-            if (measurementsByFocuserPoint.ContainsKey(focuserPosition)) {
+        internal static bool TryCompleteFocuserPoint(Dictionary<int, MeasureAndError> measurementsByFocuserPoint, int focuserPosition, List<MeasureAndError> subMeasurements, out MeasureAndError pooledMeasurement) {
+            if (measurementsByFocuserPoint.TryGetValue(focuserPosition, out pooledMeasurement)) {
                 return false;
             }
-            measurementsByFocuserPoint.Add(focuserPosition, subMeasurements.AverageMeasurement());
+            pooledMeasurement = subMeasurements.AverageMeasurement();
+            measurementsByFocuserPoint.Add(focuserPosition, pooledMeasurement);
+            return true;
+        }
+
+        /// <summary>
+        /// σ for the display/report layer: keep the measured value; non-finite σ (NaN = no valid per-frame σ; ±Infinity) and
+        /// negatives render as 0 = "no error bar". The old code fabricated a 0.001 floor here, which
+        /// downstream 1/σ weighting turned into a 1000× weight (F5a). Fitters never consume this raw
+        /// value directly — every weighted fit receives WeightRegularization copies, which map 0 or
+        /// unknown σ to the sweep's median σ.
+        /// </summary>
+        internal static double SafeDisplayError(double stdev) {
+            return double.IsFinite(stdev) ? Math.Max(0.0, stdev) : 0.0;
+        }
+
+        /// <summary>
+        /// Identifies the on-disk source of a saved per-region detection result for the replay reuse cache. Only
+        /// the REPLAY path supplies one (built from the <see cref="SavedAutoFocusImage"/> being replayed); the
+        /// live AF path passes <c>null</c>, which (together with the default-off <c>ReuseSavedDetection</c> flag)
+        /// keeps detection running exactly as before.
+        ///
+        /// <para><see cref="ImageNumber"/>/<see cref="FrameNumber"/> are the ORIGINAL numbers parsed from the
+        /// saved filename — they name the saved <c>_star_detection_result.json</c>. The replay loop reassigns a
+        /// fresh <c>imageState.ImageNumber</c> for ordering, which must NOT be used to look up the cache file.</para>
+        /// </summary>
+        internal sealed record SavedDetectionCacheSource(string SourceFolder, int ImageNumber, int FrameNumber);
+
+        /// <summary>
+        /// Returns the canonical filename for a per-region star-detection result JSON, derived from the original
+        /// image/frame/region numbers. This is the single source of truth for the filename format used by both the
+        /// save path and the cache-reuse path (<see cref="TryLoadValidCachedDetection"/>).
+        /// </summary>
+        internal static string BuildStarDetectionResultFileName(int imageNumber, int frameNumber, int regionIndex)
+            => $"{imageNumber:00}_Frame{frameNumber:00}_Region{regionIndex:00}_star_detection_result.json";
+
+        /// <summary>
+        /// Reuse-side gate for the replay detection-result cache. Tries to load the saved per-region
+        /// <c>_star_detection_result.json</c> for the given (original) image/frame/region and returns it ONLY when
+        /// it is provably interchangeable with a fresh detection for <paramref name="currentParams"/>: the saved
+        /// <see cref="HocusFocusStarDetectionResult.DetectorVersion"/> equals the current
+        /// <see cref="StarDetector.StarDetectorVersion"/> AND the saved
+        /// <see cref="HocusFocusStarDetectionResult.CacheKey"/> equals
+        /// <see cref="StarDetector.ComputeCacheKey(StarDetectorParams)"/> for the current params (region included).
+        ///
+        /// <para>Every other outcome — file missing, unreadable/corrupt JSON, any deserialize exception, version
+        /// mismatch, or key mismatch — returns <c>false</c> with <paramref name="cached"/> = <c>null</c>, so the
+        /// caller falls back to a full detection. The helper never throws: its only failure mode is a (safe)
+        /// cache miss, never a stale or incorrect reuse. The filename is built from the ORIGINAL
+        /// <paramref name="imageNumber"/>/<paramref name="frameNumber"/> (the saved-file numbers), not any
+        /// replay-reassigned counter.</para>
+        /// </summary>
+        internal static bool TryLoadValidCachedDetection(
+            string sourceFolder,
+            int imageNumber,
+            int frameNumber,
+            int regionIndex,
+            StarDetectorParams currentParams,
+            out HocusFocusStarDetectionResult cached) {
+            cached = null;
+            if (string.IsNullOrEmpty(sourceFolder) || currentParams == null) {
+                return false;
+            }
+
+            var fileName = BuildStarDetectionResultFileName(imageNumber, frameNumber, regionIndex);
+            var path = Path.Combine(sourceFolder, fileName);
+            if (!File.Exists(path)) {
+                Logger.Debug($"Saved detection cache miss (file not found): {path}");
+                return false;
+            }
+
+            HocusFocusStarDetectionResult deserialized;
+            try {
+                var json = File.ReadAllText(path);
+                deserialized = StarDetectionResultCacheSerializer.Deserialize(json);
+            } catch (Exception e) {
+                // Unreadable / corrupt / format-incompatible cache file. Treat as a miss and re-detect.
+                Logger.Debug($"Saved detection cache miss (failed to read/deserialize {path}): {e.Message}");
+                return false;
+            }
+
+            if (deserialized == null) {
+                Logger.Debug($"Saved detection cache miss (deserialized to null): {path}");
+                return false;
+            }
+
+            if (deserialized.DetectorVersion != StarDetector.StarDetectorVersion) {
+                Logger.Debug($"Saved detection cache miss (detector version {deserialized.DetectorVersion} != current {StarDetector.StarDetectorVersion}): {path}");
+                return false;
+            }
+
+            var expectedKey = StarDetector.ComputeCacheKey(currentParams);
+            if (!string.Equals(deserialized.CacheKey, expectedKey, StringComparison.Ordinal)) {
+                Logger.Debug($"Saved detection cache miss (cache key saved={deserialized.CacheKey} != current={expectedKey}): {path}");
+                return false;
+            }
+
+            cached = deserialized;
             return true;
         }
 
@@ -1033,7 +1223,27 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                 autoFocusState.InitialFocuserPosition = initialFocusPosition;
                 Logger.Info($"Starting AutoFocus with initial position {initialFocusPosition}");
 
+                // The blind sweep is normally centered on the original starting position. When a final-validation
+                // failure is fixable by re-centering (HFR regression / point outside the swept range) we retry ONCE
+                // centered on the calculated focus point instead — independent of TotalNumberOfAttempts. InitialFocuserPosition
+                // stays the true original so the focuser is restored there if the run ultimately fails.
+                int sweepCenter = initialFocusPosition;
+                bool calculatedPointRetryUsed = false;
+
+                // Structural backstop so the retry loop can NEVER run unbounded (defense-in-depth for a hardware loop):
+                // at most TotalNumberOfAttempts attempts plus the single calculated-point retry. The conditions below
+                // already guarantee this — the calculated-point retry fires at most once (calculatedPointRetryUsed is
+                // scoped OUTSIDE this loop and is only ever set true), and the standard reattempt is gated on the
+                // strictly-increasing AttemptNumber — but the cap makes termination independent of those conditions
+                // staying correct. It should never trigger in normal operation.
+                int maxIterations = Math.Max(1, autoFocusState.Options.TotalNumberOfAttempts) + 1;
+                int iteration = 0;
+
                 do {
+                    if (++iteration > maxIterations) {
+                        Logger.Error($"AutoFocus retry loop exceeded its {maxIterations}-iteration backstop; aborting to prevent an infinite loop.");
+                        break;
+                    }
                     await StartInitialFocusPoints(initialFocusPosition, autoFocusState, token, progress);
                     reattempt = false;
 
@@ -1045,7 +1255,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                     bool goodFocusPosition = false;
 
                     try {
-                        await pointGenerationAction(initialFocusPosition, autoFocusState, iterationCts.Token, progress);
+                        await pointGenerationAction(sweepCenter, autoFocusState, iterationCts.Token, progress);
                         token.ThrowIfCancellationRequested();
 
                         goodFocusPosition = await ValidateCalculatedFocusPosition(autoFocusState, iterationCts.Token, progress);
@@ -1053,19 +1263,36 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                         // Allow retries for too many failed points retries
                         Logger.Error($"Too many failed points ({e.NumFailures})");
                         Notification.ShowWarning(Loc.Instance["LblAutoFocusNotEnoughtSpreadedPoints"]);
-                        progress.Report(new ApplicationStatus() { Status = Loc.Instance["LblAutoFocusNotEnoughtSpreadedPoints"] });
+                        progress?.Report(new ApplicationStatus() { Status = Loc.Instance["LblAutoFocusNotEnoughtSpreadedPoints"] });
                     } catch (InitialHFRFailedException) {
                         // Allow retries for initial HFR failed
                         Logger.Error($"Initial HFR calculation failed");
                         Notification.ShowWarning("Calculating initial HFR failed");
-                        progress.Report(new ApplicationStatus() { Status = "Calculating initial HFR failed" });
+                        progress?.Report(new ApplicationStatus() { Status = "Calculating initial HFR failed" });
                     }
 
                     var duration = stopWatch.Elapsed;
                     if (!goodFocusPosition) {
                         // Ensure we cancel any remaining tasks from this iteration so we can start the next
                         iterationTaskCts.Cancel();
-                        if (autoFocusState.AttemptNumber < autoFocusState.Options.TotalNumberOfAttempts) {
+                        if (ShouldRetryFromCalculatedPoint(autoFocusState.LastFailureMode, autoFocusState.LastCalculatedFocusPoint, sweepCenter, calculatedPointRetryUsed)) {
+                            // The sweep started too far from focus and contaminated the curve. Re-center the next
+                            // sweep on the calculated focus point and re-attempt once (capped independently of the
+                            // normal attempt budget, so it fires even when TotalNumberOfAttempts == 1).
+                            calculatedPointRetryUsed = true;
+                            sweepCenter = autoFocusState.LastCalculatedFocusPoint;
+                            Notification.ShowWarning(Loc.Instance["LblAutoFocusReattempting"]);
+                            Logger.Warning($"AutoFocus failure ({autoFocusState.LastFailureMode}). Re-centering the sweep on the calculated focus point {sweepCenter} and re-attempting once.");
+                            await focuserMediator.MoveFocuser(sweepCenter, token);
+
+                            OnIterationFailed(
+                                state: autoFocusState,
+                                temperature: focuserMediator.GetInfo().Temperature,
+                                duration: stopWatch.Elapsed);
+                            reattempt = true;
+                        } else if (autoFocusState.AttemptNumber < autoFocusState.Options.TotalNumberOfAttempts) {
+                            // Standard reattempt restarts the sweep from the true original starting position.
+                            sweepCenter = initialFocusPosition;
                             Notification.ShowWarning(Loc.Instance["LblAutoFocusReattempting"]);
                             Logger.Warning($"Potentially bad auto-focus. Setting focuser back to {initialFocusPosition} and re-attempting.");
                             await focuserMediator.MoveFocuser(initialFocusPosition, token);
@@ -1196,6 +1423,14 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             CancellationToken token,
             IProgress<ApplicationStatus> progress) {
             var rSquaredThreshold = profileService.ActiveProfile.FocuserSettings.RSquaredThreshold;
+
+            // When the calculated point falls outside the swept range we DEFER the rejection (rather than returning
+            // immediately) so the focuser still moves there and a final-validation image is captured for diagnosis
+            // before we fail. Recorded here, applied after the move+exposure below.
+            var anyRegionOutOfBounds = false;
+            StarDetectionRegion outOfBoundsRegion = null;
+            int outOfBoundsPosition = 0, outOfBoundsMin = 0, outOfBoundsMax = 0;
+
             if (profileService.ActiveProfile.FocuserSettings.AutoFocusMethod == AFMethodEnum.STARHFR) {
                 // Evaluate R² for Fittings to be above threshold
                 foreach (var autoFocusRegionState in autoFocusState.FocusRegionStates) {
@@ -1223,6 +1458,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                                     Logger.Error($"Auto Focus Failed! R² (Coefficient of determination) for Hyperbolic Fitting is below threshold. {Math.Round(hyperbolicFitting.RSquared, 2)} / {rSquaredThreshold}; Region: {autoFocusRegionState.Region}");
                                     Notification.ShowError(string.Format(Loc.Instance["LblAutoFocusCurveCorrelationCoefficientLow"], Math.Round(hyperbolicFitting.RSquared, 2), rSquaredThreshold));
                                 }
+                                autoFocusState.LastFailureMode = AutoFocusFailureMode.FitQuality;
                                 return false;
                             }
                         }
@@ -1236,12 +1472,14 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                         if ((fitting == AFCurveFittingEnum.PARABOLIC || fitting == AFCurveFittingEnum.TRENDPARABOLIC) && quadraticBad) {
                             Logger.Error($"Auto Focus Failed! R² (Coefficient of determination) for Parabolic Fitting is below threshold. {Math.Round(fittings.QuadraticFitting.RSquared, 2)} / {rSquaredThreshold}; Region: {autoFocusRegionState.Region}");
                             Notification.ShowError(string.Format(Loc.Instance["LblAutoFocusCurveCorrelationCoefficientLow"], Math.Round(fittings.QuadraticFitting.RSquared, 2), rSquaredThreshold));
+                            autoFocusState.LastFailureMode = AutoFocusFailureMode.FitQuality;
                             return false;
                         }
 
                         if ((fitting == AFCurveFittingEnum.TRENDLINES || fitting == AFCurveFittingEnum.TRENDHYPERBOLIC || fitting == AFCurveFittingEnum.TRENDPARABOLIC) && trendlineBad) {
                             Logger.Error($"Auto Focus Failed! R² (Coefficient of determination) for Trendline Fitting is below threshold. Left: {Math.Round(fittings.TrendlineFitting.LeftTrend.RSquared, 2)} / {rSquaredThreshold}; Right: {Math.Round(fittings.TrendlineFitting.RightTrend.RSquared, 2)} / {rSquaredThreshold}; Region: {autoFocusRegionState.Region}");
                             Notification.ShowError(string.Format(Loc.Instance["LblAutoFocusCurveCorrelationCoefficientLow"], Math.Round(fittings.TrendlineFitting.LeftTrend.RSquared, 2), Math.Round(fittings.TrendlineFitting.RightTrend.RSquared, 2), rSquaredThreshold));
+                            autoFocusState.LastFailureMode = AutoFocusFailureMode.FitQuality;
                             return false;
                         }
                     }
@@ -1256,13 +1494,20 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                     if (finalFocusPosition < 0) {
                         Logger.Error("Fit failed. There likely weren't enough data points with detected stars");
                         Notification.ShowError("Fit failed. There likely weren't enough data points with detected stars");
+                        autoFocusState.LastFailureMode = AutoFocusFailureMode.FitQuality;
                         return false;
                     }
 
                     if (finalFocusPosition < min || finalFocusPosition > max) {
-                        Logger.Error($"Determined focus point position is outside of the overall measurement points of the curve. Fitting is incorrect and autofocus settings are incorrect. FocusPosition {finalFocusPosition}; Min: {min}; Max: {max}; Region: {autoFocusRegionState.Region}");
-                        Notification.ShowError(Loc.Instance["LblAutoFocusPointOutsideOfBounds"]);
-                        return false;
+                        // Defer this rejection until after the final-validation image is captured below. Record the
+                        // first offending region (mirrors the original "first failure wins" ordering) and stop
+                        // checking further regions.
+                        anyRegionOutOfBounds = true;
+                        outOfBoundsRegion = autoFocusRegionState.Region;
+                        outOfBoundsPosition = finalFocusPosition;
+                        outOfBoundsMin = min;
+                        outOfBoundsMax = max;
+                        break;
                     }
                 }
             }
@@ -1271,25 +1516,51 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             if (firstRegionFinalFocusPosition < 0) {
                 Logger.Error("Fit failed. There likely weren't enough data points with detected stars");
                 Notification.ShowError("Fit failed. There likely weren't enough data points with detected stars");
+                autoFocusState.LastFailureMode = AutoFocusFailureMode.FitQuality;
                 return false;
             }
+
+            // Region-0 fit center BEFORE the focuser offset is applied — the best estimate of focus, and the center a
+            // re-centered retry should sweep around when this validation fails (see RunAutoFocus).
+            var calculatedFocusPoint = firstRegionFinalFocusPosition;
 
             if (this.autoFocusOptions.FocuserOffset != 0) {
                 Logger.Info($"Applying focuser offset of {this.autoFocusOptions.FocuserOffset} to {firstRegionFinalFocusPosition}");
                 firstRegionFinalFocusPosition += this.autoFocusOptions.FocuserOffset;
             }
 
-            await focuserMediator.MoveFocuser(firstRegionFinalFocusPosition, token);
-            token.ThrowIfCancellationRequested();
-
-            if (autoFocusState.Options.ValidateHfrImprovement) {
-                Logger.Info($"Validating HFR at final focus position {firstRegionFinalFocusPosition}");
-                await StartAutoFocusPoint(firstRegionFinalFocusPosition, autoFocusState, FinalHFRMeasurementAction, true, token, progress);
+            // Drive the focuser to the calculated point and (when HFR validation is on) capture a final-validation
+            // image there. For an OUT-OF-BOUNDS point the only reason to move is that diagnostic image: clamp the target
+            // to the swept range so an extreme/extrapolated fit center can't drive the focuser to its travel limit, and
+            // skip the move entirely when HFR validation is off (no image to capture) — matching the pre-refactor
+            // behavior of not moving on an out-of-bounds result. In-bounds (success) moves are unchanged.
+            if (!anyRegionOutOfBounds || autoFocusState.Options.ValidateHfrImprovement) {
+                var moveTarget = anyRegionOutOfBounds
+                    ? Math.Min(outOfBoundsMax, Math.Max(outOfBoundsMin, firstRegionFinalFocusPosition))
+                    : firstRegionFinalFocusPosition;
+                await focuserMediator.MoveFocuser(moveTarget, token);
                 token.ThrowIfCancellationRequested();
+
+                if (autoFocusState.Options.ValidateHfrImprovement) {
+                    Logger.Info($"Validating HFR at final focus position {moveTarget}");
+                    await StartAutoFocusPoint(moveTarget, autoFocusState, FinalHFRMeasurementAction, true, token, progress);
+                    token.ThrowIfCancellationRequested();
+                }
             }
 
             await Task.WhenAll(autoFocusState.AnalysisTasks);
             token.ThrowIfCancellationRequested();
+
+            // Apply the deferred out-of-bounds rejection now that the focuser has moved to the calculated point and
+            // (when HFR validation is on) a final-validation image was captured for diagnosis. Re-centering the sweep
+            // on the calculated point can fix this, so it is retry-eligible.
+            if (anyRegionOutOfBounds) {
+                Logger.Error($"Determined focus point position is outside of the overall measurement points of the curve. Fitting is incorrect and autofocus settings are incorrect. FocusPosition {outOfBoundsPosition}; Min: {outOfBoundsMin}; Max: {outOfBoundsMax}; Region: {outOfBoundsRegion}");
+                Notification.ShowError(Loc.Instance["LblAutoFocusPointOutsideOfBounds"]);
+                autoFocusState.LastFailureMode = AutoFocusFailureMode.FinalPointOutOfBounds;
+                autoFocusState.LastCalculatedFocusPoint = calculatedFocusPoint;
+                return false;
+            }
 
             if (autoFocusState.Options.AutoFocusMethod == AFMethodEnum.STARHFR && autoFocusState.Options.ValidateHfrImprovement) {
                 foreach (var autoFocusRegionState in autoFocusState.FocusRegionStates) {
@@ -1297,11 +1568,13 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                         if (!autoFocusRegionState.FinalHFR.HasValue || autoFocusRegionState.FinalHFR.Value.Measure == 0.0) {
                             Logger.Warning("Failed assessing HFR at the final focus point");
                             Notification.ShowWarning("Failed assessing HFR at the final focus point");
+                            autoFocusState.LastFailureMode = AutoFocusFailureMode.FinalHfrMissing;
                             return false;
                         }
                         if (!autoFocusRegionState.InitialHFR.HasValue || autoFocusRegionState.InitialHFR.Value.Measure == 0.0) {
                             Logger.Warning("Failed assessing HFR at the initial position");
                             Notification.ShowWarning("Failed assessing HFR at the initial position");
+                            autoFocusState.LastFailureMode = AutoFocusFailureMode.InitialHfrFailed;
                             return false;
                         }
 
@@ -1310,6 +1583,8 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                         if (finalHfr > (initialHFR * (1.0 + autoFocusState.Options.HFRImprovementThreshold))) {
                             Logger.Warning($"New focus point HFR {finalHfr} is significantly worse than original HFR {initialHFR}");
                             Notification.ShowWarning(string.Format(Loc.Instance["LblAutoFocusNewWorseThanOriginal"], finalHfr, initialHFR));
+                            autoFocusState.LastFailureMode = AutoFocusFailureMode.HfrRegression;
+                            autoFocusState.LastCalculatedFocusPoint = calculatedFocusPoint;
                             return false;
                         }
                     }
@@ -1338,82 +1613,112 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             }
         }
 
-        private static bool autoFocusInProgress = false;
+        // 0 = free, 1 = an AutoFocus is in progress. Static so it is shared across all engine instances and entry
+        // points (manual AF, Inspector analyze, optimizer live attempt). Mutated only via Interlocked so the
+        // check-and-set is atomic and two RunImpl entrants cannot both claim it (F11).
+        private static int autoFocusInProgress = 0;
 
-        public bool AutoFocusInProgress {
-            get => autoFocusInProgress;
-            private set {
-                autoFocusInProgress = value;
-            }
-        }
+        public bool AutoFocusInProgress => Volatile.Read(ref autoFocusInProgress) != 0;
+
+        // Returns true iff this caller transitioned the guard from free->in-progress (i.e. it now owns the run).
+        internal static bool TryClaimAutoFocusInProgress() => Interlocked.CompareExchange(ref autoFocusInProgress, 1, 0) == 0;
+
+        // Releases the guard unconditionally (idempotent).
+        internal static void ReleaseAutoFocusInProgress() => Interlocked.Exchange(ref autoFocusInProgress, 0);
+
+        // Test hook: force the process-wide guard back to free so a leaked flag cannot pollute other tests.
+        internal static void ResetAutoFocusInProgressForTests() => Interlocked.Exchange(ref autoFocusInProgress, 0);
 
         private async Task<AutoFocusResult> RunImpl(AutoFocusEngineOptions options, FilterInfo imagingFilter, List<StarDetectionRegion> regions, CancellationToken token, IProgress<ApplicationStatus> progress) {
-            if (AutoFocusInProgress) {
+            if (!TryClaimAutoFocusInProgress()) {
                 Notification.ShowError("Another AutoFocus is already in progress");
                 Logger.Error("Another AutoFocus is already in progress");
                 return null;
             }
 
-            Logger.Trace("Starting Autofocus");
-            OnStarted();
-
-            var timeoutCts = new CancellationTokenSource(options.AutoFocusTimeout);
-            bool tempComp = false;
-            bool guidingStopped = false;
-            bool completed = false;
-            AutoFocusInProgress = true;
-            AutoFocusState autoFocusState = null;
+            // Once the claim succeeds, EVERY subsequent path must release the static guard, otherwise the flag stays
+            // set and EVERY future AutoFocus across the whole app is rejected until NINA restarts (the F11 leak). The
+            // statements between the claim and the inner try below are throw-prone (OnStarted() raises the Started
+            // event synchronously into subscribers that do real work; the CancellationTokenSource ctor throws for an
+            // out-of-range AutoFocusTimeout), so the release lives in this OUTER finally rather than the inner one.
             try {
-                if (focuserMediator.GetInfo().TempCompAvailable && focuserMediator.GetInfo().TempComp) {
-                    tempComp = true;
-                    focuserMediator.ToggleTempComp(false);
-                }
+                Logger.Trace("Starting Autofocus");
+                OnStarted();
 
-                if (profileService.ActiveProfile.FocuserSettings.AutoFocusDisableGuiding) {
-                    guidingStopped = await this.guiderMediator.StopGuiding(token);
-                }
-
-                var autofocusCts = CancellationTokenSource.CreateLinkedTokenSource(token, timeoutCts.Token);
-                autoFocusState = await InitializeState(options, imagingFilter, regions, autofocusCts.Token, progress);
-                completed = await RunAutoFocus(autoFocusState, StartBlindFocusPoints, autofocusCts.Token, progress);
-            } catch (OperationCanceledException) {
-                if (timeoutCts.IsCancellationRequested) {
-                    Notification.ShowWarning($"AutoFocus timed out after {options.AutoFocusTimeout}");
-                    Logger.Warning($"AutoFocus timed out after {options.AutoFocusTimeout}");
-                } else {
-                    Logger.Warning("AutoFocus cancelled");
-                }
-            } catch (Exception ex) {
-                Notification.ShowError($"Auto Focus Failure. {ex.Message}");
-                Logger.Error("Failure during AutoFocus", ex);
-            } finally {
+                var timeoutCts = new CancellationTokenSource(options.AutoFocusTimeout);
+                bool tempComp = false;
+                bool guidingStopped = false;
+                bool completed = false;
+                AutoFocusState autoFocusState = null;
                 try {
-                    await PerformPostAutoFocusActions(
-                        successfulAutoFocus: completed, initialFocusPosition: autoFocusState?.InitialFocuserPosition, imagingFilter: imagingFilter, restoreTempComp: tempComp,
-                        restoreGuiding: guidingStopped, progress: progress);
-                } catch (Exception ex) {
-                    Logger.Warning($"Failure during post AF actions. {ex.Message}");
-                } finally {
-                    progress.Report(new ApplicationStatus() { Status = string.Empty });
-                    AutoFocusInProgress = false;
-                }
-            }
+                    if (focuserMediator.GetInfo().TempCompAvailable && focuserMediator.GetInfo().TempComp) {
+                        tempComp = true;
+                        focuserMediator.ToggleTempComp(false);
+                    }
 
-            return new AutoFocusResult() {
-                Succeeded = completed,
-                InitialFocuserPosition = autoFocusState.InitialFocuserPosition,
-                ImageSize = autoFocusState.ImageSize,
-                StepSize = autoFocusState.Options.AutoFocusStepSize,
-                RegionResults = autoFocusState.FocusRegionStates.Select(rs => new AutoFocusRegionResult() {
-                    RegionIndex = rs.RegionIndex,
-                    Region = rs.Region,
-                    EstimatedFinalFocuserPosition = rs.FinalFocusPoint?.X ?? double.NaN,
-                    EstimatedFinalHFR = rs.FinalFocusPoint?.Y ?? double.NaN,
-                    Fittings = rs.Fittings,
-                    RejectedPoints = rs.RejectedPoints.Select(p => new AutoFocusRegionPoint() { FocuserPosition = p.Key, Measurement = p.Value }).ToArray()
-                }).OrderBy(r => r.RegionIndex).ToArray(),
-                SaveFolder = autoFocusState.SaveFolder
-            };
+                    if (profileService.ActiveProfile.FocuserSettings.AutoFocusDisableGuiding) {
+                        guidingStopped = await this.guiderMediator.StopGuiding(token);
+                    }
+
+                    var autofocusCts = CancellationTokenSource.CreateLinkedTokenSource(token, timeoutCts.Token);
+                    autoFocusState = await InitializeState(options, imagingFilter, regions, autofocusCts.Token, progress);
+                    completed = await RunAutoFocus(autoFocusState, StartBlindFocusPoints, autofocusCts.Token, progress);
+                } catch (OperationCanceledException) {
+                    if (timeoutCts.IsCancellationRequested) {
+                        Notification.ShowWarning($"AutoFocus timed out after {options.AutoFocusTimeout}");
+                        Logger.Warning($"AutoFocus timed out after {options.AutoFocusTimeout}");
+                    } else {
+                        Logger.Warning("AutoFocus cancelled");
+                    }
+                } catch (Exception ex) {
+                    Notification.ShowError($"Auto Focus Failure. {ex.Message}");
+                    Logger.Error("Failure during AutoFocus", ex);
+                } finally {
+                    try {
+                        await PerformPostAutoFocusActions(
+                            successfulAutoFocus: completed, initialFocusPosition: autoFocusState?.InitialFocuserPosition, imagingFilter: imagingFilter, restoreTempComp: tempComp,
+                            restoreGuiding: guidingStopped, progress: progress);
+                    } catch (Exception ex) {
+                        Logger.Warning($"Failure during post AF actions. {ex.Message}");
+                    } finally {
+                        // progress is optional (the Star Detection Optimizer's live attempt passes null), so report
+                        // through it defensively. The static in-progress guard is released in the OUTER finally below
+                        // so that a throw from OnStarted() or the CancellationTokenSource ctor above this inner try
+                        // cannot leak it.
+                        progress?.Report(new ApplicationStatus() { Status = string.Empty });
+                    }
+                }
+
+                if (autoFocusState == null) {
+                    // InitializeState never produced state (cancelled, timed out, or an equipment error already logged
+                    // above). There is nothing to build a result from; return null like the in-progress guard does,
+                    // rather than dereferencing a null state below.
+                    return null;
+                }
+
+                return new AutoFocusResult() {
+                    Succeeded = completed,
+                    InitialFocuserPosition = autoFocusState.InitialFocuserPosition,
+                    ImageSize = autoFocusState.ImageSize,
+                    StepSize = autoFocusState.Options.AutoFocusStepSize,
+                    RegionResults = autoFocusState.FocusRegionStates.Select(rs => new AutoFocusRegionResult() {
+                        RegionIndex = rs.RegionIndex,
+                        Region = rs.Region,
+                        EstimatedFinalFocuserPosition = rs.FinalFocusPoint?.X ?? double.NaN,
+                        EstimatedFinalHFR = rs.FinalFocusPoint?.Y ?? double.NaN,
+                        Fittings = rs.Fittings,
+                        RejectedPoints = rs.RejectedPoints.Select(p => new AutoFocusRegionPoint() { FocuserPosition = p.Key, Measurement = p.Value }).ToArray()
+                    }).OrderBy(r => r.RegionIndex).ToArray(),
+                    SaveFolder = autoFocusState.SaveFolder
+                };
+            } finally {
+                // Release the static guard on EVERY path after a successful claim — including a throw from OnStarted()
+                // or the CancellationTokenSource construction above the inner try, and the normal return paths above.
+                // Releasing here (after all inner cleanup) holds the guard until the run is fully torn down and can
+                // never leak (the F11 leak-window fix). A bare finally does not swallow the in-flight exception or
+                // alter the returned value.
+                ReleaseAutoFocusInProgress();
+            }
         }
 
         public Task<AutoFocusResult> Run(AutoFocusEngineOptions options, FilterInfo imagingFilter, CancellationToken token, IProgress<ApplicationStatus> progress) {
@@ -1434,16 +1739,29 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
         private async Task<IRenderedImage> ReloadSavedFile(
             AutoFocusState state,
             SavedAutoFocusImage savedFile,
+            SemaphoreSlim loadSerializer,
             CancellationToken token) {
             var isBayered = savedFile.IsBayered;
             var bitDepth = savedFile.BitDepth;
 
-            var sw = new Stopwatch();
-            sw.Start();
-            var imageData = await this.imageDataFactory.CreateFromFile(savedFile.Path, bitDepth, isBayered, profileService.ActiveProfile.CameraSettings.RawConverter, token);
-            sw.Stop();
-            Logger.Info($"Load file took {sw.Elapsed}");
-            return await PrepareExposure(state, imageData, token);
+            // Serialize the decode + prepare so only ONE saved frame is being decoded/prepared at a time. The
+            // NINA-core image pipeline (IImageDataFactory.CreateFromFile + IImagingMediator.PrepareImage) is not
+            // safe for concurrent invocation; the live AF path only ever decodes one frame at a time, but replay's
+            // bounded prefetch starts several loads at once. Two concurrent loads could otherwise corrupt/share pixel
+            // data, so two distinct focuser positions occasionally got an identical HFR. Detection (which reads the
+            // already-materialized RawImageData) stays fully parallel, and the prefetch still overlaps this
+            // serialized load with the parallel detection of an already-loaded frame.
+            await loadSerializer.WaitAsync(token);
+            try {
+                var sw = new Stopwatch();
+                sw.Start();
+                var imageData = await this.imageDataFactory.CreateFromFile(savedFile.Path, bitDepth, isBayered, profileService.ActiveProfile.CameraSettings.RawConverter, token);
+                sw.Stop();
+                Logger.Info($"Load file took {sw.Elapsed}");
+                return await PrepareExposure(state, imageData, token);
+            } finally {
+                loadSerializer.Release();
+            }
         }
 
         private async Task<MeasureAndError> AnalyzeSavedFile(
@@ -1451,7 +1769,8 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             AutoFocusRegionState regionState,
             AutoFocusImageState imageState,
             IRenderedImage renderedImage,
-            CancellationToken token) {
+            CancellationToken token,
+            SavedDetectionCacheSource cacheSource = null) {
             try {
                 state.MeasurementStarted();
                 return await EvaluateExposure(
@@ -1459,7 +1778,8 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                     regionState: regionState,
                     imageState: imageState,
                     image: renderedImage,
-                    token: token);
+                    token: token,
+                    cacheSource: cacheSource);
             } finally {
                 state.MeasurementCompleted();
             }
@@ -1478,6 +1798,32 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                 throw new ArgumentException($"Hocus Focus must be used as the star detector to auto focus with specific regions");
             }
             return RerunImpl(options, savedAttempt, imagingFilter, regions, token, progress);
+        }
+
+        /// <summary>
+        /// Copies a reloaded run's original raw frame into the current save folder's attempt directory (preserving the
+        /// original metadata-encoded filename) so a saving reprocess yields a complete, replayable run — the reload
+        /// path itself never re-saves raw frames. No-op when the run is not saving. Best-effort: a copy failure is
+        /// logged and never fails the run (the reprocess result is still valid; that run just won't be replayable).
+        /// </summary>
+        private void MaybeCopyReplayFrame(AutoFocusState state, SavedAutoFocusImage savedFile, int attemptNumber, bool finalValidation) {
+            if (string.IsNullOrWhiteSpace(state.SaveFolder)) {
+                return;
+            }
+            try {
+                if (string.IsNullOrEmpty(savedFile.Path) || !File.Exists(savedFile.Path)) {
+                    return;
+                }
+                var destFolder = GetSaveAttemptFolder(state, attemptNumber, finalValidation);
+                var dest = Path.Combine(destFolder, Path.GetFileName(savedFile.Path));
+                // Defensive: never copy a file onto itself (would not happen — the save folder is a fresh AutoFocus_<ts>).
+                if (string.Equals(Path.GetFullPath(dest), Path.GetFullPath(savedFile.Path), StringComparison.OrdinalIgnoreCase)) {
+                    return;
+                }
+                File.Copy(savedFile.Path, dest, overwrite: true);
+            } catch (Exception e) {
+                Logger.Warning($"Failed to copy raw frame for replay ({savedFile.Path}): {e.Message}");
+            }
         }
 
         private void InitializeSave(AutoFocusState autoFocusState) {
@@ -1514,13 +1860,32 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             var focuserPositionTasks = new List<Task>();
             int completedCount = 0;
             int totalCount = savedFiles.Count;
-            progress.Report(new ApplicationStatus() {
+            progress?.Report(new ApplicationStatus() {
                 Status = "Data Points",
                 MaxProgress = totalCount,
                 Progress = 0,
                 ProgressType = ApplicationStatus.StatusProgressType.ValueOfMaxValue
             });
 
+            // Bounded prefetch: allow several saved-file loads (disk read + decode + PrepareExposure) to be in
+            // flight at once so loads overlap each other and the parallel star detection, instead of the loop
+            // blocking on each load sequentially. The bound is deliberately SMALL (not ProcessorCount): each
+            // decoded frame is multi-MB and must stay resident until all of its region-analysis tasks finish,
+            // so maxPrefetch caps the number of decoded frames held in memory at once. A slot is acquired before
+            // each load is started and released only after that frame's analysis completes and its imageState is
+            // disposed, so acquire<->release are paired and resident decoded frames never exceed maxPrefetch.
+            // Floor 2: one frame can load while the previous is analyzed; ceiling 4: memory (multi-MB decoded frames) grows linearly with little extra overlap benefit past this.
+            var maxPrefetch = Math.Max(2, Math.Min(4, Environment.ProcessorCount));
+            var prefetchSemaphore = new SemaphoreSlim(maxPrefetch, maxPrefetch);
+            // Serializes the decode + prepare stage across all in-flight loads (see ReloadSavedFile): the NINA-core
+            // CreateFromFile/PrepareImage pipeline is not safe for concurrent invocation, which the prefetch would
+            // otherwise trigger. Detection stays parallel; only load<->load overlap is removed.
+            var loadSerializer = new SemaphoreSlim(1, 1);
+            // Flat list of every post-task spawned, so the finally can wait for ALL of them (each of which releases
+            // its slot) before disposing the semaphore — even if the loop is left early via cancellation/exception
+            // before a group's combined task is added to focuserPositionTasks. Avoids disposing while a Release is
+            // still in flight.
+            var allPostTasks = new List<Task>();
             try {
                 var framesPerFile = savedFiles
                     .GroupBy(f => f.ImageNumber)
@@ -1538,30 +1903,67 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                     var files = focuserPositionGroup.OrderBy(g => g.FrameNumber).ToList();
                     var allMeasurementTasks = new List<Task>();
                     foreach (var savedFile in files) {
+                        // OnNextImage assigns ImageNumber/ordering and MUST stay sequential and ordered.
                         var imageState = await state.OnNextImage(savedFile.FrameNumber, savedFile.FocuserPosition, false, token);
 
-                        var localSavedFile = savedFile;
-                        var loadedImage = await ReloadSavedFile(state, localSavedFile, token);
+                        // Acquire a prefetch slot BEFORE starting the load. If WaitAsync throws (e.g. cancellation),
+                        // dispose imageState to release the ExposureSemaphore slot OnNextImage acquired — mirrors the
+                        // live-run catch at ~line 882. Nothing between the successful WaitAsync and the post-task
+                        // creation throws synchronously (ReloadSavedFile is async; Task.Run/List.Add don't throw), so
+                        // the post-task reliably takes ownership of cleanup from that point on. If synchronously-
+                        // throwing code is ever added in that window, this guard must be widened to also release the
+                        // acquired prefetch slot.
+                        try {
+                            await prefetchSemaphore.WaitAsync(token);
+                        } catch {
+                            imageState.Dispose();
+                            throw;
+                        }
+
+                        // Start the load without awaiting it inline so loads overlap each other and analysis. The
+                        // returned Task is awaited by the region-analysis tasks below. Any load failure is captured
+                        // in loadTask and surfaces when those tasks await it.
+                        var loadTask = ReloadSavedFile(state, savedFile, loadSerializer, token);
+                        // Source for the replay reuse cache (consumed only when Options.ReuseSavedDetection is on).
+                        // Uses the ORIGINAL image/frame numbers from the saved filename (NOT imageState.ImageNumber,
+                        // which OnNextImage reassigned as a fresh ordering counter) and the saved file's own folder,
+                        // so it points at the matching _star_detection_result.json written next to this exposure.
+                        var cacheSource = new SavedDetectionCacheSource(Path.GetDirectoryName(savedFile.Path), savedFile.ImageNumber, savedFile.FrameNumber);
                         var singleFileAnalysisTasks = new List<Task>();
                         foreach (var regionState in state.FocusRegionStates) {
                             var partialMeasurementTask = Task.Run(async () => {
+                                // Image is read-only during detection and is shared across region tasks, so awaiting
+                                // the same loadTask from each is safe.
+                                var loadedImage = await loadTask;
                                 lock (state.StatesLock) {
                                     var imageProperties = loadedImage.RawImageData.Properties;
                                     state.ImageSize = new DrawingSize(width: imageProperties.Width, height: imageProperties.Height);
                                 }
 
-                                var measurement = await AnalyzeSavedFile(state, regionState, imageState, loadedImage, token);
+                                var measurement = await AnalyzeSavedFile(state, regionState, imageState, loadedImage, token, cacheSource);
                                 await FocusPointMeasurementAction(imageState, measurement, state, regionState);
                             });
 
                             singleFileAnalysisTasks.Add(partialMeasurementTask);
                         }
 
+                        // Created unconditionally and immediately after acquiring the slot (no awaitable code in
+                        // between can throw synchronously), so this post-task is the sole, guaranteed owner of the
+                        // slot release. Its finally releases the slot and disposes imageState EXACTLY ONCE on every
+                        // path (success, load/analysis failure, or cancellation), pairing 1:1 with the WaitAsync
+                        // above. The decoded image is held until WhenAll completes, so it is never disposed before
+                        // all region-analysis tasks finish reading it. No token is passed to Task.Run so the finally
+                        // always runs (a token-canceled Task.Run would skip the delegate and leak the slot/imageState).
                         var singleFilePostTask = Task.Run(async () => {
                             try {
                                 await Task.WhenAll(singleFileAnalysisTasks);
+                                // After the frame has been loaded + analyzed (so the source file is no longer open for
+                                // decode), copy the original raw frame into this run's save folder so a saving reprocess
+                                // produces a self-contained, independently-replayable run (the reload path does not
+                                // otherwise re-save raw frames). No-op when not saving.
+                                MaybeCopyReplayFrame(state, savedFile, imageState.AttemptNumber, imageState.FinalValidation);
                                 var incrementedCompletedCount = Interlocked.Increment(ref completedCount);
-                                progress.Report(new ApplicationStatus() {
+                                progress?.Report(new ApplicationStatus() {
                                     Status = "Data Points",
                                     MaxProgress = totalCount,
                                     Progress = incrementedCompletedCount,
@@ -1569,9 +1971,11 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                                 });
                             } finally {
                                 imageState.Dispose();
+                                prefetchSemaphore.Release();
                             }
-                        }, token);
+                        });
                         allMeasurementTasks.Add(singleFilePostTask);
+                        allPostTasks.Add(singleFilePostTask);
                     }
 
                     var focuserPositionTask = Task.WhenAll(allMeasurementTasks);
@@ -1604,8 +2008,19 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                     SaveFolder = state.SaveFolder
                 };
             } finally {
+                // Wait for every spawned post-task to finish so all slot Releases have completed before disposing
+                // the semaphore. This also covers the early-exit paths (e.g. a WaitAsync/OnNextImage cancellation
+                // mid-loop) where some post-tasks were created but their group was never added to
+                // focuserPositionTasks. Exceptions are swallowed here because the original (already-thrown)
+                // exception must be the one that propagates out of RerunImpl; this await is cleanup only.
+                try {
+                    await Task.WhenAll(allPostTasks);
+                } catch {
+                }
+                prefetchSemaphore.Dispose();
+                loadSerializer.Dispose();
                 await Task.Delay(1000);
-                progress.Report(new ApplicationStatus());
+                progress?.Report(new ApplicationStatus());
             }
         }
 
@@ -1649,15 +2064,123 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                 RegionIndex = regionState.RegionIndex,
                 Region = regionState.Region,
                 FocuserPosition = imageState.FocuserPosition,
-                StarDetectionResult = imageState.StarDetectionResult,
+                StarDetectionResult = imageState.GetStarDetectionResult(regionState.RegionIndex),
                 Image = imageState.PreservedExposure
             });
+        }
+
+        /// <summary>
+        /// Writes the replay <c>metadata.json</c> (the star-detection + AutoFocus settings used, region geometry, and
+        /// a result summary) to the run's save folder. Written for any run that produced a complete, replayable saved
+        /// folder — both live captures and saving reprocesses (a saving reprocess re-saves the raw frames, see
+        /// RerunImpl). Only meaningful for STARHFR (contrast detection has no star detector to snapshot). Captures the
+        /// capture-time override when one was used (option b), otherwise the live detector's options. Never throws /
+        /// never fails the run.
+        /// </summary>
+        // Serializes the metadata to <saveFolder>/metadata.json. Isolated + internal so the file-write contract can be
+        // unit-tested without standing up the whole engine.
+        internal static void WriteMetadataFile(string saveFolder, AutoFocusReplayMetadata metadata) {
+            var metadataPath = Path.Combine(saveFolder, "metadata.json");
+            File.WriteAllText(metadataPath, metadata.Serialize());
+            Logger.Info($"Wrote AutoFocus replay metadata to {metadataPath}");
+        }
+
+        private void WriteReplayMetadata(AutoFocusState state, bool succeeded, string failureReason) {
+            try {
+                if (string.IsNullOrWhiteSpace(state.SaveFolder)) {
+                    return;
+                }
+                if (state.Options.AutoFocusMethod != AFMethodEnum.STARHFR) {
+                    return;
+                }
+
+                // Capture the settings ACTUALLY used: the capture-time override when replaying with it (option b),
+                // otherwise the live detector's options (live capture, or replay with current/updated settings).
+                var detector = starDetectionSelector.GetBehavior() as IHocusFocusStarDetection;
+                var sdOptions = state.Options.StarDetectionOptionsOverride ?? detector?.StarDetectionOptions;
+                if (sdOptions == null) {
+                    // Not the Hocus Focus detector (or no options) — nothing meaningful to snapshot for replay.
+                    return;
+                }
+
+                var focuserSettings = profileService.ActiveProfile.FocuserSettings;
+                // >1 explicit region ⇒ an Aberration Inspector run (its region grid is always >= 6); an AF-pane run
+                // uses no regions (live) or a single captured region (a capture-time replay routed through regions).
+                var isInspectorRun = state.FocusRegions.Count > 1;
+                var explicitRegions = state.FocusRegionStates.Select(rs => rs.Region).Where(r => r != null).ToList();
+
+                List<StarDetectionRegion> regions;
+                if (explicitRegions.Count > 0) {
+                    // Inspector run, or any capture-time replay routed through the explicit-region path — store the
+                    // regions actually used (they already encode the capture-time ROI).
+                    regions = explicitRegions;
+                } else {
+                    // AF pane with no explicit region: derive the single region from the crop ROI actually in effect,
+                    // so an in-memory replay can reproduce that ROI through the explicit-region path.
+                    regions = new List<StarDetectionRegion>() {
+                        StarDetectionRegion.FromStarDetectionParams(new StarDetectionParams() {
+                            UseROI = focuserSettings.AutoFocusInnerCropRatio < 1.0,
+                            InnerCropRatio = focuserSettings.AutoFocusInnerCropRatio,
+                            OuterCropRatio = focuserSettings.AutoFocusOuterCropRatio
+                        })
+                    };
+                }
+
+                var inspectorOptions = HocusFocusPlugin.InspectorOptions;
+                var regionGeometry = new ReplayRegionGeometry() {
+                    AutoFocusInnerCropRatio = focuserSettings.AutoFocusInnerCropRatio,
+                    AutoFocusOuterCropRatio = focuserSettings.AutoFocusOuterCropRatio,
+                    IsInspectorRun = isInspectorRun,
+                    SensorROI = inspectorOptions?.SensorROI ?? 0.0,
+                    CornersROI = inspectorOptions?.CornersROI ?? 0.0,
+                    SensorCurveModelEnabled = inspectorOptions?.SensorCurveModelEnabled ?? false,
+                    Regions = regions
+                };
+
+                var results = state.FocusRegionStates.Select(rs => new ReplayRegionResultSummary() {
+                    RegionIndex = rs.RegionIndex,
+                    EstimatedFinalFocuserPosition = rs.FinalFocusPoint?.X,
+                    EstimatedFinalHFR = rs.FinalFocusPoint?.Y,
+                    FinalHFR = rs.FinalHFR?.Measure,
+                    InitialHFR = rs.InitialHFR?.Measure,
+                    RSquared = rs.Fittings?.HyperbolicFitting?.RSquared,
+                    SelectedHyperbolicFitModel = rs.Fittings?.SelectedHyperbolicFitModel
+                }).ToList();
+
+                var pluginVersion = typeof(AutoFocusEngine).Assembly.GetName().Version?.ToString();
+                var metadata = AutoFocusReplayMetadataBuilder.Build(
+                    sdOptions, state.Options, regionGeometry, results, DateTime.UtcNow, pluginVersion, StarDetector.StarDetectorVersion,
+                    succeeded: succeeded, failureReason: failureReason);
+
+                WriteMetadataFile(state.SaveFolder, metadata);
+            } catch (Exception e) {
+                Logger.Warning($"Failed to write AutoFocus replay metadata.json: {e.Message}");
+            }
+        }
+
+        // Short human-readable reason for the metadata.json failure record, derived from the validation failure mode.
+        private static string FailureReasonText(AutoFocusFailureMode mode) {
+            switch (mode) {
+                case AutoFocusFailureMode.HfrRegression:
+                    return "Final HFR worse than original";
+                case AutoFocusFailureMode.FinalPointOutOfBounds:
+                    return "Calculated focus point outside the swept range";
+                case AutoFocusFailureMode.FitQuality:
+                    return "Fit/data quality rejected (low R²/χ² or insufficient stars)";
+                case AutoFocusFailureMode.InitialHfrFailed:
+                    return "Initial HFR measurement failed";
+                case AutoFocusFailureMode.FinalHfrMissing:
+                    return "Final HFR measurement failed";
+                default:
+                    return "AutoFocus failed";
+            }
         }
 
         private void OnCompleted(
             AutoFocusState state,
             double temperature,
             TimeSpan duration) {
+            WriteReplayMetadata(state, succeeded: true, failureReason: null);
             var initialFocuserPosition = state.InitialFocuserPosition;
             var filter = state.AutoFocusFilter?.Name ?? string.Empty;
             var iteration = state.AttemptNumber;
@@ -1717,6 +2240,9 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             AutoFocusState state,
             double temperature,
             TimeSpan duration) {
+            // A failed run is still saved with a metadata.json (flagged as failed) so it can be inspected/replayed —
+            // unlike OnIterationFailed, which is a mid-run retry boundary, this is the terminal failure.
+            WriteReplayMetadata(state, succeeded: false, failureReason: FailureReasonText(state.LastFailureMode));
             Failed?.Invoke(this, GetFailedEventArgs(state, temperature, duration));
         }
 

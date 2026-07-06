@@ -58,7 +58,7 @@ namespace TestApp {
         }
 
         private static async Task RunImpl(string[] args) {
-            var imagePath = GetArg(args, "--image");
+            var imagePath = DiagnosticUtil.GetArg(args, "--image");
             if (string.IsNullOrWhiteSpace(imagePath)) {
                 Console.Error.WriteLine("Usage: TestApp contamination --image <path> [--profile-id <guid>] [--out <dir>] [--sensitivity <double>] [--sensitivity-sweep <a,b,step>]");
                 Environment.ExitCode = 2;
@@ -68,8 +68,8 @@ namespace TestApp {
                 throw new FileNotFoundException($"Image not found: {imagePath}", imagePath);
             }
 
-            var profileId = GetArg(args, "--profile-id");
-            var outDir = GetArg(args, "--out");
+            var profileId = DiagnosticUtil.GetArg(args, "--profile-id");
+            var outDir = DiagnosticUtil.GetArg(args, "--out");
             if (string.IsNullOrWhiteSpace(outDir)) {
                 var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
                 outDir = Path.Combine(localAppData, "NINA", "Logs", "hf-diag", DateTime.Now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture));
@@ -77,7 +77,7 @@ namespace TestApp {
             Directory.CreateDirectory(outDir);
 
             double? sensitivityOverride = null;
-            var sensitivityArg = GetArg(args, "--sensitivity");
+            var sensitivityArg = DiagnosticUtil.GetArg(args, "--sensitivity");
             if (!string.IsNullOrWhiteSpace(sensitivityArg)) {
                 sensitivityOverride = double.Parse(sensitivityArg, CultureInfo.InvariantCulture);
             }
@@ -131,13 +131,49 @@ namespace TestApp {
                 baseParams.ContaminationSensitivity = sensitivityOverride.Value;
             }
 
+            // Opt-in defocus-aware distortion test switch (for the near-focus precision check). Flips the flag ON
+            // and optionally overrides the two tuning knobs; prints accepted + TooDistorted before/after so the
+            // gate's effect on a single frame is visible without labels.
+            if (DiagnosticUtil.HasFlag(args, "--defocus-distortion")) {
+                baseParams.DefocusAwareDistortion = true;
+                var sizeRefArg = DiagnosticUtil.GetArg(args, "--defocus-size-ref");
+                if (!string.IsNullOrWhiteSpace(sizeRefArg) && double.TryParse(sizeRefArg, NumberStyles.Float, CultureInfo.InvariantCulture, out var sizeRef)) {
+                    baseParams.DefocusDistortionSizeReference = sizeRef;
+                }
+                var minFactorArg = DiagnosticUtil.GetArg(args, "--defocus-min-factor");
+                if (!string.IsNullOrWhiteSpace(minFactorArg) && double.TryParse(minFactorArg, NumberStyles.Float, CultureInfo.InvariantCulture, out var minFactor)) {
+                    baseParams.DefocusDistortionMinFactor = minFactor;
+                }
+                Console.WriteLine($"DefocusAwareDistortion=ON (SizeReference={baseParams.DefocusDistortionSizeReference.ToString(CultureInfo.InvariantCulture)} px, MinFactor={baseParams.DefocusDistortionMinFactor.ToString(CultureInfo.InvariantCulture)})");
+            } else {
+                Console.WriteLine("DefocusAwareDistortion=OFF");
+            }
+
+            // Companion defocus-aware CENTERING test switch (relaxes the NotCentered gate for large/defocused
+            // candidates). Shares the size reference with the distortion gate; optional --defocus-center-factor
+            // overrides the max centering-tolerance multiplier.
+            if (DiagnosticUtil.HasFlag(args, "--defocus-centering")) {
+                baseParams.DefocusAwareCentering = true;
+                var sizeRefArg = DiagnosticUtil.GetArg(args, "--defocus-size-ref");
+                if (!string.IsNullOrWhiteSpace(sizeRefArg) && double.TryParse(sizeRefArg, NumberStyles.Float, CultureInfo.InvariantCulture, out var sizeRef)) {
+                    baseParams.DefocusDistortionSizeReference = sizeRef;
+                }
+                var centerFactorArg = DiagnosticUtil.GetArg(args, "--defocus-center-factor");
+                if (!string.IsNullOrWhiteSpace(centerFactorArg) && double.TryParse(centerFactorArg, NumberStyles.Float, CultureInfo.InvariantCulture, out var centerFactor)) {
+                    baseParams.DefocusCenteringToleranceFactor = centerFactor;
+                }
+                Console.WriteLine($"DefocusAwareCentering=ON (SizeReference={baseParams.DefocusDistortionSizeReference.ToString(CultureInfo.InvariantCulture)} px, ToleranceFactor={baseParams.DefocusCenteringToleranceFactor.ToString(CultureInfo.InvariantCulture)})");
+            } else {
+                Console.WriteLine("DefocusAwareCentering=OFF");
+            }
+
             // Load the original image once (CV_32F, normalized [0,1]). Detection mutates its input in place,
             // so each run gets a clone and the original is kept for the annotated background.
-            using var srcFloat = await LoadFloatMat(imagePath, profileService);
+            using var srcFloat = await DiagnosticUtil.LoadFloatMat(imagePath, profileService);
             Console.WriteLine($"Image dimensions: {srcFloat.Width} x {srcFloat.Height}");
             Logger.Info($"Loaded image {srcFloat.Width}x{srcFloat.Height} from {imagePath}");
 
-            var sweepArg = GetArg(args, "--sensitivity-sweep");
+            var sweepArg = DiagnosticUtil.GetArg(args, "--sensitivity-sweep");
             if (!string.IsNullOrWhiteSpace(sweepArg)) {
                 await RunSweep(srcFloat, baseParams, sweepArg, outDir);
                 return;
@@ -149,6 +185,7 @@ namespace TestApp {
             int total = result.DetectedStars.Count;
             int suspected = result.Metrics.ContaminationSuspected;
             Console.WriteLine($"Detected {total}, {suspected} contamination-suspected ({Percent(suspected, total)})");
+            Console.WriteLine($"PRECISION-CHECK accepted={total}, TooDistorted={result.Metrics.TooDistorted}, NotCentered={result.Metrics.NotCentered}, TooSmall={result.Metrics.TooSmall}");
 
             var shapes = BuildShapeLookup(result, diagnostics);
             WriteCsv(Path.Combine(outDir, "contamination_stars.csv"), diagnostics, shapes);
@@ -193,25 +230,6 @@ namespace TestApp {
             using var clone = srcFloat.Clone();
             var detector = new StarDetector(new AlglibAPI());
             return await detector.Detect(clone, p, null, CancellationToken.None);
-        }
-
-        private static async Task<Mat> LoadFloatMat(string path, IProfileService profileService) {
-            var ext = Path.GetExtension(path).ToLowerInvariant();
-            if (ext == ".tif" || ext == ".tiff") {
-                using var src = new Mat(path, ImreadModes.Unchanged);
-                var dst = new Mat();
-                Program.ConvertToFloat(src, dst);
-                return dst;
-            }
-            if (ext == ".xisf" || ext == ".fits" || ext == ".fit") {
-                var factory = new ImageDataFactory(profileService, new StubBehaviorSelector<IStarDetection>(new StubStarDetection()), new StubBehaviorSelector<IStarAnnotator>());
-                var uri = new Uri(Path.GetFullPath(path));
-                IImageData imageData = ext == ".xisf"
-                    ? await XISF.Load(uri, false, factory, CancellationToken.None)
-                    : await FITS.Load(uri, false, factory, CancellationToken.None);
-                return CvImageUtility.ToOpenCVMat(imageData);
-            }
-            throw new NotSupportedException($"Unsupported image extension '{ext}'. Supported: .tif/.tiff, .xisf, .fits/.fit");
         }
 
         private static void LogResolvedOptions(StarDetectionOptions o) {
@@ -500,15 +518,6 @@ namespace TestApp {
             int hi = (int)Math.Ceiling(idx);
             double frac = idx - lo;
             return sorted[lo] * (1 - frac) + sorted[hi] * frac;
-        }
-
-        private static string GetArg(string[] args, string name) {
-            for (int i = 0; i < args.Length - 1; ++i) {
-                if (string.Equals(args[i], name, StringComparison.OrdinalIgnoreCase)) {
-                    return args[i + 1];
-                }
-            }
-            return null;
         }
 
         private static string F(double v) {

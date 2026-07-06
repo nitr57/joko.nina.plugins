@@ -1,0 +1,1320 @@
+#!/usr/bin/env python3
+"""Generate the synthetic illustrative figures for the Hocus Focus documentation site.
+
+Every figure is deterministic (each seeds its own ``numpy`` RNG), so re-running reproduces
+byte-for-byte-equivalent images up to matplotlib/freetype rendering differences. The committed
+PNGs under ``documentation/docs/assets/figures/`` are the published source of truth; CI runs this
+script with ``--check`` to verify they have not drifted.
+
+Usage:
+    python generate_figures.py                # (re)generate every figure
+    python generate_figures.py --only af_vcurve objective_sfocus
+    python generate_figures.py --check        # regenerate to a temp dir and compare to committed
+    python generate_figures.py --out <dir>    # write somewhere other than the default assets dir
+
+There are two visual registers:
+  * "image" figures (star fields / PSFs / donuts) use a dark astro look: grayscale or magma,
+    no axes, optional annotations.
+  * "plot" figures (objective terms, V-curves, score curves) use a clean light-friendly line
+    style with labelled axes and LaTeX (mathtext) titles that match the body MathJax.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import tempfile
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")  # headless; no display required (CI + WSL)
+import matplotlib.pyplot as plt
+import numpy as np
+
+# --------------------------------------------------------------------------------------------------
+# Constants & style
+# --------------------------------------------------------------------------------------------------
+
+DEFAULT_OUT = Path(__file__).resolve().parent.parent / "docs" / "assets" / "figures"
+DPI = 144
+ACCENT = "#3F51B5"      # indigo, matches the Material theme primary
+ACCENT2 = "#E91E63"     # pink, for "rejected"/secondary series
+GOOD = "#2E7D32"        # green, for "accepted"
+WARN = "#F9A825"        # amber, for thresholds
+STAR_CMAP = "gray"
+
+plt.rcParams.update(
+    {
+        "figure.dpi": DPI,
+        "savefig.dpi": DPI,
+        "font.family": "DejaVu Sans",   # ships with matplotlib -> stable across machines
+        "font.size": 11,
+        "axes.titlesize": 12,
+        "axes.grid": True,
+        "grid.alpha": 0.25,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+    }
+)
+
+
+# --------------------------------------------------------------------------------------------------
+# Pure-numpy primitives
+# --------------------------------------------------------------------------------------------------
+
+def _grid(shape):
+    h, w = shape
+    yy, xx = np.mgrid[0:h, 0:w]
+    return xx.astype(float), yy.astype(float)
+
+
+def gaussian_psf(shape, x0, y0, sigma, amp=1.0):
+    xx, yy = _grid(shape)
+    r2 = (xx - x0) ** 2 + (yy - y0) ** 2
+    return amp * np.exp(-r2 / (2.0 * sigma ** 2))
+
+
+def elliptical_gaussian(shape, x0, y0, sx, sy, theta=0.0, amp=1.0):
+    xx, yy = _grid(shape)
+    xr = (xx - x0) * np.cos(theta) + (yy - y0) * np.sin(theta)
+    yr = -(xx - x0) * np.sin(theta) + (yy - y0) * np.cos(theta)
+    return amp * np.exp(-(xr ** 2 / (2 * sx ** 2) + yr ** 2 / (2 * sy ** 2)))
+
+
+def moffat_psf(shape, x0, y0, alpha, beta, amp=1.0):
+    xx, yy = _grid(shape)
+    r2 = (xx - x0) ** 2 + (yy - y0) ** 2
+    return amp * (1.0 + r2 / alpha ** 2) ** (-beta)
+
+
+def moffat_radial(r, alpha, beta):
+    return (1.0 + (r / alpha) ** 2) ** (-beta)
+
+
+def defocused_donut(shape, x0, y0, r_outer, r_inner, amp=1.0, softness=2.0):
+    """A ring/annulus star (central-obstruction shadow), softened at both edges."""
+    xx, yy = _grid(shape)
+    r = np.sqrt((xx - x0) ** 2 + (yy - y0) ** 2)
+    outer = 1.0 / (1.0 + np.exp((r - r_outer) / softness))
+    inner = 1.0 / (1.0 + np.exp((r_inner - r) / softness))
+    ring = outer * inner
+    return amp * ring / max(ring.max(), 1e-9)
+
+
+def add_noise(img, sky, read_noise, rng, gain=1500.0):
+    """Add a sky pedestal + shot (Poisson-like) + read (Gaussian) noise.
+
+    Images here are normalized to ~[0, 1], so ``gain`` is electrons-per-unit: shot-noise std is
+    sqrt(signal / gain), which keeps the noise physically gentle (a large gain ⇒ high SNR). With
+    the default ``gain``, a unit-amplitude star has shot std ≈ 0.026.
+    """
+    out = img + sky
+    shot = rng.normal(0.0, np.sqrt(np.maximum(out, 0.0) / max(gain, 1e-9)))
+    read = rng.normal(0.0, read_noise, size=img.shape)
+    return out + shot + read
+
+
+def star_field(shape, n_stars, rng, max_amp=1.0, sigma_range=(1.2, 2.6), margin=8):
+    h, w = shape
+    img = np.zeros(shape)
+    cats = []
+    for _ in range(n_stars):
+        x0 = rng.uniform(margin, w - margin)
+        y0 = rng.uniform(margin, h - margin)
+        amp = max_amp * rng.uniform(0.1, 1.0)
+        sigma = rng.uniform(*sigma_range)
+        img += gaussian_psf(shape, x0, y0, sigma, amp)
+        cats.append((x0, y0, amp, sigma))
+    return img, cats
+
+
+# --------------------------------------------------------------------------------------------------
+# Render helpers
+# --------------------------------------------------------------------------------------------------
+
+def _stretch(img, lo=1.0, hi=99.5):
+    a, b = np.percentile(img, [lo, hi])
+    return np.clip((img - a) / max(b - a, 1e-9), 0, 1)
+
+
+def save_image_panel(panels, name, out_dir, cmap=STAR_CMAP, figsize=None):
+    """panels: list of (title, 2D array). Renders a row of imshow panels with no ticks."""
+    n = len(panels)
+    figsize = figsize or (3.1 * n, 3.4)
+    fig, axes = plt.subplots(1, n, figsize=figsize)
+    if n == 1:
+        axes = [axes]
+    for ax, (title, arr) in zip(axes, panels):
+        ax.imshow(_stretch(arr), cmap=cmap, origin="upper", interpolation="nearest")
+        ax.set_title(title)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.grid(False)
+        for s in ax.spines.values():
+            s.set_visible(False)
+    fig.patch.set_facecolor("white")
+    return _finalize(fig, name, out_dir)
+
+
+def save_plot(fig, name, out_dir):
+    fig.tight_layout()
+    return _finalize(fig, name, out_dir)
+
+
+def _finalize(fig, name, out_dir):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"{name}.png"
+    fig.savefig(path, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    return path
+
+
+# --------------------------------------------------------------------------------------------------
+# Figure builders  (one per documented concept)
+# --------------------------------------------------------------------------------------------------
+
+def fig_psf_models(out_dir):
+    shape = (49, 49)
+    c = 24
+    g = gaussian_psf(shape, c, c, 4.0)
+    m40 = moffat_psf(shape, c, c, 6.0, 4.0)
+    m15 = moffat_psf(shape, c, c, 6.0, 1.5)
+    fig, axes = plt.subplots(1, 2, figsize=(9.5, 4.0))
+    # left: 2D images stacked via a small montage
+    montage = np.concatenate([_stretch(g), _stretch(m40), _stretch(m15)], axis=1)
+    axes[0].imshow(montage, cmap=STAR_CMAP, interpolation="nearest")
+    axes[0].set_xticks([c, c + shape[1], c + 2 * shape[1]])
+    axes[0].set_xticklabels(["Gaussian", "Moffat β=4.0", "Moffat β=1.5"])
+    axes[0].set_yticks([])
+    axes[0].grid(False)
+    axes[0].set_title("Point-spread function shapes")
+    # right: radial profiles (log y) — Moffat has heavier wings
+    r = np.linspace(0, 16, 400)
+    axes[1].plot(r, np.exp(-r ** 2 / (2 * 4.0 ** 2)), color=ACCENT, label="Gaussian")
+    axes[1].plot(r, moffat_radial(r, 6.0, 4.0), color=GOOD, label="Moffat β=4.0")
+    axes[1].plot(r, moffat_radial(r, 6.0, 2.5), color=WARN, label="Moffat β=2.5")
+    axes[1].plot(r, moffat_radial(r, 6.0, 1.5), color=ACCENT2, label="Moffat β=1.5")
+    axes[1].set_yscale("log")
+    axes[1].set_ylim(1e-3, 1.2)
+    axes[1].set_xlabel("radius (px)")
+    axes[1].set_ylabel("normalized intensity")
+    axes[1].set_title("Radial profiles — Moffat has heavier wings")
+    axes[1].legend(frameon=False, fontsize=9)
+    return save_plot(fig, "psf-models", out_dir)
+
+
+def fig_defocused_donut(out_dir):
+    shape = (81, 81)
+    c = 40
+    focused = gaussian_psf(shape, c, c, 3.0)
+    donut = defocused_donut(shape, c, c, r_outer=28, r_inner=14, softness=3.0)
+    fig, axes = plt.subplots(1, 3, figsize=(11, 3.8))
+    for ax, (title, arr) in zip(
+        axes[:2], [("Near focus", focused), ("Far from focus (donut)", donut)]
+    ):
+        ax.imshow(_stretch(arr), cmap=STAR_CMAP, interpolation="nearest")
+        ax.set_title(title)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.grid(False)
+    row = shape[0] // 2
+    axes[2].plot(focused[row], color=ACCENT, label="near focus")
+    axes[2].plot(donut[row], color=ACCENT2, label="donut")
+    axes[2].set_title("Horizontal cut")
+    axes[2].set_xlabel("column (px)")
+    axes[2].set_ylabel("intensity")
+    axes[2].legend(frameon=False, fontsize=9)
+    return save_plot(fig, "defocused-donut", out_dir)
+
+
+def fig_hot_pixel(out_dir):
+    rng = np.random.default_rng(11)
+    shape = (60, 60)
+    img, _ = star_field(shape, 10, rng, max_amp=0.8, sigma_range=(1.4, 2.2))
+    img = add_noise(img, sky=0.05, read_noise=0.02, rng=rng)
+    hot = img.copy()
+    hot[20, 38] = img.max() * 6  # single bright hot pixel
+    # 3x3 median filter (manual, no scipy dependency required here)
+    med = np.copy(hot)
+    for y in range(1, shape[0] - 1):
+        for x in range(1, shape[1] - 1):
+            med[y, x] = np.median(hot[y - 1 : y + 2, x - 1 : x + 2])
+    return save_image_panel(
+        [("Raw + hot pixel", hot), ("After 3×3 median", med)],
+        "hot-pixel",
+        out_dir,
+        figsize=(7.2, 3.8),
+    )
+
+
+def fig_saturated_star(out_dir):
+    shape = (41, 41)
+    c = 20
+    star = gaussian_psf(shape, c, c, 4.0, amp=1.8)  # peak above full well
+    full_well = 1.0
+    sat = np.clip(star, 0, full_well)
+    fig, axes = plt.subplots(1, 2, figsize=(8.6, 3.8))
+    axes[0].imshow(_stretch(sat), cmap=STAR_CMAP, interpolation="nearest")
+    axes[0].set_title("Saturated star (flat-topped core)")
+    axes[0].set_xticks([])
+    axes[0].set_yticks([])
+    axes[0].grid(False)
+    row = shape[0] // 2
+    axes[1].plot(star[row], color=ACCENT, ls="--", label="true profile")
+    axes[1].plot(sat[row], color=ACCENT2, label="recorded (clipped)")
+    axes[1].axhline(full_well, color=WARN, lw=1, label="saturation threshold")
+    axes[1].set_title("Clipping destroys the core")
+    axes[1].set_xlabel("column (px)")
+    axes[1].set_ylabel("intensity")
+    axes[1].legend(frameon=False, fontsize=9)
+    return save_plot(fig, "saturated-star", out_dir)
+
+
+def fig_eccentric_star(out_dir):
+    shape = (41, 41)
+    c = 20
+    round_star = elliptical_gaussian(shape, c, c, 4.0, 4.0)
+    elong = elliptical_gaussian(shape, c, c, 6.0, 2.6, theta=np.deg2rad(35))
+    return save_image_panel(
+        [("Round (e ≈ 0)", round_star), ("Elongated (high e)", elong)],
+        "eccentric-star",
+        out_dir,
+        figsize=(7.2, 3.8),
+    )
+
+
+def fig_contamination_annulus(out_dir):
+    shape = (61, 61)
+    c = 30
+    img = gaussian_psf(shape, c, c, 3.0, amp=1.0)
+    img += gaussian_psf(shape, c + 17, c - 6, 3.0, amp=0.6)  # contaminating neighbor
+    rng = np.random.default_rng(7)
+    img = add_noise(img, sky=0.04, read_noise=0.02, rng=rng)
+    fig, ax = plt.subplots(figsize=(4.6, 4.4))
+    ax.imshow(_stretch(img), cmap=STAR_CMAP, interpolation="nearest")
+    # draw the background annulus
+    for rad, style in [(8, "-"), (15, "-")]:
+        circ = plt.Circle((c, c), rad, fill=False, color=GOOD, lw=1.4, ls=style)
+        ax.add_patch(circ)
+    ax.text(c, c - 19, "background annulus", color=GOOD, ha="center", fontsize=8)
+    ax.annotate(
+        "brighter on\none side →\ncontaminant",
+        xy=(c + 17, c - 6),
+        xytext=(c - 6, c + 22),
+        color=ACCENT2,
+        fontsize=8,
+        arrowprops=dict(arrowstyle="->", color=ACCENT2),
+    )
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.grid(False)
+    ax.set_title("Contamination: one-sided annulus excess")
+    return _finalize(fig, "contamination-annulus", out_dir)
+
+
+def fig_noise_reduction(out_dir):
+    rng = np.random.default_rng(3)
+    shape = (70, 70)
+    img, _ = star_field(shape, 14, rng, max_amp=0.7, sigma_range=(1.3, 2.0))
+    noisy = add_noise(img, sky=0.05, read_noise=0.09, rng=rng)
+    # gaussian blur via separable kernel
+    def blur(a, sigma):
+        k = int(sigma * 3) | 1
+        ax = np.arange(k) - k // 2
+        g = np.exp(-(ax ** 2) / (2 * sigma ** 2))
+        g /= g.sum()
+        out = np.apply_along_axis(lambda m: np.convolve(m, g, mode="same"), 0, a)
+        out = np.apply_along_axis(lambda m: np.convolve(m, g, mode="same"), 1, out)
+        return out
+
+    return save_image_panel(
+        [("Raw (noisy)", noisy), ("Noise reduction (blur r=3)", blur(noisy, 1.6))],
+        "noise-reduction",
+        out_dir,
+        figsize=(7.2, 3.8),
+    )
+
+
+def fig_structure_map(out_dir):
+    rng = np.random.default_rng(21)
+    shape = (90, 90)
+    stars, cats = star_field(shape, 20, rng, max_amp=1.0, sigma_range=(1.6, 2.8))
+    # add a strong, smooth large-scale "nebula" gradient (the thing the wavelet step removes)
+    xx, yy = _grid(shape)
+    nebula = 0.8 * np.exp(-((xx - 26) ** 2 + (yy - 64) ** 2) / (2 * 34 ** 2))
+    nebula += 0.25 * (xx / shape[1])  # gentle linear gradient too
+    img = add_noise(stars + nebula, sky=0.06, read_noise=0.012, rng=rng)
+
+    # crude a-trous-like high pass: subtract a strongly blurred copy (removes large structures)
+    def blur(a, sigma):
+        k = int(sigma * 3) | 1
+        ax = np.arange(k) - k // 2
+        g = np.exp(-(ax ** 2) / (2 * sigma ** 2))
+        g /= g.sum()
+        out = np.apply_along_axis(lambda m: np.convolve(m, g, mode="same"), 0, a)
+        return np.apply_along_axis(lambda m: np.convolve(m, g, mode="same"), 1, out)
+
+    highpass = img - blur(img, 6.0)
+    thr = np.median(highpass) + 3.0 * (1.4826 * np.median(np.abs(highpass - np.median(highpass))))
+    binary = (highpass > thr).astype(float)
+    return save_image_panel(
+        [
+            ("Raw frame (+ nebula)", img),
+            ("Wavelet residual (high-pass)", highpass),
+            ("Binarized structure map", binary),
+        ],
+        "structure-map",
+        out_dir,
+        figsize=(10.5, 3.7),
+    )
+
+
+def fig_hfr_half_flux(out_dir):
+    r = np.linspace(0, 12, 500)
+    profile = np.exp(-r ** 2 / (2 * 3.0 ** 2))
+    flux = np.cumsum(profile * 2 * np.pi * r)
+    flux /= flux[-1]
+    hfr = r[np.searchsorted(flux, 0.5)]
+    fig, ax = plt.subplots(figsize=(6.4, 4.0))
+    ax.plot(r, flux, color=ACCENT, label="enclosed flux fraction")
+    ax.axhline(0.5, color=WARN, lw=1, ls="--")
+    ax.axvline(hfr, color=ACCENT2, lw=1.4)
+    ax.annotate(
+        f"HFR ≈ {hfr:.1f} px\n(radius enclosing half the flux)",
+        xy=(hfr, 0.5),
+        xytext=(hfr + 1.2, 0.28),
+        fontsize=9,
+        arrowprops=dict(arrowstyle="->", color=ACCENT2),
+    )
+    ax.set_xlabel("radius from star center (px)")
+    ax.set_ylabel("fraction of total flux")
+    ax.set_title("Half-Flux Radius (HFR)")
+    ax.legend(frameon=False, fontsize=9, loc="lower right")
+    return save_plot(fig, "hfr-half-flux", out_dir)
+
+
+def fig_gate_distortion(out_dir):
+    fig, axes = plt.subplots(1, 2, figsize=(8.4, 4.0))
+    for ax, (title, fill, color) in zip(
+        axes,
+        [("Compact star — high fill ratio", True, GOOD), ("Stringy/diffuse — low fill", False, ACCENT2)],
+    ):
+        ax.add_patch(plt.Rectangle((0, 0), 10, 10, fill=False, edgecolor="gray", lw=1.5))
+        rng = np.random.default_rng(5 if fill else 9)
+        if fill:
+            th = np.linspace(0, 2 * np.pi, 220)
+            rr = rng.uniform(0, 3.6, th.size)
+            xs, ys = 5 + rr * np.cos(th), 5 + rr * np.sin(th)
+        else:
+            xs = rng.uniform(0.5, 9.5, 70)
+            ys = 5 + 0.7 * (xs - 5) + rng.normal(0, 0.6, xs.size)
+        ax.scatter(xs, ys, s=8, color=color)
+        ax.set_xlim(-0.5, 10.5)
+        ax.set_ylim(-0.5, 10.5)
+        ax.set_aspect("equal")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.grid(False)
+        ax.set_title(title)
+    fig.suptitle(r"Max Distortion = pixel count / bounding-box area", fontsize=11)
+    return save_plot(fig, "gate-distortion", out_dir)
+
+
+def fig_gate_centering(out_dir):
+    fig, axes = plt.subplots(1, 2, figsize=(8.4, 4.0))
+    for ax, (title, cx, cy, ok) in zip(
+        axes, [("Centroid inside tolerance", 5.3, 4.7, True), ("Centroid off-center", 7.8, 6.9, False)]
+    ):
+        ax.add_patch(plt.Rectangle((0, 0), 10, 10, fill=False, edgecolor="gray", lw=1.5))
+        ax.add_patch(plt.Rectangle((3.5, 3.5), 3, 3, fill=False, edgecolor=ACCENT, lw=1.5, ls="--"))
+        ax.scatter([cx], [cy], s=80, color=GOOD if ok else ACCENT2, marker="x", lw=2.5)
+        ax.text(5, 7.2, "tolerance box", color=ACCENT, ha="center", fontsize=8)
+        ax.set_xlim(-0.5, 10.5)
+        ax.set_ylim(-0.5, 10.5)
+        ax.set_aspect("equal")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.grid(False)
+        ax.set_title(title)
+    fig.suptitle("Star Center Tolerance: centroid must fall in the inner box", fontsize=11)
+    return save_plot(fig, "gate-centering", out_dir)
+
+
+def fig_gate_min_size(out_dir):
+    fig, ax = plt.subplots(figsize=(7.2, 3.6))
+    sizes = [2, 3, 5, 8, 12]
+    minbb = 5
+    for i, s in enumerate(sizes):
+        x = i * 3
+        color = ACCENT2 if s < minbb else GOOD
+        ax.add_patch(plt.Rectangle((x, 0), s * 0.18, s * 0.18, color=color, alpha=0.7))
+        ax.text(x + s * 0.09, -0.3, f"{s}px", ha="center", fontsize=9)
+    ax.axhline(0, color="gray", lw=0.5)
+    ax.set_xlim(-0.5, 15)
+    ax.set_ylim(-0.8, 2.6)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.grid(False)
+    ax.set_title("MinStarBoundingBoxSize = 5 → smaller candidates (pink) rejected")
+    return save_plot(fig, "gate-min-size", out_dir)
+
+
+def fig_gate_sensitivity(out_dir):
+    x = np.linspace(0, 40, 400)
+    noise = 1.0
+    bg = 5.0
+    bright = bg + 9 * np.exp(-(x - 20) ** 2 / (2 * 3 ** 2))
+    dim = bg + 2.2 * np.exp(-(x - 20) ** 2 / (2 * 3 ** 2))
+    fig, ax = plt.subplots(figsize=(6.6, 4.0))
+    ax.plot(x, bright, color=GOOD, label="bright: (s−b)/n high → accept")
+    ax.plot(x, dim, color=ACCENT2, label="dim: (s−b)/n low → reject")
+    ax.axhline(bg, color="gray", ls="--", lw=1, label="background b")
+    ax.axhline(bg + 2 * noise, color=WARN, ls=":", lw=1.2, label="b + sensitivity·n")
+    ax.set_xlabel("pixel (px)")
+    ax.set_ylabel("intensity")
+    ax.set_title(r"Brightness Sensitivity gate: $(s-b)/n \geq$ threshold")
+    ax.legend(frameon=False, fontsize=8.5, loc="upper right")
+    return save_plot(fig, "gate-sensitivity", out_dir)
+
+
+def fig_gate_flatness(out_dir):
+    x = np.linspace(0, 20, 300)
+    peaked = np.exp(-(x - 10) ** 2 / (2 * 2.0 ** 2))
+    flat = np.clip(1.15 * np.exp(-(x - 10) ** 2 / (2 * 5.0 ** 2)), 0, 0.82)
+    fig, ax = plt.subplots(figsize=(6.6, 4.0))
+    ax.plot(x, peaked, color=GOOD, label="peaked: median ≪ peak → accept")
+    ax.plot(x, flat, color=ACCENT2, label="flat blob: median ≈ peak → reject")
+    ax.set_xlabel("pixel (px)")
+    ax.set_ylabel("intensity")
+    ax.set_title("Star Peak Response: flatness = median / peak")
+    ax.legend(frameon=False, fontsize=9)
+    return save_plot(fig, "gate-flatness", out_dir)
+
+
+def fig_noise_clipping(out_dir):
+    rng = np.random.default_rng(8)
+    bg = rng.normal(0.10, 0.03, 60000)
+    stars = rng.uniform(0.3, 1.0, 1500)
+    data = np.concatenate([bg, stars])
+    median = np.median(bg)
+    sigma = 1.4826 * np.median(np.abs(bg - median))
+    fig, ax = plt.subplots(figsize=(6.8, 4.0))
+    ax.hist(data, bins=120, color="lightgray", edgecolor="none")
+    for k, c in [(2, WARN), (4, ACCENT)]:
+        ax.axvline(median + k * sigma, color=c, lw=1.6, label=f"median + {k}·σ")
+    ax.set_yscale("log")
+    ax.set_xlabel("pixel value")
+    ax.set_ylabel("count (log)")
+    ax.set_title("Noise Clipping Multiplier sets the binarization floor")
+    ax.legend(frameon=False, fontsize=9)
+    return save_plot(fig, "noise-clipping", out_dir)
+
+
+def fig_pixel_sample_size(out_dir):
+    shape = (15, 15)
+    c = 7
+    star = gaussian_psf(shape, c + 0.3, c - 0.2, 1.2)
+    fig, ax = plt.subplots(figsize=(4.8, 4.6))
+    ax.imshow(_stretch(star), cmap=STAR_CMAP, interpolation="nearest", extent=[0, 15, 15, 0])
+    for g in np.arange(0, 15.1, 0.5):
+        ax.axhline(g, color=ACCENT, lw=0.4, alpha=0.5)
+        ax.axvline(g, color=ACCENT, lw=0.4, alpha=0.5)
+    ax.set_title("Sub-pixel sampling (0.5 px grid)\nfor undersampled stars")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.grid(False)
+    return _finalize(fig, "pixel-sample-size", out_dir)
+
+
+# -------- optimization plots --------
+
+def _hyperbola(x, xmin, a, b, c):
+    return c + a * np.sqrt(1.0 + ((x - xmin) / b) ** 2)
+
+
+def fig_af_vcurve(out_dir):
+    rng = np.random.default_rng(42)
+    xmin, a, b, c = 5000.0, 3.5, 280.0, 1.4
+    pos = np.linspace(4200, 5800, 9)
+    true = _hyperbola(pos, xmin, a, b, c)
+    meas = true + rng.normal(0, 0.12, pos.size)
+    xfit = np.linspace(4100, 5900, 400)
+    fig, ax = plt.subplots(figsize=(7.2, 4.4))
+    ax.plot(xfit, _hyperbola(xfit, xmin, a, b, c), color=ACCENT, label="hyperbolic fit")
+    ax.errorbar(pos, meas, yerr=0.15, fmt="o", color=GOOD, ms=5, capsize=2, label="measured HFR")
+    ax.axvline(xmin, color=ACCENT2, lw=1.2, ls="--")
+    ax.axvspan(xmin - 90, xmin + 90, color=ACCENT2, alpha=0.12)
+    y_min = c + a  # actual HFR at the fitted minimum
+    ax.annotate(
+        r"$\sigma_{\mathrm{focus}}$: standard error" + "\nof the fitted minimum",
+        xy=(xmin, y_min), xytext=(xmin + 170, y_min + 2.6), fontsize=9,
+        arrowprops=dict(arrowstyle="->", color=ACCENT2),
+    )
+    ax.set_xlabel("focuser position (steps)")
+    ax.set_ylabel("HFR (px)")
+    ax.set_title("Autofocus V-curve → best focus + σ_focus")
+    ax.legend(frameon=False, fontsize=9)
+    return save_plot(fig, "af-vcurve", out_dir)
+
+
+# -------- hyperbolic fit-model figures (see overview/hyperbola-fitting.md) --------
+# Model forms mirror the plugin's fitters (StarDetection/*HyperbolicFittingAlglib.cs); u = x - x0.
+
+def _hyp_sym(x, x0, y0, a, b):
+    u = x - x0
+    return y0 + (a / b) * np.sqrt(u * u + b * b)
+
+
+def _hyp_tilted(x, x0, y0, a, b, sigma):
+    u = x - x0
+    return y0 + (a / b) * (np.sqrt(u * u + b * b) + sigma * u)
+
+
+def _tilted_min_x(x0, b, sigma):
+    return x0 - sigma * b / np.sqrt(max(1.0 - sigma * sigma, 1e-12))
+
+
+def _hyp_smooth(x, x0, y0, a, b, c, w):
+    u = x - x0
+    t = 1.0 / (1.0 + np.exp(np.clip(u / w, -40, 40)))
+    return y0 + t * (a / b) * np.sqrt(u * u + b * b) + (1.0 - t) * (a / c) * np.sqrt(u * u + c * c)
+
+
+def _hyp_uneven(x, x0, y0, a, b, c, step):
+    u = x - x0
+    t = np.clip((x0 - x) / step, 0.0, 1.0)
+    return t * (a / b) * np.sqrt(u * u + b * b) + (1.0 - t) * (a / c) * np.sqrt(u * u + c * c) + y0
+
+
+def _lm_fit(model, p0, x, y, lower, upper, iters=400):
+    """Tiny bounded Levenberg-Marquardt (numerical Jacobian) for honest, deterministic figure fits."""
+    lower = np.array(lower, float)
+    upper = np.array(upper, float)
+    p = np.clip(np.array(p0, float), lower, upper)
+    lam = 1e-2
+    r = model(x, *p) - y
+    cost = float(r @ r)
+    for _ in range(iters):
+        f0 = model(x, *p)
+        J = np.empty((x.size, p.size))
+        for j in range(p.size):
+            dpj = max(1e-6, abs(p[j]) * 1e-6)
+            pj = p.copy()
+            pj[j] += dpj
+            J[:, j] = (model(x, *pj) - f0) / dpj
+        JtJ = J.T @ J
+        g = J.T @ r
+        try:
+            step = np.linalg.solve(JtJ + lam * np.diag(np.diag(JtJ) + 1e-9), -g)
+        except np.linalg.LinAlgError:
+            lam = min(lam * 4, 1e8)
+            continue
+        pn = np.clip(p + step, lower, upper)
+        rn = model(x, *pn) - y
+        cn = float(rn @ rn)
+        if cn < cost:
+            p, r, cost = pn, rn, cn
+            lam = max(lam * 0.5, 1e-9)
+        else:
+            lam = min(lam * 2.5, 1e8)
+    return p
+
+
+def fig_hyperbola_anatomy(out_dir):
+    x0, y0, a, b = 5000.0, 1.4, 2.6, 320.0
+    x = np.linspace(4200, 5800, 500)
+    y = _hyp_sym(x, x0, y0, a, b)
+    fig, ax = plt.subplots(figsize=(7.0, 4.4))
+    ax.plot(x, y, color=ACCENT, lw=2, label="symmetric hyperbola")
+    ax.plot(x, y0 + (a / b) * np.abs(x - x0), color="0.6", lw=1, ls="--",
+            label=r"asymptotes, slope $=a/b$")
+    ax.axvline(x0, color=ACCENT2, lw=1.1, ls=":")
+    ax.plot([x0], [y0 + a], "o", color=ACCENT2, ms=7)
+    ax.annotate("best focus $x_0$\nmin HFR $= a + y_0$", xy=(x0, y0 + a),
+                xytext=(x0 + 130, y0 + a + 2.6), fontsize=9,
+                arrowprops=dict(arrowstyle="->", color=ACCENT2))
+    ax.set_ylim(0, None)
+    ax.set_xlabel("focuser position (steps)")
+    ax.set_ylabel("HFR (px)")
+    ax.set_title(r"Symmetric hyperbola: $y=\frac{a}{b}\sqrt{u^2+b^2}+y_0,\ u=x-x_0$")
+    ax.legend(frameon=False, fontsize=9, loc="upper center")
+    return save_plot(fig, "hyperbola-anatomy", out_dir)
+
+
+def fig_hyperbola_asymmetric_bias(out_dir):
+    rng = np.random.default_rng(202)
+    x0, y0, a, b, sigma = 5000.0, 1.4, 2.6, 300.0, 0.5
+    pos = np.linspace(4250, 5750, 11)
+    meas = _hyp_tilted(pos, x0, y0, a, b, sigma) + rng.normal(0, 0.07, pos.size)
+    x = np.linspace(4150, 5850, 500)
+    p_t = _lm_fit(_hyp_tilted, [5000, 1.0, 2.0, 300, 0.0], pos, meas,
+                  [4200, -5, 0.05, 30, -0.9], [5800, 8, 8, 1200, 0.9])
+    p_s = _lm_fit(_hyp_sym, [5000, 1.0, 2.0, 300], pos, meas,
+                  [4200, -5, 0.05, 30], [5800, 8, 8, 1200])
+    xmin_t, xmin_s = _tilted_min_x(p_t[0], p_t[3], p_t[4]), p_s[0]
+    fig, ax = plt.subplots(figsize=(7.2, 4.4))
+    ax.errorbar(pos, meas, yerr=0.12, fmt="o", color=GOOD, ms=5, capsize=2, label="measured HFR")
+    ax.plot(x, _hyp_tilted(x, *p_t), color=ACCENT, lw=2, label="tilted fit")
+    ax.plot(x, _hyp_sym(x, *p_s), color=ACCENT2, lw=2, ls="--", label="symmetric fit")
+    ax.axvline(xmin_t, color=ACCENT, lw=1, ls=":")
+    ax.axvline(xmin_s, color=ACCENT2, lw=1, ls=":")
+    ylo = ax.get_ylim()[0]
+    ax.annotate("", xy=(xmin_t, ylo + 0.35), xytext=(xmin_s, ylo + 0.35),
+                arrowprops=dict(arrowstyle="<->", color="0.3"))
+    ax.text((xmin_t + xmin_s) / 2, ylo + 0.6, f"focus error ≈ {abs(xmin_s - xmin_t):.0f} steps",
+            ha="center", fontsize=9, color="0.2")
+    ax.set_xlabel("focuser position (steps)")
+    ax.set_ylabel("HFR (px)")
+    ax.set_title("A symmetric fit biases best focus on an asymmetric curve")
+    ax.legend(frameon=False, fontsize=9)
+    return save_plot(fig, "hyperbola-asymmetric-bias", out_dir)
+
+
+def fig_hyperbola_variants(out_dir):
+    rng = np.random.default_rng(303)
+    # Strongly asymmetric truth (steep left wing, shallow right) so the variants separate near focus.
+    x0, y0, a, b, c = 5000.0, 1.2, 2.6, 185.0, 520.0
+    pos = np.linspace(4250, 5750, 13)
+    meas = _hyp_smooth(pos, x0, y0, a, b, c, 0.25 * 150.0) + rng.normal(0, 0.05, pos.size)
+    x = np.linspace(4150, 5850, 700)
+    w = 0.25 * float(np.median(np.diff(np.sort(pos))))
+    step = (pos.max() - pos.min()) / 12.0
+    p_t = _lm_fit(_hyp_tilted, [5000, 1, 2, 300, 0], pos, meas,
+                  [4200, -5, 0.05, 30, -0.9], [5800, 8, 8, 1200, 0.9])
+    p_sm = _lm_fit(lambda xx, x0, y0, a, b, c: _hyp_smooth(xx, x0, y0, a, b, c, w),
+                   [5000, 1, 2, 200, 500], pos, meas, [4200, -5, 0.05, 30, 30], [5800, 8, 8, 1500, 1500])
+    p_un = _lm_fit(lambda xx, x0, y0, a, b, c: _hyp_uneven(xx, x0, y0, a, b, c, step),
+                   [5000, 1, 2, 200, 500], pos, meas, [4200, -5, 0.05, 30, 30], [5800, 8, 8, 1500, 1500])
+    smooth = lambda xx: _hyp_smooth(xx, p_sm[0], p_sm[1], p_sm[2], p_sm[3], p_sm[4], w)
+    uneven = lambda xx: _hyp_uneven(xx, p_un[0], p_un[1], p_un[2], p_un[3], p_un[4], step)
+    fig, ax = plt.subplots(figsize=(7.2, 4.6))
+    ax.plot(pos, meas, "o", color=GOOD, ms=4, alpha=0.7, label="measured HFR")
+    ax.plot(x, _hyp_tilted(x, *p_t), color=ACCENT, lw=1.8, label="Tilted")
+    ax.plot(x, smooth(x), color=GOOD, lw=1.8, label="Smooth Blend")
+    ax.plot(x, uneven(x), color=ACCENT2, lw=1.8, label="Uneven Blend (legacy)")
+    ax.set_xlabel("focuser position (steps)")
+    ax.set_ylabel("HFR (px)")
+    ax.set_title("Three asymmetric variants fit the same curve")
+    ax.legend(frameon=False, fontsize=9, loc="upper left")
+    # Inset zoom on the vertex: the Uneven blend kinks where the smooth models stay round.
+    xv = np.linspace(p_un[0] - 300, p_un[0] + 300, 400)
+    axin = ax.inset_axes([0.60, 0.42, 0.37, 0.42])
+    axin.plot(xv, _hyp_tilted(xv, *p_t), color=ACCENT, lw=1.6)
+    axin.plot(xv, smooth(xv), color=GOOD, lw=1.6)
+    axin.plot(xv, uneven(xv), color=ACCENT2, lw=1.6)
+    axin.set_title("vertex (zoom)", fontsize=8)
+    axin.tick_params(labelsize=7)
+    yv = uneven(np.array([p_un[0]]))[0]
+    axin.annotate("C⁰ kink", xy=(p_un[0], yv), xytext=(p_un[0] + 55, yv + 0.42),
+                  fontsize=8, color=ACCENT2, arrowprops=dict(arrowstyle="->", color=ACCENT2))
+    ax.indicate_inset_zoom(axin, edgecolor="0.5")
+    return save_plot(fig, "hyperbola-variants", out_dir)
+
+
+def fig_hyperbola_parsimony(out_dir):
+    rng = np.random.default_rng(404)
+    x0, y0, a, b = 5000.0, 1.4, 2.6, 320.0
+    pos = np.linspace(4300, 5700, 9)
+    meas = _hyp_sym(pos, x0, y0, a, b) + rng.normal(0, 0.05, pos.size)
+    x = np.linspace(4200, 5800, 500)
+    p_s = _lm_fit(_hyp_sym, [5000, 1, 2, 300], pos, meas, [4200, -5, 0.05, 30], [5800, 8, 8, 1200])
+    p_t = _lm_fit(_hyp_tilted, [5000, 1, 2, 300, 0], pos, meas,
+                  [4200, -5, 0.05, 30, -0.9], [5800, 8, 8, 1200, 0.9])
+    xmin_s, xmin_t = p_s[0], _tilted_min_x(p_t[0], p_t[3], p_t[4])
+    fig, ax = plt.subplots(figsize=(7.2, 4.5))
+    ax.errorbar(pos, meas, yerr=0.08, fmt="o", color=GOOD, ms=5, capsize=2, label="measured HFR")
+    ax.plot(x, _hyp_sym(x, *p_s), color=ACCENT, lw=2, label="symmetric fit (kept)")
+    ax.plot(x, _hyp_tilted(x, *p_t), color=ACCENT2, lw=1.4, ls="--", label="asymmetric fit (rejected)")
+    ax.axvline(xmin_s, color=ACCENT, lw=1, ls=":")
+    ax.axvline(xmin_t, color=ACCENT2, lw=1, ls=":")
+    ax.text(0.025, 0.96,
+            "Asymmetric Δχ² not significant\n(F < F_crit at 95%) → keep Symmetric\n(smaller σ_focus)",
+            transform=ax.transAxes, va="top", ha="left", fontsize=8.5,
+            bbox=dict(boxstyle="round", fc="white", ec="0.7"))
+    ax.set_xlabel("focuser position (steps)")
+    ax.set_ylabel("HFR (px)")
+    ax.set_title("When symmetric wins: the parsimony gate rejects the over-fit")
+    ax.legend(frameon=False, fontsize=9, loc="upper right")
+    return save_plot(fig, "hyperbola-parsimony", out_dir)
+
+
+def fig_objective_sfocus(out_dir):
+    rho = np.linspace(0, 1.2, 400)
+    for_ref = 0.25
+    s = 1.0 / (1.0 + (rho / for_ref) ** 2)
+    fig, ax = plt.subplots(figsize=(6.4, 4.0))
+    ax.plot(rho, s, color=ACCENT, lw=2)
+    ax.axvline(for_ref, color=WARN, ls="--", lw=1, label=r"$\rho_{\mathrm{ref}}=0.25$")
+    ax.set_xlabel(r"$\rho = \sigma_{\mathrm{focus}} / \mathrm{stepSize}$")
+    ax.set_ylabel(r"$S_{\mathrm{focus}}$")
+    ax.set_title(r"$S_{\mathrm{focus}} = 1 / (1 + (\rho/\rho_{\mathrm{ref}})^2)$")
+    ax.legend(frameon=False, fontsize=9)
+    return save_plot(fig, "objective-sfocus", out_dir)
+
+
+def fig_objective_sstars(out_dir):
+    n = np.linspace(0, 30, 400)
+    n_floor, n_target = 8, 20
+    s_min = np.clip(n / n_floor, 0, 1)
+    s_med = np.clip(n / n_target, 0, 1)
+    fig, ax = plt.subplots(figsize=(6.6, 4.0))
+    ax.plot(n, s_min, color=ACCENT, label=r"$\mathrm{clip}(n_{\min}/N_{\mathrm{floor}})$  (w=0.6)")
+    ax.plot(n, s_med, color=GOOD, label=r"$\mathrm{clip}(n_{\mathrm{med}}/N_{\mathrm{target}})$  (w=0.4)")
+    ax.axvline(n_floor, color=WARN, ls="--", lw=1)
+    ax.axvline(n_target, color=WARN, ls=":", lw=1)
+    ax.set_xlabel("stars per frame")
+    ax.set_ylabel("component score")
+    ax.set_title(r"$S_{\mathrm{stars}} = 0.6\,c(n_{\min}/8) + 0.4\,c(n_{\mathrm{med}}/20)$")
+    ax.legend(frameon=False, fontsize=8.5, loc="lower right")
+    return save_plot(fig, "objective-sstars", out_dir)
+
+
+def fig_objective_sfit(out_dir):
+    chi = np.linspace(0, 6, 400)
+    tau = 2.0
+    penalty = np.where(chi <= tau, 1.0, tau / np.maximum(chi, 1e-9))
+    fig, ax = plt.subplots(figsize=(6.6, 4.0))
+    ax.plot(chi, penalty, color=ACCENT, lw=2)
+    ax.axvline(tau, color=WARN, ls="--", lw=1, label=r"$\chi^2_\nu$ knee = 2.0")
+    ax.fill_between(chi, penalty, where=chi > tau, color=ACCENT2, alpha=0.12)
+    ax.set_xlabel(r"reduced $\chi^2_\nu$ of the curve fit")
+    ax.set_ylabel("penalty factor")
+    ax.set_title(r"$S_{\mathrm{fit}} = \mathrm{clip}(R^2)\cdot\mathrm{penalty}(\chi^2_\nu)$  (only high side penalized)")
+    ax.legend(frameon=False, fontsize=9)
+    return save_plot(fig, "objective-sfit", out_dir)
+
+
+def fig_objective_precision_penalty(out_dir):
+    frac = np.linspace(0, 1, 400)
+    thr, strength, minf = 0.20, 0.5, 0.5
+    pen = np.clip(1.0 - strength * np.maximum(0, frac - thr), minf, 1.0)
+    fig, ax = plt.subplots(figsize=(6.6, 4.0))
+    ax.plot(frac, pen, color=ACCENT, lw=2)
+    ax.axvline(thr, color=WARN, ls="--", lw=1, label="threshold = 0.20")
+    ax.axhline(minf, color=ACCENT2, ls=":", lw=1, label="floor = 0.50")
+    ax.set_xlabel("near-focus relaxation-admitted fraction")
+    ax.set_ylabel("multiplicative penalty")
+    ax.set_title("Defocus-precision penalty (label-free junk guard)")
+    ax.legend(frameon=False, fontsize=9, loc="lower left")
+    return save_plot(fig, "objective-precision-penalty", out_dir)
+
+
+def fig_multirun_blend(out_dir):
+    beta = np.linspace(0, 1, 200)
+    mean_j, min_j = 0.8, 0.5
+    blend = (1 - beta) * mean_j + beta * min_j
+    fig, ax = plt.subplots(figsize=(6.4, 4.0))
+    ax.plot(beta, blend, color=ACCENT, lw=2)
+    ax.axhline(mean_j, color=GOOD, ls="--", lw=1, label="mean J = 0.8")
+    ax.axhline(min_j, color=ACCENT2, ls="--", lw=1, label="min J = 0.5")
+    ax.axvline(0.5, color=WARN, ls=":", lw=1, label="β = 0.5 (default)")
+    ax.set_xlabel(r"$\beta$ (worst-case weight)")
+    ax.set_ylabel(r"$J_{\mathrm{total}}$")
+    ax.set_title(r"$J_{\mathrm{total}} = (1-\beta)\,\overline{J} + \beta \min J$")
+    ax.legend(frameon=False, fontsize=8.5)
+    return save_plot(fig, "multirun-blend", out_dir)
+
+
+def fig_compass_search(out_dir):
+    # synthetic objective surface over two axes (Sensitivity, StarClippingMultiplier)
+    s = np.linspace(0, 6, 200)
+    cmul = np.linspace(0.5, 4, 200)
+    S, C = np.meshgrid(s, cmul)
+    J = np.exp(-((S - 2.2) ** 2) / 4.0 - ((C - 1.8) ** 2) / 1.2)
+    fig, ax = plt.subplots(figsize=(6.8, 4.6))
+    cs = ax.contourf(S, C, J, levels=18, cmap="magma")
+    fig.colorbar(cs, ax=ax, label="objective J")
+    # phase A coarse grid
+    gx, gy = np.meshgrid(np.linspace(0.7, 5.3, 4), np.linspace(0.8, 3.6, 4))
+    ax.scatter(gx, gy, s=14, color="white", alpha=0.5, marker="s", label="Phase A grid")
+    # phase B compass trajectory
+    path = [(4.5, 3.2), (3.6, 3.2), (3.6, 2.4), (2.8, 2.4), (2.8, 1.9), (2.3, 1.9), (2.2, 1.8)]
+    px, py = zip(*path)
+    ax.plot(px, py, "-o", color="cyan", ms=4, lw=1.5, label="Phase B compass")
+    ax.scatter([2.2], [1.8], s=120, marker="*", color="white", edgecolor="k", zorder=5, label="optimum")
+    ax.set_xlabel("Sensitivity")
+    ax.set_ylabel("StarClippingMultiplier")
+    ax.set_title("Staged compass / pattern search")
+    ax.legend(frameon=False, fontsize=8, loc="upper right", labelcolor="white")
+    ax.grid(False)
+    return save_plot(fig, "compass-search", out_dir)
+
+
+def fig_step_size(out_dir):
+    # _hyperbola(x) = c + a*sqrt(1 + ((x-xmin)/b)^2), so its minimum (best-focus HFR) is c + a.
+    # Use a minimum HFR of 3, and a curve width (b) that puts the 3x-min crossing comfortably in view.
+    xmin, a, c, b = 5000.0, 1.5, 1.5, 110.0
+    min_hfr = c + a  # 3.0
+    x = np.linspace(4200, 5800, 400)
+    y = _hyperbola(x, xmin, a, b, c)
+    target = 3.0 * min_hfr  # 3 × min HFR == 9
+    fig, ax = plt.subplots(figsize=(7.2, 4.2))
+    ax.plot(x, y, color=ACCENT, lw=2)
+    ax.axhline(min_hfr, color="0.5", ls=":", lw=1, label="min HFR")
+    ax.axhline(target, color=WARN, ls="--", lw=1, label="3 × min HFR")
+    # find half-width where HFR == 3*min
+    right_mask = x > xmin
+    right = x[right_mask][np.argmin(np.abs(y[right_mask] - target))]
+    hw = right - xmin
+    step = hw / 3.5
+    for k in range(-3, 4):
+        ax.axvline(xmin + k * step, color=GOOD, lw=0.8, alpha=0.6)
+    ax.axvspan(xmin - hw, xmin + hw, color=ACCENT2, alpha=0.08)
+    ax.set_xlabel("focuser position (steps)")
+    ax.set_ylabel("HFR (px)")
+    ax.set_title("Step size ≈ half-width / 3.5 → ~3–4 points per side")
+    ax.legend(frameon=False, fontsize=9)
+    return save_plot(fig, "step-size", out_dir)
+
+
+# -------- feature figures --------
+
+def fig_tilt_heatmap(out_dir):
+    # best-focus offset across the frame: a tilt plane + curvature
+    gx, gy = np.meshgrid(np.linspace(-1, 1, 60), np.linspace(-1, 1, 60))
+    tilt = 40 * gx + 18 * gy           # planar tilt
+    curv = 25 * (gx ** 2 + gy ** 2)    # field curvature
+    z = tilt + curv
+    fig, ax = plt.subplots(figsize=(5.6, 4.6))
+    im = ax.imshow(z, cmap="coolwarm", extent=[-1, 1, -1, 1], origin="lower")
+    fig.colorbar(im, ax=ax, label="best-focus offset (µm)")
+    ax.set_title("Sensor tilt + curvature map")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.grid(False)
+    return _finalize(fig, "tilt-heatmap", out_dir)
+
+
+def fig_aberration_corners(out_dir):
+    shape = (31, 31)
+    c = 15
+    center = elliptical_gaussian(shape, c, c, 2.2, 2.2)
+    tl = elliptical_gaussian(shape, c, c, 4.2, 2.0, theta=np.deg2rad(45))
+    tr = elliptical_gaussian(shape, c, c, 4.2, 2.0, theta=np.deg2rad(135))
+    bl = elliptical_gaussian(shape, c, c, 3.8, 2.2, theta=np.deg2rad(20))
+    br = moffat_psf(shape, c, c, 5.0, 2.0)
+    canvas = np.zeros((shape[0] * 3, shape[1] * 3))
+    placements = {
+        (0, 0): tl, (0, 2): tr, (2, 0): bl, (2, 2): br, (1, 1): center,
+    }
+    for (ry, rx), arr in placements.items():
+        canvas[ry * shape[0] : (ry + 1) * shape[0], rx * shape[1] : (rx + 1) * shape[1]] = arr
+    fig, ax = plt.subplots(figsize=(5.0, 5.0))
+    ax.imshow(_stretch(canvas), cmap=STAR_CMAP, interpolation="nearest")
+    ax.set_title("Corner PSFs: aberrations grow off-axis")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.grid(False)
+    return _finalize(fig, "aberration-corners", out_dir)
+
+
+def fig_annotation_overlay(out_dir):
+    rng = np.random.default_rng(99)
+    shape = (110, 150)
+    img, cats = star_field(shape, 24, rng, max_amp=1.0, sigma_range=(1.5, 2.6))
+    img = add_noise(img, sky=0.05, read_noise=0.012, rng=rng)
+    fig, ax = plt.subplots(figsize=(7.4, 5.4))
+    ax.imshow(_stretch(img), cmap=STAR_CMAP, interpolation="nearest")
+    for i, (x0, y0, amp, sigma) in enumerate(cats):
+        accepted = amp > 0.25 and sigma < 2.4
+        col = GOOD if accepted else ACCENT2
+        ax.add_patch(plt.Circle((x0, y0), sigma * 3.5, fill=False, color=col, lw=1.2))
+        if accepted and i % 2 == 0:
+            ax.text(x0 + 4, y0 - 4, f"{sigma*2.3:.1f}", color=GOOD, fontsize=6)
+    ax.set_title("Star annotation overlay (green = accepted, pink = rejected; labels = HFR)")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.grid(False)
+    return _finalize(fig, "annotation-overlay", out_dir)
+
+
+def fig_sensor_surface_decomposition(out_dir):
+    # Best-focus offset across the sensor, split into the linear tilt plane, the rotationally
+    # symmetric field curvature, and their sum (the tilted paraboloid the sensor model fits).
+    g = np.linspace(-1, 1, 80)
+    gx, gy = np.meshgrid(g, g)
+    tilt = 38 * gx + 14 * gy           # linear tilt plane (microns)
+    curv = 22 * (gx ** 2 + gy ** 2)    # field curvature bowl (microns)
+    surface = tilt + curv              # the paraboloid surface
+    panels = [
+        (r"Tilt plane  $G_x x + G_y y$", tilt),
+        (r"Field curvature  $K r^2$", curv),
+        ("Sensor surface (sum)", surface),
+    ]
+    vmax = max(np.abs(tilt).max(), np.abs(curv).max(), np.abs(surface).max())
+    fig, axes = plt.subplots(1, 3, figsize=(9.6, 3.6))
+    im = None
+    for ax, (title, z) in zip(axes, panels):
+        im = ax.imshow(z, cmap="coolwarm", extent=[-1, 1, -1, 1], origin="lower", vmin=-vmax, vmax=vmax)
+        ax.set_title(title, fontsize=10)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.grid(False)
+    fig.colorbar(im, ax=axes, label="best-focus offset (µm)", fraction=0.026, pad=0.02)
+    return _finalize(fig, "sensor-surface-decomposition", out_dir)
+
+
+def fig_sensor_outlier_rejection(out_dir):
+    # The surface fit's MAD-based residual clip: per-star best-focus points scatter around the
+    # fitted surface; points outside the ±2.5·MAD band are dropped, then the surface is refit.
+    rng = np.random.default_rng(7)
+    x = np.linspace(-12, 12, 240)
+
+    def model(xx):
+        return 1.6 * xx + 0.10 * xx ** 2   # tilt + curvature cross-section (microns)
+
+    fit = model(x)
+    n = 90
+    xs = rng.uniform(-12, 12, n)
+    ys = model(xs) + rng.normal(0.0, 1.2, n)
+    # A handful of failed / contaminated star fits land far from the surface.
+    xo = rng.uniform(-11, 11, 7)
+    yo = model(xo) + rng.choice([-1.0, 1.0], 7) * rng.uniform(7.0, 12.0, 7)
+    xs = np.concatenate([xs, xo])
+    ys = np.concatenate([ys, yo])
+
+    resid = ys - model(xs)
+    mad = 1.483 * np.median(np.abs(resid - np.median(resid)))   # scaled MAD, as in the solver
+    band = 2.5 * mad
+    rejected = np.abs(resid) > band
+
+    fig, ax = plt.subplots(figsize=(7.0, 4.4))
+    ax.fill_between(x, fit - band, fit + band, color=ACCENT, alpha=0.12, label=r"$\pm 2.5\,\mathrm{MAD}$ band")
+    ax.plot(x, fit, color=ACCENT, lw=2, label="fitted surface (cross-section)")
+    ax.scatter(xs[~rejected], ys[~rejected], s=14, color=GOOD, label="kept", zorder=3)
+    ax.scatter(xs[rejected], ys[rejected], s=34, color=ACCENT2, marker="x", lw=1.6, label="dropped outlier", zorder=4)
+    ax.set_xlabel("sensor position (mm)")
+    ax.set_ylabel("best-focus offset (µm)")
+    ax.set_title(r"MAD residual clip: points beyond $\pm 2.5\,\mathrm{MAD}$ are dropped, then refit")
+    ax.legend(frameon=False, fontsize=8.5, loc="upper left")
+    return save_plot(fig, "sensor-outlier-rejection", out_dir)
+
+
+# -------- star-detection decisions / golden-set figures --------
+# Real measured numbers below are transcribed from the design/results docs and cited per figure:
+#   docs/star-detection-golden-audit-cwhite-results.md  (cwhite NC sweep, FN attribution, donut table)
+#   docs/af-bank-noiseclip-sweep-results.md             (bank-median NC sweep + adaptive OFF/ON A/B)
+#   docs/defocus-aware-donut-detection-design.md        (donut validation)
+
+def _flow_box(ax, x, y, w, h, title, detail, color):
+    from matplotlib.patches import FancyBboxPatch
+
+    ax.add_patch(
+        FancyBboxPatch(
+            (x - w / 2, y - h / 2), w, h,
+            boxstyle="round,pad=0.02,rounding_size=0.10",
+            linewidth=1.4, edgecolor=color, facecolor=color + "22",
+        )
+    )
+    ax.text(x, y + h * 0.26, title, ha="center", va="center", fontsize=8.6, fontweight="bold", color="0.1")
+    ax.text(x, y - h * 0.18, detail, ha="center", va="center", fontsize=7.0, color="0.3")
+
+
+def fig_golden_pipeline(out_dir):
+    # Methodology flow (.claude/docs/golden-star-set.md): independent SNR reference + LLM montage QA.
+    stages = [
+        (ACCENT, "Linear FITS", "mono / debayered\nframe"),
+        (ACCENT, "SNR reference\ndetector", "local bg + per-pixel SNR\n+ connected components\n(no HocusFocus gates)"),
+        (GOOD, "LLM montage QA", "classify each crop:\nreal centered star?"),
+        (ACCENT, "golden.json", "QA-confirmed stars\n+ SNR confidence tiers"),
+        (WARN, "golden eval", "recall · precision\n· FN attribution"),
+    ]
+    fig, ax = plt.subplots(figsize=(13.4, 2.5))
+    ax.set_xlim(0, 16)
+    ax.set_ylim(0, 2)
+    yc, bw, bh, spacing = 1.05, 2.7, 1.25, 3.1
+    xs = [1.55 + i * spacing for i in range(len(stages))]
+    for x, (color, title, detail) in zip(xs, stages):
+        _flow_box(ax, x, yc, bw, bh, title, detail, color)
+    for x0, x1 in zip(xs[:-1], xs[1:]):
+        ax.annotate("", xy=(x1 - bw / 2 - 0.05, yc), xytext=(x0 + bw / 2 + 0.05, yc),
+                    arrowprops=dict(arrowstyle="-|>", color="0.4", lw=1.6))
+    ax.text(8.0, 0.12, "Independent of HocusFocus, so reference stars it finds that HF rejects are exactly HF's recall gaps.",
+            ha="center", va="center", fontsize=7.6, color="0.4", style="italic")
+    ax.axis("off")
+    return _finalize(fig, "golden-pipeline", out_dir)
+
+
+def fig_candidate_ceiling(out_dir):
+    # cwhite false-negative attribution, default vs optimized (--inspection), all 9 frames.
+    # docs/star-detection-golden-audit-cwhite-results.md "The decisive finding" table.
+    buckets = ["NO CANDIDATE", "TooSmall", "TooDistorted", "NotCentered", "Contaminated"]
+    colors = [ACCENT2, "#7E57C2", "#5C6BC0", "#26A69A", "#FFB300"]
+    default = [6191, 563, 258, 263, 22]
+    optimized = [6191, 194, 24, 570, 52]
+    rows = [("Default", default, 1.0), ("Optimized (--inspection)", optimized, 0.0)]
+    fig, ax = plt.subplots(figsize=(8.8, 3.4))
+    for label, vals, y in rows:
+        left = 0
+        for v, c in zip(vals, colors):
+            ax.barh(y, v, left=left, height=0.62, color=c, edgecolor="white", linewidth=0.6)
+            left += v
+    ax.text(6191 / 2, 1.0, "6191  (79%)\nnever forms a candidate", ha="center", va="center",
+            fontsize=8.5, color="white", fontweight="bold")
+    ax.text(6191 / 2, 0.0, "6191  (identical)", ha="center", va="center",
+            fontsize=8.5, color="white", fontweight="bold")
+    ax.set_yticks([0.0, 1.0])
+    ax.set_yticklabels(["Optimized\n(--inspection)", "Default"])
+    ax.set_xlabel("false negatives — real stars missed (of 7875)")
+    ax.set_title("Candidate formation is the recall ceiling, not the late gates")
+    handles = [plt.matplotlib.patches.Patch(color=c, label=b) for c, b in zip(colors, buckets)]
+    ax.legend(handles=handles, frameon=False, fontsize=7.4, ncol=5, loc="upper center",
+              bbox_to_anchor=(0.5, -0.24), columnspacing=1.0, handlelength=1.2)
+    ax.grid(False)
+    fig.subplots_adjust(left=0.16, right=0.97, top=0.88, bottom=0.30)
+    return _finalize(fig, "candidate-ceiling", out_dir)
+
+
+def fig_nc_recall_sweep(out_dir):
+    # cwhite candidate-formation sweep (all 9 frames vs golden).
+    # docs/star-detection-golden-audit-cwhite-results.md "Candidate-formation sweep".
+    labels = ["4.0", "2.5", "2.0", "1.5"]
+    pos = [0, 1, 2, 3]
+    recall = [0.189, 0.358, 0.459, 0.596]
+    nocand = [6191, 4712, 3556, 1757]
+    fig, ax = plt.subplots(figsize=(7.4, 4.2))
+    l1, = ax.plot(pos, recall, "-o", color=ACCENT, lw=2, ms=6, label="recall @ SNR≥12")
+    ax.set_ylabel("recall @ SNR≥12", color=ACCENT)
+    ax.tick_params(axis="y", labelcolor=ACCENT)
+    ax.set_ylim(0, 0.7)
+    ax2 = ax.twinx()
+    l2, = ax2.plot(pos, nocand, "--s", color=ACCENT2, lw=2, ms=6, label="NO-CANDIDATE misses")
+    ax2.set_ylabel("NO-CANDIDATE misses", color=ACCENT2)
+    ax2.tick_params(axis="y", labelcolor=ACCENT2)
+    ax2.set_ylim(0, 7000)
+    ax2.grid(False)
+    ax.axvline(2, color=GOOD, ls=":", lw=1.4)
+    ax.text(2, 0.66, "shipped\ndefault", color=GOOD, ha="center", va="top", fontsize=8.5)
+    ax.text(0, 0.66, "legacy", color="0.4", ha="center", va="top", fontsize=8.5)
+    ax.set_xticks(pos)
+    ax.set_xticklabels(labels)
+    ax.set_xlabel("NoiseClippingMultiplier   (stricter ←   → more permissive)")
+    ax.set_title("Lowering the binarization floor recovers real stars (cwhite run)")
+    ax.legend([l1, l2], ["recall @ SNR≥12", "NO-CANDIDATE misses"], frameon=False, fontsize=9, loc="center right")
+    return save_plot(fig, "nc-recall-sweep", out_dir)
+
+
+def fig_adaptive_binarization(out_dir):
+    # Conceptual: a flat global floor vs a spatially-varying threshold surface over a non-uniform frame.
+    # docs/adaptive-noiseclip-design.md root-cause section.
+    rng = np.random.default_rng(17)
+    x = np.arange(100)
+    bg = 0.10 + 0.0024 * x + 0.20 * np.exp(-((x - 84) ** 2) / (2 * 9.0 ** 2))   # ramp + corner glow
+    sig = 0.014 + 0.00045 * x + 0.022 * np.exp(-((x - 84) ** 2) / (2 * 10.0 ** 2))
+    k = 2.0
+    adaptive = bg + k * sig
+    global_thr = float(np.median(bg) + k * np.median(sig))
+    star_amp, junk_amp = 0.10, 0.075
+    star = star_amp * np.exp(-((x - 24) ** 2) / (2 * 1.6 ** 2))  # faint real star, clean region
+    junk = junk_amp * np.exp(-((x - 84) ** 2) / (2 * 1.4 ** 2))  # noise bump inside the glow
+    signal = bg + 0.32 * rng.normal(0, sig) + star + junk
+    star_val = float(bg[24] + star_amp)                         # adaptive < star_val < global → recovered
+    junk_val = float(bg[84] + junk_amp)                         # global < junk_val < adaptive → rejected
+
+    # left: a synthetic 2D frame with the same gradient + glow (illustrative)
+    shape = (90, 100)
+    xx, yy = _grid(shape)
+    frame, _ = star_field(shape, 26, rng, max_amp=0.6, sigma_range=(1.3, 2.1))
+    frame = frame + 0.10 + 0.0024 * xx + 0.55 * np.exp(-((xx - 84) ** 2 + (yy - 20) ** 2) / (2 * 13.0 ** 2))
+    frame = add_noise(frame, sky=0.0, read_noise=0.012, rng=rng)
+
+    fig, axes = plt.subplots(1, 2, figsize=(11.4, 4.0), gridspec_kw={"width_ratios": [1, 1.35]})
+    axes[0].imshow(_stretch(frame), cmap=STAR_CMAP, interpolation="nearest")
+    axes[0].axhline(45, color=WARN, lw=1.0, ls="--", alpha=0.8)
+    axes[0].set_title("Real frame: gradient + corner glow")
+    axes[0].set_xticks([]); axes[0].set_yticks([]); axes[0].grid(False)
+
+    ax = axes[1]
+    ax.plot(x, signal, color="0.6", lw=1.0, label="pixel value (1 row)")
+    ax.plot(x, global_thr * np.ones_like(x), color=WARN, lw=2, ls="--", label="global threshold (one scalar)")
+    ax.plot(x, adaptive, color=ACCENT, lw=2, label="adaptive threshold (local)")
+    ax.plot(24, star_val, "o", color=GOOD, ms=9, zorder=5)
+    ax.annotate("faint star:\nabove adaptive,\nbelow global → recovered", xy=(24, star_val),
+                xytext=(31, 0.40), fontsize=7.6, color=GOOD,
+                arrowprops=dict(arrowstyle="->", color=GOOD))
+    ax.plot(84, junk_val, "X", color=ACCENT2, ms=10, zorder=5)
+    ax.annotate("glow noise:\nabove global,\nbelow adaptive → rejected", xy=(84, junk_val),
+                xytext=(36, 0.66), fontsize=7.6, color=ACCENT2,
+                arrowprops=dict(arrowstyle="->", color=ACCENT2))
+    ax.set_xlabel("column (px)")
+    ax.set_ylabel("intensity")
+    ax.set_ylim(0, 0.78)
+    ax.set_title("One global floor is the wrong shape for a non-uniform frame")
+    ax.legend(frameon=False, fontsize=8, loc="upper left")
+    return save_plot(fig, "adaptive-binarization", out_dir)
+
+
+def fig_nc_adaptive_ab(out_dir):
+    # Adaptive binarization OFF -> ON at NC=2. docs/af-bank-noiseclip-sweep-results.md A/B tables.
+    fig, axes = plt.subplots(1, 2, figsize=(10.6, 4.0))
+    # Panel A: bank-median recall & precision, OFF vs ON.
+    metrics = ["recall @ SNR≥12", "precision"]
+    off = [0.870, 0.585]
+    on = [0.877, 0.618]
+    xb = np.arange(2)
+    w = 0.36
+    a = axes[0]
+    a.bar(xb - w / 2, off, w, color="0.6", label="OFF (legacy global)")
+    a.bar(xb + w / 2, on, w, color=ACCENT, label="ON (adaptive)")
+    for xi, (o, n) in enumerate(zip(off, on)):
+        a.text(xi - w / 2, o + 0.012, f"{o:.3f}", ha="center", fontsize=8)
+        a.text(xi + w / 2, n + 0.012, f"{n:.3f}", ha="center", fontsize=8, color=ACCENT)
+    a.set_xticks(xb); a.set_xticklabels(metrics)
+    a.set_ylim(0, 1.0)
+    a.set_ylabel("bank median")
+    a.set_title("Recall and precision both rise")
+    a.legend(frameon=False, fontsize=8, loc="upper right")
+    # Panel B: AF focus scatter (lower = better), bank median and the standout run.
+    runs = ["bank median", "cwhite_2026"]
+    off_s = [10.26, 10.65]
+    on_s = [8.84, 4.10]
+    xr = np.arange(2)
+    b = axes[1]
+    b.bar(xr - w / 2, off_s, w, color="0.6", label="OFF")
+    b.bar(xr + w / 2, on_s, w, color=GOOD, label="ON (adaptive)")
+    for xi, (o, n) in enumerate(zip(off_s, on_s)):
+        b.text(xi - w / 2, o + 0.18, f"{o:.2f}", ha="center", fontsize=8)
+        b.text(xi + w / 2, n + 0.18, f"{n:.2f}", ha="center", fontsize=8, color=GOOD)
+    b.set_xticks(xr); b.set_xticklabels(runs)
+    b.set_ylim(0, 12.5)
+    b.set_ylabel("AF σ_focus (steps, lower = better)")
+    b.set_title("Focus fit tightens")
+    b.legend(frameon=False, fontsize=8, loc="upper right")
+    fig.suptitle("Locally adaptive binarization, OFF → ON at NoiseClippingMultiplier = 2", fontsize=11)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    return _finalize(fig, "nc-adaptive-ab", out_dir)
+
+
+def fig_donut_recovery(out_dir):
+    # mufti frame (focuser 2325) vs SNR + matched-filter reference.
+    # docs/star-detection-golden-audit-cwhite-results.md "Donut / defocus validation".
+    settings = ["default", "NC=2\nonly", "defocus-aware\nonly", "NC=2 +\ndefocus-aware"]
+    accepted = [7, 21, 84, 161]
+    toodistorted = [191, 436, 214, 203]
+    x = np.arange(len(settings))
+    w = 0.38
+    fig, ax = plt.subplots(figsize=(8.2, 4.3))
+    ax.bar(x - w / 2, accepted, w, color=GOOD, label="accepted (real donuts recovered)")
+    ax.bar(x + w / 2, toodistorted, w, color=ACCENT2, label="rejected: TooDistorted")
+    for xi, v in enumerate(accepted):
+        ax.text(xi - w / 2, v + 6, str(v), ha="center", fontsize=8.5, color=GOOD, fontweight="bold")
+    for xi, v in enumerate(toodistorted):
+        ax.text(xi + w / 2, v + 6, str(v), ha="center", fontsize=8, color=ACCENT2)
+    ax.set_xticks(x); ax.set_xticklabels(settings)
+    ax.set_ylabel("candidates")
+    ax.set_ylim(0, 470)
+    ax.set_title("Donut recovery needs both levers (mufti, focuser 2325)")
+    ax.annotate("NC alone forms candidates,\nbut they pile into TooDistorted", xy=(1 + w / 2, 436),
+                xytext=(2.05, 415), fontsize=7.6, color=ACCENT2, ha="left",
+                arrowprops=dict(arrowstyle="->", color=ACCENT2))
+    ax.legend(frameon=False, fontsize=8.5, loc="upper left")
+    return save_plot(fig, "donut-recovery", out_dir)
+
+
+# --------------------------------------------------------------------------------------------------
+# Registry + CLI
+# --------------------------------------------------------------------------------------------------
+
+FIGURES = {
+    "psf-models": fig_psf_models,
+    "defocused-donut": fig_defocused_donut,
+    "hot-pixel": fig_hot_pixel,
+    "saturated-star": fig_saturated_star,
+    "eccentric-star": fig_eccentric_star,
+    "contamination-annulus": fig_contamination_annulus,
+    "noise-reduction": fig_noise_reduction,
+    "structure-map": fig_structure_map,
+    "hfr-half-flux": fig_hfr_half_flux,
+    "gate-distortion": fig_gate_distortion,
+    "gate-centering": fig_gate_centering,
+    "gate-min-size": fig_gate_min_size,
+    "gate-sensitivity": fig_gate_sensitivity,
+    "gate-flatness": fig_gate_flatness,
+    "noise-clipping": fig_noise_clipping,
+    "pixel-sample-size": fig_pixel_sample_size,
+    "af-vcurve": fig_af_vcurve,
+    "objective-sfocus": fig_objective_sfocus,
+    "objective-sstars": fig_objective_sstars,
+    "objective-sfit": fig_objective_sfit,
+    "objective-precision-penalty": fig_objective_precision_penalty,
+    "multirun-blend": fig_multirun_blend,
+    "compass-search": fig_compass_search,
+    "step-size": fig_step_size,
+    "tilt-heatmap": fig_tilt_heatmap,
+    "aberration-corners": fig_aberration_corners,
+    "sensor-surface-decomposition": fig_sensor_surface_decomposition,
+    "sensor-outlier-rejection": fig_sensor_outlier_rejection,
+    "annotation-overlay": fig_annotation_overlay,
+    "hyperbola-anatomy": fig_hyperbola_anatomy,
+    "hyperbola-asymmetric-bias": fig_hyperbola_asymmetric_bias,
+    "hyperbola-variants": fig_hyperbola_variants,
+    "hyperbola-parsimony": fig_hyperbola_parsimony,
+    "golden-pipeline": fig_golden_pipeline,
+    "candidate-ceiling": fig_candidate_ceiling,
+    "nc-recall-sweep": fig_nc_recall_sweep,
+    "adaptive-binarization": fig_adaptive_binarization,
+    "nc-adaptive-ab": fig_nc_adaptive_ab,
+    "donut-recovery": fig_donut_recovery,
+}
+
+
+def _structural_diff(path_a, path_b):
+    """Tolerant comparison: downscale to 32x32 grayscale and return mean abs difference in [0,1]."""
+    from PIL import Image
+
+    def load(p):
+        return np.asarray(Image.open(p).convert("L").resize((32, 32))) / 255.0
+
+    return float(np.mean(np.abs(load(path_a) - load(path_b))))
+
+
+def run_check(committed_dir):
+    tol = 0.05
+    missing, drifted = [], []
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        for name, builder in FIGURES.items():
+            fresh = builder(tmp_dir)
+            committed = committed_dir / f"{name}.png"
+            if not committed.exists():
+                missing.append(name)
+                continue
+            d = _structural_diff(fresh, committed)
+            if d > tol:
+                drifted.append((name, d))
+    ok = not missing and not drifted
+    if missing:
+        print(f"MISSING committed figures: {', '.join(missing)}")
+    if drifted:
+        print("DRIFTED figures (structural diff > %.3f):" % tol)
+        for name, d in drifted:
+            print(f"  {name}: {d:.4f}")
+    if ok:
+        print(f"OK: all {len(FIGURES)} figures match committed PNGs.")
+    return 0 if ok else 1
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Generate Hocus Focus documentation figures.")
+    ap.add_argument("--out", type=Path, default=DEFAULT_OUT, help="output directory")
+    ap.add_argument("--only", nargs="*", help="only build these named figures")
+    ap.add_argument("--check", action="store_true", help="verify committed PNGs are up to date")
+    args = ap.parse_args(argv)
+
+    if args.check:
+        return run_check(args.out)
+
+    names = args.only or list(FIGURES)
+    unknown = [n for n in names if n not in FIGURES]
+    if unknown:
+        ap.error(f"unknown figure(s): {', '.join(unknown)}")
+    for name in names:
+        path = FIGURES[name](args.out)
+        print(f"wrote {path}")
+    print(f"done: {len(names)} figure(s) -> {args.out}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -8,10 +8,23 @@
     <UseWPF>true</UseWPF>
     <UseWindowsForms>true</UseWindowsForms>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <NoWarn>NU1701</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\Joko.NINA.Plugins.HocusFocus\Joko.NINA.Plugins.HocusFocus.csproj" />
+  </ItemGroup>
+
+  <!-- The TestApp project is a WPF Exe (not referenced as an assembly), so its pure-logic helpers are linked in
+       directly for unit testing — the same pattern the test project uses for other shared source. The label store
+       and viewport math now live in the plugin (StarDetection/Optimization/Review) and come in via the plugin
+       ProjectReference above; only the TestApp-resident queue selection + run discovery are linked here. -->
+  <ItemGroup>
+    <Compile Include="..\TestApp\StarReview\StarReviewQueue.cs" Link="StarReview\StarReviewQueue.cs" />
+    <Compile Include="..\TestApp\OptimizationRunDiscovery.cs" Link="StarReview\OptimizationRunDiscovery.cs" />
+    <Compile Include="..\TestApp\GoldenStarSet.cs" Link="Golden\GoldenStarSet.cs" />
+    <Compile Include="..\TestApp\GoldenGeometry.cs" Link="Golden\GoldenGeometry.cs" />
+    <Compile Include="..\TestApp\BankVerification.cs" Link="Bank\BankVerification.cs" />
   </ItemGroup>
 
   <ItemGroup>

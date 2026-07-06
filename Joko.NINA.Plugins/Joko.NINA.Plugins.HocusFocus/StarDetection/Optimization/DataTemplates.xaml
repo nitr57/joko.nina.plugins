@@ -1,0 +1,807 @@
+<ResourceDictionary
+    x:Class="NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization.DataTemplates"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="clr-namespace:NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization"
+    xmlns:ninactrl="clr-namespace:NINA.CustomControlLibrary;assembly=NINA.CustomControlLibrary"
+    xmlns:oxy="clr-namespace:OxyPlot.Wpf;assembly=OxyPlot.Contrib.Wpf"
+    xmlns:review="clr-namespace:NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization.Review"
+    xmlns:rules="clr-namespace:NINA.Core.Utility.ValidationRules;assembly=NINA.Core"
+    xmlns:s="clr-namespace:System;assembly=mscorlib"
+    xmlns:util="clr-namespace:NINA.Core.Utility;assembly=NINA.Core">
+    <ResourceDictionary.MergedDictionaries>
+        <ResourceDictionary Source="../../Resources/OptionsDataTemplates.xaml" />
+    </ResourceDictionary.MergedDictionaries>
+
+    <!--  Tooltips  -->
+    <TextBlock x:Key="SDOpt_SourceMode_Tooltip" Text="Replay optimizes against a saved auto-focus run (recommended). Live triggers a fresh auto-focus that saves its frames, then optimizes against those." />
+    <TextBlock x:Key="SDOpt_OptimizeMode_Tooltip" Text="Optimize runs the parameter search and recommends improved settings. Use current settings skips the search entirely and jumps straight to a summary built from your current settings, so you can review (and label) today's detection without an optimization pass. Either way, after reviewing you can still run Optimize with feedback to recover the stars you labeled." />
+    <TextBlock x:Key="SDOpt_StartFromCurrent_Tooltip" Text="When checked, the optimizer SEEDS from your current settings instead of the fully-default settings, so it refines your existing setup rather than re-deriving from scratch. Useful when you've already hand-tuned detection and want incremental improvement. The search still only accepts changes that improve on your current settings, and improvement is reported against them. Leave unchecked to explore from the defaults (recommended for a first run). Only applies in Optimize mode." />
+    <TextBlock x:Key="SDOpt_FeedbackBreakdown_Tooltip" Text="How your labels map to the detector's gates: each row is the gate that rejected the stars you marked, and the setting change that would recover them — bounded so it doesn't admit too many unlabeled candidates (precision). Optimize with feedback starts the optimizer from these recommendations." />
+    <TextBlock x:Key="SDOpt_ApplyStepSize_Tooltip" Text="When checked, clicking Accept also writes the recommended auto-focus step size and offset steps to the active profile (they appear in the Changed parameters list above). The step size is sized so a sweep lands several measurement points across the focus-sensitive region of the curve. Disabled when the recommendation already matches your current settings (nothing to apply)." />
+    <TextBlock x:Key="SDOpt_Review_Tooltip" Text="Optional: review the optimized detector boxes over every loaded frame and label any missed, falsely-accepted, or wrongly-rejected stars. The labels are saved next to the run and can drive a future re-optimization. Reviewing is not required — you can Accept directly." />
+    <TextBlock x:Key="SDOpt_ReOptimize_Tooltip" Text="Re-run the optimization using the labels you just made in Review. Your missed / wrongly-rejected stars steer the optimizer to recover them (recall), and your should-reject stars steer it to exclude them (precision). The run is re-read from disk and the search re-runs, landing on an updated summary you can review again or accept." />
+    <TextBlock x:Key="SDOpt_Variant_Tooltip" Text="Switch the chart and the summary below between your current settings, the optimized settings, and (after Optimize with feedback) the feedback-optimized settings. Accept applies whichever variant is shown (Current can't be accepted — it's your baseline)." />
+    <TextBlock x:Key="SDOpt_DonutDetection_Tooltip" Text="When checked, the optimizer is allowed to recover out-of-focus DONUT stars — heavily defocused stars that appear as hollow rings — which the detector otherwise drops (they fragment or fail the fill-ratio test). It also unlocks diffraction-spike and saturated-bloom suppression so a bright star's rays aren't mistaken for stars. Recommended for telescopes with a central obstruction (Newtonians/SCTs) whose defocused stars become donuts; leave OFF for refractors (defocused stars are filled disks, not rings). Saved to your profile and default OFF. When OFF, star detection is exactly as before." />
+    <TextBlock x:Key="SDOpt_Inspection_Tooltip" Text="When checked, the optimizer favors detecting MANY MORE stars spread across the frame, which the aberration inspector needs to measure sensor tilt and field curvature. It does this by trading away a little auto-focus-curve sharpness for star count — but the fit is bounded: settings that make the focus curve noticeably worse than your current settings are penalized, so focus stays usable. Leave OFF to optimize purely for the tightest auto-focus curve (the default). Only applies in Optimize mode; nothing is saved until you Accept." />
+    <TextBlock x:Key="SDOpt_Continue_Tooltip" Text="Run another optimization pass starting from the settings just found, giving the search a fresh chance to refine further (it resets its step sizes, so it can make larger moves again). Useful when the last pass looks like it stopped just short. Limited to 3 total passes; the Changed parameters table shows the value of each setting after every pass." />
+
+    <!--  Auto-focus curve chart for ONE settings variant. The Summary panel hosts this via a ContentControl bound to
+          SelectedCurve, so toggling the variant rebuilds the plot from a fresh OptimizationCurve instance (a robust
+          OxyPlot re-render without InvalidatePlot). Bindings are relative to the OptimizationCurve. Mirrors the AF
+          chart in AutoFocus/DataTemplates.xaml: ScatterErrorSeries (points + HFR error bars), a FunctionAnnotation for
+          the fitted curve, and a PointAnnotation diamond at the curve minimum (best focus). The default tracker shows
+          the per-point readout on hover/click.  -->
+    <DataTemplate DataType="{x:Type local:OptimizationCurve}">
+        <oxy:Plot
+            MinHeight="240"
+            Background="{StaticResource BackgroundBrush}"
+            PlotAreaBackground="{StaticResource BackgroundBrush}"
+            PlotAreaBorderColor="{Binding Path=Color, Source={StaticResource BorderBrush}}"
+            TextColor="{Binding Path=Color, Source={StaticResource PrimaryBrush}}">
+            <oxy:Plot.Axes>
+                <!--  Explicit bounds (incl. the best-focus minimum, padded) so a steep curve's optimum is never clipped.  -->
+                <oxy:LinearAxis
+                    AxislineColor="{Binding Path=Color, Source={StaticResource PrimaryBrush}}"
+                    IsPanEnabled="False"
+                    IsZoomEnabled="False"
+                    MajorGridlineColor="{Binding Path=Color, Source={StaticResource PrimaryBrush}, Converter={StaticResource SetAlphaToColorConverter}, ConverterParameter=60}"
+                    MajorGridlineStyle="LongDash"
+                    Maximum="{Binding Bounds.YMax}"
+                    Minimum="{Binding Bounds.YMin}"
+                    Position="Left"
+                    TextColor="{Binding Path=Color, Source={StaticResource PrimaryBrush}}"
+                    TicklineColor="{Binding Path=Color, Source={StaticResource SecondaryBrush}}"
+                    Title="HFR" />
+                <oxy:LinearAxis
+                    AxislineColor="{Binding Path=Color, Source={StaticResource PrimaryBrush}}"
+                    IsPanEnabled="False"
+                    IsZoomEnabled="False"
+                    MajorGridlineColor="{Binding Path=Color, Source={StaticResource PrimaryBrush}, Converter={StaticResource SetAlphaToColorConverter}, ConverterParameter=60}"
+                    MajorGridlineStyle="LongDash"
+                    Maximum="{Binding Bounds.XMax}"
+                    Minimum="{Binding Bounds.XMin}"
+                    Position="Bottom"
+                    TextColor="{Binding Path=Color, Source={StaticResource PrimaryBrush}}"
+                    TicklineColor="{Binding Path=Color, Source={StaticResource SecondaryBrush}}"
+                    Title="Focuser position" />
+            </oxy:Plot.Axes>
+            <oxy:Plot.Series>
+                <oxy:ScatterErrorSeries
+                    ErrorBarColor="{Binding Path=Color, Source={StaticResource NotificationErrorBrush}}"
+                    ErrorBarStopWidth="2"
+                    ErrorBarStrokeThickness="2"
+                    ItemsSource="{Binding Points}"
+                    MarkerFill="{Binding Path=Color, Source={StaticResource PrimaryBrush}}"
+                    MarkerType="Circle"
+                    TrackerFormatString="Focuser: {2:0}, HFR: {4:0.000}" />
+            </oxy:Plot.Series>
+            <oxy:Plot.Annotations>
+                <oxy:FunctionAnnotation
+                    Color="{Binding Path=Color, Source={StaticResource SecondaryBrush}}"
+                    Equation="{Binding Fitting}" />
+                <oxy:PointAnnotation
+                    Fill="{Binding Path=Color, Source={StaticResource NotificationErrorBrush}}"
+                    Shape="Diamond"
+                    Stroke="{Binding Path=Color, Source={StaticResource NotificationErrorBrush}}"
+                    X="{Binding Minimum.X}"
+                    Y="{Binding Minimum.Y}" />
+            </oxy:Plot.Annotations>
+        </oxy:Plot>
+    </DataTemplate>
+
+    <!--  Fitted focus graph for a registered star WITH an accepted fit (Review Frames hover): plain scatter (NO error
+          bars — each point is a single detection, so there is no sample spread) + the fitted curve + best-focus marker.  -->
+    <DataTemplate DataType="{x:Type review:FrameReviewFocusGraph}">
+        <oxy:Plot
+            MinHeight="240"
+            Background="{StaticResource BackgroundBrush}"
+            PlotAreaBackground="{StaticResource BackgroundBrush}"
+            PlotAreaBorderColor="{Binding Path=Color, Source={StaticResource BorderBrush}}"
+            TextColor="{Binding Path=Color, Source={StaticResource PrimaryBrush}}">
+            <oxy:Plot.Axes>
+                <!--  Explicit bounds (incl. the best-focus minimum, padded) so a steep curve's optimum is never clipped.  -->
+                <oxy:LinearAxis
+                    AxislineColor="{Binding Path=Color, Source={StaticResource PrimaryBrush}}"
+                    IsPanEnabled="False"
+                    IsZoomEnabled="False"
+                    MajorGridlineColor="{Binding Path=Color, Source={StaticResource PrimaryBrush}, Converter={StaticResource SetAlphaToColorConverter}, ConverterParameter=60}"
+                    MajorGridlineStyle="LongDash"
+                    Maximum="{Binding Bounds.YMax}"
+                    Minimum="{Binding Bounds.YMin}"
+                    Position="Left"
+                    TextColor="{Binding Path=Color, Source={StaticResource PrimaryBrush}}"
+                    TicklineColor="{Binding Path=Color, Source={StaticResource SecondaryBrush}}"
+                    Title="HFR" />
+                <oxy:LinearAxis
+                    AxislineColor="{Binding Path=Color, Source={StaticResource PrimaryBrush}}"
+                    IsPanEnabled="False"
+                    IsZoomEnabled="False"
+                    MajorGridlineColor="{Binding Path=Color, Source={StaticResource PrimaryBrush}, Converter={StaticResource SetAlphaToColorConverter}, ConverterParameter=60}"
+                    MajorGridlineStyle="LongDash"
+                    Maximum="{Binding Bounds.XMax}"
+                    Minimum="{Binding Bounds.XMin}"
+                    Position="Bottom"
+                    TextColor="{Binding Path=Color, Source={StaticResource PrimaryBrush}}"
+                    TicklineColor="{Binding Path=Color, Source={StaticResource SecondaryBrush}}"
+                    Title="Focuser position" />
+            </oxy:Plot.Axes>
+            <oxy:Plot.Series>
+                <oxy:ScatterSeries
+                    ItemsSource="{Binding Points}"
+                    MarkerFill="{Binding Path=Color, Source={StaticResource PrimaryBrush}}"
+                    MarkerType="Circle"
+                    TrackerFormatString="Focuser: {2:0}, HFR: {4:0.000}" />
+                <!--  Outlier-rejected detections: a red X drawn over the rejected point's dot (mirrors the AutoFocus graph).  -->
+                <oxy:ScatterSeries
+                    ItemsSource="{Binding RejectedPoints}"
+                    MarkerSize="6"
+                    MarkerStroke="Red"
+                    MarkerStrokeThickness="2"
+                    MarkerType="Cross"
+                    TrackerFormatString="Rejected — Focuser: {2:0}, HFR: {4:0.000}" />
+            </oxy:Plot.Series>
+            <oxy:Plot.Annotations>
+                <oxy:FunctionAnnotation
+                    Color="{Binding Path=Color, Source={StaticResource SecondaryBrush}}"
+                    Equation="{Binding Fitting}" />
+                <oxy:PointAnnotation
+                    Fill="{Binding Path=Color, Source={StaticResource NotificationErrorBrush}}"
+                    Shape="Diamond"
+                    Stroke="{Binding Path=Color, Source={StaticResource NotificationErrorBrush}}"
+                    X="{Binding Minimum.X}"
+                    Y="{Binding Minimum.Y}" />
+            </oxy:Plot.Annotations>
+        </oxy:Plot>
+    </DataTemplate>
+
+    <!--  Points-only focus graph for a registered star with NO accepted fit (Review Frames hover): plain scatter only,
+          no fitted-curve/minimum annotations (which would require a non-null fit).  -->
+    <DataTemplate DataType="{x:Type review:FrameReviewScatterGraph}">
+        <oxy:Plot
+            MinHeight="240"
+            Background="{StaticResource BackgroundBrush}"
+            PlotAreaBackground="{StaticResource BackgroundBrush}"
+            PlotAreaBorderColor="{Binding Path=Color, Source={StaticResource BorderBrush}}"
+            TextColor="{Binding Path=Color, Source={StaticResource PrimaryBrush}}">
+            <oxy:Plot.Axes>
+                <oxy:LinearAxis
+                    AxislineColor="{Binding Path=Color, Source={StaticResource PrimaryBrush}}"
+                    IsPanEnabled="False"
+                    IsZoomEnabled="False"
+                    MajorGridlineColor="{Binding Path=Color, Source={StaticResource PrimaryBrush}, Converter={StaticResource SetAlphaToColorConverter}, ConverterParameter=60}"
+                    MajorGridlineStyle="LongDash"
+                    MaximumPadding="0.1"
+                    MinimumPadding="0.1"
+                    Position="Left"
+                    TextColor="{Binding Path=Color, Source={StaticResource PrimaryBrush}}"
+                    TicklineColor="{Binding Path=Color, Source={StaticResource SecondaryBrush}}"
+                    Title="HFR" />
+                <oxy:LinearAxis
+                    AxislineColor="{Binding Path=Color, Source={StaticResource PrimaryBrush}}"
+                    IsPanEnabled="False"
+                    IsZoomEnabled="False"
+                    MajorGridlineColor="{Binding Path=Color, Source={StaticResource PrimaryBrush}, Converter={StaticResource SetAlphaToColorConverter}, ConverterParameter=60}"
+                    MajorGridlineStyle="LongDash"
+                    MaximumPadding="0.1"
+                    MinimumPadding="0.1"
+                    Position="Bottom"
+                    TextColor="{Binding Path=Color, Source={StaticResource PrimaryBrush}}"
+                    TicklineColor="{Binding Path=Color, Source={StaticResource SecondaryBrush}}"
+                    Title="Focuser position" />
+            </oxy:Plot.Axes>
+            <oxy:Plot.Series>
+                <oxy:ScatterSeries
+                    ItemsSource="{Binding Points}"
+                    MarkerFill="{Binding Path=Color, Source={StaticResource PrimaryBrush}}"
+                    MarkerType="Circle"
+                    TrackerFormatString="Focuser: {2:0}, HFR: {4:0.000}" />
+            </oxy:Plot.Series>
+        </oxy:Plot>
+    </DataTemplate>
+
+    <!--  The Aberration Inspector "Review Frames" window content. Implicit DataType template so the WindowService's
+          ContentPresenter resolves it by VM type (same mechanism as the wizard below).  -->
+    <DataTemplate DataType="{x:Type review:FrameReviewVM}">
+        <!--  No fixed min size: the control sizes its host window to fit the screen on load (ReviewViewportHostBase),
+              opening large (1280x860) but clamped to the work area so it can be shrunk freely.  -->
+        <review:FrameReviewControl />
+    </DataTemplate>
+
+    <!--  The wizard window content. Implicit DataType template so the WindowService's ContentPresenter resolves it by VM type.  -->
+    <DataTemplate DataType="{x:Type local:StarDetectionOptimizerWizardVM}">
+        <!--  Width grows per step (the Review step embeds a full interactive image viewer). The preferred HEIGHT now
+              lives on the scrollable body below, NOT here: keeping a MinHeight floor on the root grid prevented it
+              from shrinking to a smaller window, so the bottom row (footer buttons) overflowed and clipped. With the
+              floor gone the grid shrinks to the window, the body scrolls, and the footer stays pinned.  -->
+        <Grid Margin="10" local:ClampWindowToWorkArea.Enabled="True">
+            <Grid.Style>
+                <Style TargetType="Grid">
+                    <Setter Property="Width" Value="640" />
+                    <Style.Triggers>
+                        <!--  Wider on the results page so the auto-focus curve chart has room…  -->
+                        <DataTrigger Binding="{Binding IsSummary}" Value="True">
+                            <Setter Property="Width" Value="820" />
+                        </DataTrigger>
+                        <!--  …and widest for the Review step (embeds the full interactive image viewer). Listed last
+                              so it wins; the two are mutually exclusive anyway.  -->
+                        <DataTrigger Binding="{Binding IsReview}" Value="True">
+                            <Setter Property="Width" Value="1120" />
+                        </DataTrigger>
+                    </Style.Triggers>
+                </Style>
+            </Grid.Style>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+
+            <!--  Header  -->
+            <TextBlock
+                Grid.Row="0"
+                Margin="0,0,0,8"
+                FontSize="16"
+                FontWeight="Bold"
+                Text="Star Detection Optimization Wizard" />
+
+            <!--  Body: one panel visible per step. Wrapped in a ScrollViewer so that when the window is shorter than
+                  the body's preferred height, the body scrolls (the footer below stays pinned) instead of the whole
+                  grid overflowing and clipping the footer. The per-step MinHeight on the inner grid sets the
+                  preferred/opening height; on a tall-enough window the body fills (no scrollbar) exactly as before,
+                  so the StarReviewControl still gets the full area when there is room.  -->
+            <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+            <Grid>
+                <Grid.Style>
+                    <Style TargetType="Grid">
+                        <Setter Property="MinHeight" Value="380" />
+                        <Style.Triggers>
+                            <DataTrigger Binding="{Binding IsSummary}" Value="True">
+                                <Setter Property="MinHeight" Value="520" />
+                            </DataTrigger>
+                            <DataTrigger Binding="{Binding IsReview}" Value="True">
+                                <Setter Property="MinHeight" Value="660" />
+                            </DataTrigger>
+                        </Style.Triggers>
+                    </Style>
+                </Grid.Style>
+
+                <!--  Step 1: Select Source  -->
+                <StackPanel Visibility="{Binding ShowSelectSource, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}">
+                    <TextBlock
+                        Margin="0,0,0,8"
+                        Text="Choose a saved auto-focus run to tune star detection against. The optimizer re-runs detection on its frames with many parameter combinations and keeps the settings that best pin down focus."
+                        TextWrapping="Wrap" />
+
+                    <StackPanel Margin="0,4" Orientation="Horizontal">
+                        <TextBlock
+                            Width="90"
+                            VerticalAlignment="Center"
+                            Text="Source" />
+                        <ComboBox
+                            Width="160"
+                            ItemsSource="{Binding Source={util:EnumBindingSource {x:Type local:SourceMode}}}"
+                            SelectedItem="{Binding SourceMode}"
+                            ToolTip="{StaticResource SDOpt_SourceMode_Tooltip}">
+                            <ComboBox.ItemTemplate>
+                                <DataTemplate>
+                                    <TextBlock Text="{Binding Converter={StaticResource HF_EnumStaticDescriptionValueConverter}}" />
+                                </DataTemplate>
+                            </ComboBox.ItemTemplate>
+                        </ComboBox>
+                    </StackPanel>
+
+                    <StackPanel Margin="0,4" Orientation="Horizontal">
+                        <TextBlock
+                            Width="90"
+                            VerticalAlignment="Center"
+                            Text="Mode" />
+                        <RadioButton
+                            Margin="0,0,14,0"
+                            VerticalAlignment="Center"
+                            Content="Optimize"
+                            GroupName="OptimizeMode"
+                            IsChecked="{Binding IsOptimizeMode}"
+                            ToolTip="{StaticResource SDOpt_OptimizeMode_Tooltip}" />
+                        <RadioButton
+                            VerticalAlignment="Center"
+                            Content="Use current settings"
+                            GroupName="OptimizeMode"
+                            IsChecked="{Binding IsUseCurrentMode}"
+                            ToolTip="{StaticResource SDOpt_OptimizeMode_Tooltip}" />
+                    </StackPanel>
+
+                    <!--  Start-from-current toggle (CheckBox left, label right; details in the tooltip). Off by
+                          default; only meaningful in Optimize mode, so disabled otherwise.  -->
+                    <StackPanel Margin="0,4" Orientation="Horizontal">
+                        <CheckBox
+                            VerticalAlignment="Center"
+                            IsChecked="{Binding StartFromCurrentSettings}"
+                            IsEnabled="{Binding IsOptimizeMode}"
+                            ToolTip="{StaticResource SDOpt_StartFromCurrent_Tooltip}" />
+                        <TextBlock
+                            Margin="6,0,0,0"
+                            VerticalAlignment="Center"
+                            IsEnabled="{Binding IsOptimizeMode}"
+                            Text="Start from my current settings (refine them further)"
+                            ToolTip="{StaticResource SDOpt_StartFromCurrent_Tooltip}" />
+                    </StackPanel>
+
+                    <!--  Defocus-aware donut detection MASTER toggle (profile-saved, default OFF). Recovers
+                          out-of-focus donut stars and unlocks the defocus axes for the optimizer; details in the
+                          tooltip. Persists on click (it is a profile option, not VM-only). Only meaningful in
+                          Optimize mode (it gates the optimizer's defocus axes), so disabled in Use-current mode —
+                          like the start-from-current toggle above.  -->
+                    <StackPanel Margin="0,4" Orientation="Horizontal">
+                        <CheckBox
+                            VerticalAlignment="Center"
+                            IsChecked="{Binding DefocusAwareDonutDetection}"
+                            IsEnabled="{Binding IsOptimizeMode}"
+                            ToolTip="{StaticResource SDOpt_DonutDetection_Tooltip}" />
+                        <TextBlock
+                            Margin="6,0,0,0"
+                            VerticalAlignment="Center"
+                            IsEnabled="{Binding IsOptimizeMode}"
+                            Text="Recover out-of-focus donut stars (reflectors/SCTs)"
+                            ToolTip="{StaticResource SDOpt_DonutDetection_Tooltip}" />
+                    </StackPanel>
+
+                    <!--  Optimize-for-aberration-inspection toggle (VM-only, default OFF). Swaps in a star-favoring
+                          objective bounded relative to the current settings' fit; details in the tooltip. Only
+                          meaningful in Optimize mode (it shapes the search), so disabled in Use-current mode.  -->
+                    <StackPanel Margin="0,4" Orientation="Horizontal">
+                        <CheckBox
+                            VerticalAlignment="Center"
+                            IsChecked="{Binding OptimizeForAberrationInspection}"
+                            IsEnabled="{Binding IsOptimizeMode}"
+                            ToolTip="{StaticResource SDOpt_Inspection_Tooltip}" />
+                        <TextBlock
+                            Margin="6,0,0,0"
+                            VerticalAlignment="Center"
+                            IsEnabled="{Binding IsOptimizeMode}"
+                            Text="Optimize for aberration inspection (favor more stars)"
+                            ToolTip="{StaticResource SDOpt_Inspection_Tooltip}" />
+                    </StackPanel>
+
+                    <!--  Single saved-run folder picker (Saved Auto-Focus only). Optimizing against one run at a time
+                          keeps the recommendation interpretable; the multi-run selector was removed.  -->
+                    <ItemsControl
+                        Margin="0,8,0,0"
+                        AlternationCount="100"
+                        ItemsSource="{Binding SourcePaths}"
+                        Visibility="{Binding IsReplay, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <StackPanel Margin="0,2" Orientation="Horizontal">
+                                    <Button
+                                        Width="80"
+                                        Command="{Binding DataContext.BrowseSourceCommand, RelativeSource={RelativeSource AncestorType=ItemsControl}}"
+                                        CommandParameter="{Binding RelativeSource={RelativeSource AncestorType=ContentPresenter}, Path=(ItemsControl.AlternationIndex)}"
+                                        Content="Browse…" />
+                                    <TextBlock
+                                        Width="440"
+                                        Margin="8,0,0,0"
+                                        VerticalAlignment="Center"
+                                        Text="{Binding}"
+                                        TextTrimming="CharacterEllipsis" />
+                                </StackPanel>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </StackPanel>
+
+                <!--  Determinate progress: shown whenever the wizard is busy (loading frames / analyzing frames /
+                      optimizing / building the review). The bar marches (indeterminate) for phases with no known
+                      total yet, and shows a "N / M" count otherwise.  -->
+                <StackPanel VerticalAlignment="Center"
+                            Visibility="{Binding ShowProgress, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}">
+                    <TextBlock
+                        Margin="0,0,0,8"
+                        HorizontalAlignment="Center"
+                        FontWeight="Bold"
+                        Text="{Binding Phase}" />
+                    <ProgressBar
+                        Height="18"
+                        IsIndeterminate="{Binding IsProgressIndeterminate}"
+                        Maximum="{Binding ProgressTotal}"
+                        Minimum="0"
+                        Value="{Binding ProgressCurrent, Mode=OneWay}" />
+                    <!--  Count + elapsed clock on one line: "X / Y (MM:SS)" while a determinate count is known, else
+                          just "(MM:SS)". Ticks once a second.  -->
+                    <TextBlock
+                        Margin="0,4,0,0"
+                        HorizontalAlignment="Center"
+                        Text="{Binding ProgressCountElapsedText, Mode=OneWay}" />
+                    <TextBlock
+                        Margin="0,2,0,0"
+                        HorizontalAlignment="Center"
+                        Text="{Binding ProgressImprovementText}"
+                        Visibility="{Binding IsOptimizing, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
+                </StackPanel>
+
+                <!--  Step 4: Summary (the results page)  -->
+                <ScrollViewer VerticalScrollBarVisibility="Auto" Visibility="{Binding ShowSummary, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}">
+                    <StackPanel>
+                        <TextBlock
+                            Margin="0,0,0,8"
+                            FontWeight="Bold"
+                            Text="Optimization complete" />
+
+                        <!--  Variant toggle: switch the chart + summary between Current / Optimized / Optimized (with
+                              feedback). Hidden when only the current curve exists (review-only).  -->
+                        <StackPanel
+                            Margin="0,0,0,6"
+                            Orientation="Horizontal"
+                            Visibility="{Binding HasOptimized, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}">
+                            <RadioButton
+                                VerticalAlignment="Center"
+                                Content="Current"
+                                GroupName="Variant"
+                                IsChecked="{Binding IsCurrentVariant}"
+                                ToolTip="{StaticResource SDOpt_Variant_Tooltip}" />
+                            <RadioButton
+                                Margin="12,0,0,0"
+                                VerticalAlignment="Center"
+                                Content="Optimized"
+                                GroupName="Variant"
+                                IsChecked="{Binding IsOptimizedVariant}"
+                                ToolTip="{StaticResource SDOpt_Variant_Tooltip}" />
+                            <RadioButton
+                                Margin="12,0,0,0"
+                                VerticalAlignment="Center"
+                                Content="Optimized (with feedback)"
+                                GroupName="Variant"
+                                IsChecked="{Binding IsFeedbackVariant}"
+                                ToolTip="{StaticResource SDOpt_Variant_Tooltip}"
+                                Visibility="{Binding HasFeedback, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
+                        </StackPanel>
+
+                        <!--  Shown when the optimizer could not beat the user's current settings: the page defaults to
+                              Current so Accept keeps it. Explains why + points at "Start from my current settings".  -->
+                        <TextBlock
+                            Margin="0,0,0,8"
+                            FontStyle="Italic"
+                            TextWrapping="Wrap"
+                            Text="{Binding OptimizerNoImprovementNote, Mode=OneWay}"
+                            Visibility="{Binding ShowNoImprovementNote, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
+
+                        <!--  Auto-focus curve for the selected variant (rebuilt on toggle via the ContentControl).  -->
+                        <Border
+                            Height="260"
+                            Margin="0,0,0,8"
+                            Visibility="{Binding HasSelectedCurve, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}">
+                            <ContentControl Content="{Binding SelectedCurve}" />
+                        </Border>
+
+                        <!--  Before / after — plain language, no jargon "J" (the abstract objective stays in logs).
+                              Every row is "[label Width=200][value]" with uniform spacing so the values line up in a
+                              column and the row gaps match across the whole summary.  -->
+                        <!--  Focus precision shows the full per-round σ path "baseline → R1 → R2 → …" after "Continue
+                              optimizing" (FocusPrecisionText), mirroring the J rounds header; a single pass collapses to
+                              the start→finish SigmaText.  -->
+                        <StackPanel Orientation="Horizontal" Margin="0,2">
+                            <TextBlock Width="200" Text="Focus precision (σ, lower is better)" />
+                            <TextBlock Text="{Binding FocusPrecisionText, Mode=OneWay}" />
+                        </StackPanel>
+                        <!--  Feedback variant only: how much the feedback round tightened σ over the plain optimization.  -->
+                        <StackPanel Orientation="Horizontal" Margin="0,2"
+                                    Visibility="{Binding Summary.HasFeedbackComparison, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}">
+                            <TextBlock Width="200" Text="vs optimized (no feedback)" />
+                            <TextBlock Text="{Binding Summary.FeedbackVsOptimizedText, Mode=OneWay}" />
+                        </StackPanel>
+                        <!--  How long the most recent optimization run took (minutes:seconds).  -->
+                        <StackPanel Orientation="Horizontal" Margin="0,2"
+                                    Visibility="{Binding HasRunDuration, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}">
+                            <TextBlock Width="200" Text="Optimization time" />
+                            <TextBlock Text="{Binding RunDurationText, Mode=OneWay}" />
+                        </StackPanel>
+
+                        <!--  Stars per frame: accepted-star count at each focuser position and how it moved across the
+                              optimization passes (current → optimized, and current → R1 → R2 after Continue). A wrapping
+                              row of compact cells in the main results flow (NOT the gray feedback panel). Shown for the
+                              Optimized variant (with a net delta) and the Current variant (counts only).  -->
+                        <StackPanel Margin="0,8,0,0"
+                                    Visibility="{Binding HasStarsPerFrame, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}">
+                            <TextBlock Margin="0,0,0,4" FontWeight="Bold" Text="{Binding StarsPerFrameLabel, Mode=OneWay}" />
+                            <ItemsControl ItemsSource="{Binding StarsPerFrame}">
+                                <ItemsControl.ItemsPanel>
+                                    <ItemsPanelTemplate>
+                                        <WrapPanel Orientation="Horizontal" />
+                                    </ItemsPanelTemplate>
+                                </ItemsControl.ItemsPanel>
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <Border
+                                            Margin="0,0,6,6"
+                                            Padding="6,3"
+                                            BorderBrush="{StaticResource BorderBrush}"
+                                            BorderThickness="1"
+                                            CornerRadius="3">
+                                            <StackPanel>
+                                                <TextBlock
+                                                    HorizontalAlignment="Center"
+                                                    FontSize="10"
+                                                    Foreground="{StaticResource SecondaryBrush}"
+                                                    Text="{Binding FocuserPosition}" />
+                                                <TextBlock HorizontalAlignment="Center" Text="{Binding CountsText}" />
+                                                <TextBlock
+                                                    HorizontalAlignment="Center"
+                                                    FontWeight="Bold"
+                                                    Text="{Binding DeltaText}"
+                                                    Visibility="{Binding HasDelta, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
+                                            </StackPanel>
+                                        </Border>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </StackPanel>
+
+                        <!--  Auto-focus block: the recommended step size / offset steps PLUS the toggle that applies
+                              them on Accept, grouped so the toggle's purpose is obvious.  -->
+                        <TextBlock Margin="0,8,0,2" FontWeight="Bold" Text="Auto-focus settings" />
+                        <StackPanel Orientation="Horizontal" Margin="0,2">
+                            <TextBlock Width="200" Text="Recommended step size" />
+                            <TextBlock Text="{Binding Summary.StepSizeText, Mode=OneWay}" />
+                        </StackPanel>
+                        <StackPanel Orientation="Horizontal" Margin="0,2">
+                            <TextBlock Width="200" Text="Recommended offset steps" />
+                            <TextBlock Text="{Binding Summary.OffsetStepsText, Mode=OneWay}" />
+                        </StackPanel>
+                        <!--  Separate TextBlock label (NINA's CheckBox style doesn't render Content as a visible
+                              label — every other checkbox in the plugin uses this label-beside-box pattern).  -->
+                        <StackPanel Orientation="Horizontal" Margin="0,4,0,8">
+                            <CheckBox
+                                VerticalAlignment="Center"
+                                IsChecked="{Binding ApplyRecommendedStepSize}"
+                                IsEnabled="{Binding CanApplyRecommendedStepSize}"
+                                ToolTip="{StaticResource SDOpt_ApplyStepSize_Tooltip}" />
+                            <TextBlock
+                                Margin="6,0,0,0"
+                                VerticalAlignment="Center"
+                                IsEnabled="{Binding CanApplyRecommendedStepSize}"
+                                Text="Apply these auto-focus settings to my profile when I click Accept"
+                                ToolTip="{StaticResource SDOpt_ApplyStepSize_Tooltip}" />
+                        </StackPanel>
+
+                        <!--  Changed parameters table  -->
+                        <TextBlock
+                            Margin="0,4,0,4"
+                            FontWeight="Bold"
+                            Text="Changed parameters" />
+                        <!--  Multi-round header: after "Continue optimizing", shows the per-pass J path (e.g.
+                              "3 rounds  •  J: 0.940 → 0.985 → 0.990"). Hidden for a single pass.  -->
+                        <TextBlock
+                            Margin="0,0,0,4"
+                            FontStyle="Italic"
+                            Text="{Binding RoundsSummaryText, Mode=OneWay}"
+                            Visibility="{Binding HasRoundsSummary, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
+                        <!--  The value column shows the full path "current → optimized" (and, after Continue, the
+                              per-round trajectory "current → R1 → R2 → …") via the row's arrow-joined Trajectory.  -->
+                        <DataGrid
+                            AutoGenerateColumns="False"
+                            CanUserAddRows="False"
+                            HeadersVisibility="Column"
+                            IsReadOnly="True"
+                            ItemsSource="{Binding ChangedParametersDisplay}"
+                            MaxHeight="180">
+                            <DataGrid.Columns>
+                                <DataGridTextColumn
+                                    Width="2*"
+                                    Binding="{Binding Name}"
+                                    Header="Parameter" />
+                                <DataGridTextColumn
+                                    Width="3*"
+                                    Binding="{Binding Trajectory}"
+                                    Header="Current → Optimized" />
+                            </DataGrid.Columns>
+                        </DataGrid>
+
+                        <TextBlock
+                            Margin="0,8,0,0"
+                            Text="Toggle between your current, optimized, and feedback-optimized curves above. Optionally review the detector boxes on your frames and label any mistakes, then Accept to apply the selected variant (it becomes your active star-detection settings), or Close to discard."
+                            TextWrapping="Wrap" />
+
+                        <!--  Re-optimize with feedback: shown only after the user labeled mistakes in Review. Re-reads
+                              the runs from disk and re-runs the optimizer with the labels feeding recall/precision,
+                              then returns here with an updated summary.  -->
+                        <Border
+                            Margin="0,12,0,0"
+                            Padding="8"
+                            Background="{StaticResource ButtonBackgroundBrush}"
+                            BorderBrush="{StaticResource BorderBrush}"
+                            BorderThickness="1"
+                            CornerRadius="3"
+                            Visibility="{Binding ShowFeedbackPanel, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}">
+                            <StackPanel>
+                                <!--  Before a feedback run exists: prompt to re-run with the labels just made. Once a
+                                      feedback result exists this is replaced by the star-count comparison below
+                                      (re-optimize stays reachable from the Review page footer).  -->
+                                <StackPanel Visibility="{Binding ShowReoptimizePrompt, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}">
+                                    <TextBlock
+                                        FontWeight="Bold"
+                                        Text="You labeled stars in Review" />
+                                    <TextBlock
+                                        Margin="0,4,0,8"
+                                        Text="Re-run the optimization using the feedback you just made. The optimizer will try to recover the stars you marked as missed or wrongly-rejected and exclude the ones you marked should-reject, then bring you back to an updated summary."
+                                        TextWrapping="Wrap" />
+                                    <Button
+                                        Width="220"
+                                        HorizontalAlignment="Left"
+                                        Command="{Binding ReOptimizeCommand}"
+                                        Content="Optimize with feedback"
+                                        ToolTip="{StaticResource SDOpt_ReOptimize_Tooltip}" />
+                                </StackPanel>
+
+                                <!--  When viewing the feedback variant: the accepted-star-count change per frame
+                                      (baseline → with feedback), as a wrapping horizontal list of per-position cells.  -->
+                                <StackPanel Visibility="{Binding HasStarCountChanges, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}">
+                                    <TextBlock Margin="0,0,0,4" FontWeight="Bold">
+                                        <Run Text="Star count change per frame (" /><Run Text="{Binding StarCountChangeBaselineLabel, Mode=OneWay}" /><Run Text=" → with feedback)" />
+                                    </TextBlock>
+                                    <ItemsControl ItemsSource="{Binding StarCountChanges}">
+                                        <ItemsControl.ItemsPanel>
+                                            <ItemsPanelTemplate>
+                                                <WrapPanel Orientation="Horizontal" />
+                                            </ItemsPanelTemplate>
+                                        </ItemsControl.ItemsPanel>
+                                        <ItemsControl.ItemTemplate>
+                                            <DataTemplate>
+                                                <Border
+                                                    Margin="0,0,6,6"
+                                                    Padding="6,3"
+                                                    BorderBrush="{StaticResource BorderBrush}"
+                                                    BorderThickness="1"
+                                                    CornerRadius="3">
+                                                    <StackPanel>
+                                                        <TextBlock
+                                                            HorizontalAlignment="Center"
+                                                            FontSize="10"
+                                                            Foreground="{StaticResource SecondaryBrush}"
+                                                            Text="{Binding FocuserPosition}" />
+                                                        <TextBlock HorizontalAlignment="Center" Text="{Binding CountsText}" />
+                                                        <TextBlock
+                                                            HorizontalAlignment="Center"
+                                                            FontWeight="Bold"
+                                                            Text="{Binding DeltaText}" />
+                                                    </StackPanel>
+                                                </Border>
+                                            </DataTemplate>
+                                        </ItemsControl.ItemTemplate>
+                                    </ItemsControl>
+                                </StackPanel>
+
+                                <!--  Transparent label→gate breakdown produced by the last feedback run. Each row's
+                                      ToString() renders "Param old → new  recovers N/M Gate, admits ~K unlabeled".  -->
+                                <TextBlock
+                                    Margin="0,10,0,2"
+                                    FontWeight="Bold"
+                                    Text="How your labels map to settings"
+                                    ToolTip="{StaticResource SDOpt_FeedbackBreakdown_Tooltip}"
+                                    Visibility="{Binding HasRecommendation, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
+                                <ItemsControl
+                                    ItemsSource="{Binding RecommendationRows}"
+                                    Visibility="{Binding HasRecommendation, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}">
+                                    <ItemsControl.ItemTemplate>
+                                        <DataTemplate>
+                                            <TextBlock Margin="0,1" Text="{Binding}" TextWrapping="Wrap" />
+                                        </DataTemplate>
+                                    </ItemsControl.ItemTemplate>
+                                </ItemsControl>
+                            </StackPanel>
+                        </Border>
+                    </StackPanel>
+                </ScrollViewer>
+
+                <!--  Review step: the shared interactive review control over ALL loaded frames at the optimized
+                      params. Fills the body when IsReview; its DataContext is the lazily-built StarReviewVM.  -->
+                <review:StarReviewControl
+                    DataContext="{Binding ReviewVM}"
+                    Visibility="{Binding DataContext.ShowReview, RelativeSource={RelativeSource AncestorType=Grid}, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
+            </Grid>
+            </ScrollViewer>
+
+            <!--  Error banner  -->
+            <TextBlock
+                Grid.Row="2"
+                Margin="0,8,0,0"
+                Foreground="{StaticResource NotificationErrorBrush}"
+                Text="{Binding ErrorMessage}"
+                TextWrapping="Wrap"
+                Visibility="{Binding HasError, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
+
+            <!--  Footer: navigation. Exactly one step's buttons show at a time; while busy only Cancel shows.  -->
+            <StackPanel
+                Grid.Row="3"
+                Margin="0,10,0,0"
+                HorizontalAlignment="Right"
+                Orientation="Horizontal">
+
+                <!--  Busy (loading / analyzing / optimizing / building review): only Cancel.  -->
+                <Button
+                    Width="90"
+                    Margin="0,0,8,0"
+                    Command="{Binding CancelCommand}"
+                    Content="Cancel"
+                    Visibility="{Binding ShowProgress, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
+
+                <!--  SelectSource: Start (Close is the shared button below).  -->
+                <Button
+                    Width="90"
+                    Margin="0,0,8,0"
+                    Command="{Binding StartCommand}"
+                    Content="Start"
+                    Visibility="{Binding ShowSelectSource, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
+
+                <!--  Summary (results) page: Back, Review, Accept. Accept is always shown but disabled (via CanAccept)
+                      on Current / in review-only / while a run is in progress — there is then nothing to apply.  -->
+                <Button
+                    Width="90"
+                    Margin="0,0,8,0"
+                    Command="{Binding BackCommand}"
+                    Content="Back"
+                    Visibility="{Binding ShowSummary, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
+                <Button
+                    Width="120"
+                    Margin="0,0,8,0"
+                    Command="{Binding ReviewCommand}"
+                    Content="Review frames"
+                    ToolTip="{StaticResource SDOpt_Review_Tooltip}"
+                    Visibility="{Binding ShowSummary, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
+                <!--  Continue optimizing: another pass from the current best. Disabled (greyed) once 3 passes have
+                      run, via the command's CanContinueOptimization. Only shown on the Summary page.  -->
+                <Button
+                    Width="140"
+                    Margin="0,0,8,0"
+                    Command="{Binding ContinueOptimizationCommand}"
+                    Content="Continue optimizing"
+                    ToolTip="{StaticResource SDOpt_Continue_Tooltip}"
+                    Visibility="{Binding ShowSummary, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
+                <Button
+                    Width="90"
+                    Margin="0,0,8,0"
+                    Command="{Binding AcceptCommand}"
+                    Content="Accept"
+                    Visibility="{Binding ShowSummary, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
+
+                <!--  Review (labeling) page: Back to summary + Optimize with feedback (enabled once anything is
+                      labeled). Accept/Cancel are intentionally NOT offered here — finalize from the results page.  -->
+                <Button
+                    Width="120"
+                    Margin="0,0,8,0"
+                    Command="{Binding BackToSummaryCommand}"
+                    Content="Back to summary"
+                    Visibility="{Binding ShowReview, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
+                <Button
+                    Width="180"
+                    Margin="0,0,8,0"
+                    Command="{Binding ReOptimizeCommand}"
+                    Content="Optimize with feedback"
+                    ToolTip="{StaticResource SDOpt_ReOptimize_Tooltip}"
+                    Visibility="{Binding ShowReview, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
+
+                <!--  Close: on SelectSource (generic) and on the Summary results page (discard without applying).  -->
+                <Button
+                    Width="90"
+                    Command="{Binding CloseCommand}"
+                    Content="Close">
+                    <Button.Style>
+                        <!--  BasedOn the theme's implicit Button style so Close matches the other footer buttons'
+                              font/look (a style without BasedOn would drop the NINA default style).  -->
+                        <Style TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+                            <Setter Property="Visibility" Value="Collapsed" />
+                            <Style.Triggers>
+                                <DataTrigger Binding="{Binding ShowSelectSource}" Value="True">
+                                    <Setter Property="Visibility" Value="Visible" />
+                                </DataTrigger>
+                                <DataTrigger Binding="{Binding ShowSummary}" Value="True">
+                                    <Setter Property="Visibility" Value="Visible" />
+                                </DataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </Button.Style>
+                </Button>
+            </StackPanel>
+        </Grid>
+    </DataTemplate>
+</ResourceDictionary>

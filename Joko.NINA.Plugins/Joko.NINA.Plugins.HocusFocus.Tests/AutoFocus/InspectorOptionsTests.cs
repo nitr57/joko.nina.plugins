@@ -25,6 +25,8 @@ public class InspectorOptionsTests {
         Assert.Multiple(() => {
             Assert.That(options.StepCount, Is.EqualTo(-1));
             Assert.That(options.StepSize, Is.EqualTo(-1));
+            Assert.That(options.SignalAmplification, Is.EqualTo(2));
+            Assert.That(options.CenterFocuserBeforeRun, Is.False);
             Assert.That(options.FramesPerPoint, Is.EqualTo(-1));
             Assert.That(options.TimeoutSeconds, Is.EqualTo(-1));
             Assert.That(options.SimpleExposureSeconds, Is.EqualTo(-1));
@@ -48,6 +50,7 @@ public class InspectorOptionsTests {
             Assert.That(options.UseRANSAC, Is.True);
             Assert.That(options.SaveImagesOnReruns, Is.False);
             Assert.That(options.SaveAlignmentImages, Is.False);
+            Assert.That(options.FrameReviewEnabled, Is.False);
             Assert.That(options.MaxStarsPerRegion, Is.EqualTo(-1));
             Assert.That(options.InterpolationEnabled, Is.False);
         });
@@ -58,6 +61,8 @@ public class InspectorOptionsTests {
         var (options, store, _) = Build();
         options.StepCount = 5;
         options.StepSize = 50;
+        options.SignalAmplification = 3;
+        options.CenterFocuserBeforeRun = true;
         options.FramesPerPoint = 3;
         options.NumRegionsWide = 9;
         options.SimpleExposureSeconds = 2.5;
@@ -80,11 +85,14 @@ public class InspectorOptionsTests {
         options.UseRANSAC = false;
         options.SaveImagesOnReruns = true;
         options.SaveAlignmentImages = true;
+        options.FrameReviewEnabled = true;
         options.MaxStarsPerRegion = 50;
 
         Assert.Multiple(() => {
             Assert.That(store.Snapshot[nameof(InspectorOptions.StepCount)], Is.EqualTo(5));
             Assert.That(store.Snapshot[nameof(InspectorOptions.StepSize)], Is.EqualTo(50));
+            Assert.That(store.Snapshot[nameof(InspectorOptions.SignalAmplification)], Is.EqualTo(3));
+            Assert.That(store.Snapshot[nameof(InspectorOptions.CenterFocuserBeforeRun)], Is.True);
             Assert.That(store.Snapshot[nameof(InspectorOptions.FramesPerPoint)], Is.EqualTo(3));
             Assert.That(store.Snapshot[nameof(InspectorOptions.SimpleExposureSeconds)], Is.EqualTo(2.5));
             Assert.That(store.Snapshot[nameof(InspectorOptions.DetailedAnalysisExposureSeconds)], Is.EqualTo(4.0));
@@ -107,6 +115,7 @@ public class InspectorOptionsTests {
             Assert.That(store.Snapshot[nameof(InspectorOptions.UseRANSAC)], Is.False);
             Assert.That(store.Snapshot[nameof(InspectorOptions.SaveImagesOnReruns)], Is.True);
             Assert.That(store.Snapshot[nameof(InspectorOptions.SaveAlignmentImages)], Is.True);
+            Assert.That(store.Snapshot[nameof(InspectorOptions.FrameReviewEnabled)], Is.True);
             Assert.That(store.Snapshot[nameof(InspectorOptions.MaxStarsPerRegion)], Is.EqualTo(50));
         });
     }
@@ -131,6 +140,17 @@ public class InspectorOptionsTests {
         var (options, _, _) = Build();
         options.CornersROI = assigned;
         Assert.That(options.CornersROI, Is.EqualTo(expected));
+    }
+
+    [TestCase(-5, 1)]
+    [TestCase(0, 1)]
+    [TestCase(1, 1)]
+    [TestCase(2, 2)]
+    [TestCase(4, 4)]
+    public void SignalAmplification_ClampsToAtLeastOne(int assigned, int expected) {
+        var (options, _, _) = Build();
+        options.SignalAmplification = assigned;
+        Assert.That(options.SignalAmplification, Is.EqualTo(expected));
     }
 
     [Test]
@@ -162,6 +182,8 @@ public class InspectorOptionsTests {
         options.NumRegionsWide = 10;
         options.SensorROI = 0.5;
         options.MouseOnChartsEnabled = false;
+        options.SignalAmplification = 4;
+        options.CenterFocuserBeforeRun = true;
 
         options.ResetDefaults();
 
@@ -171,14 +193,19 @@ public class InspectorOptionsTests {
             Assert.That(options.SensorROI, Is.EqualTo(1.0));
             Assert.That(options.MouseOnChartsEnabled, Is.True);
             Assert.That(options.InterpolationAmount, Is.EqualTo(InterpolationAmountEnum.Medium));
+            Assert.That(options.SignalAmplification, Is.EqualTo(2));
+            Assert.That(options.CenterFocuserBeforeRun, Is.False);
         });
     }
 
     [TestCase(nameof(InspectorOptions.StepCount), 4)]
+    [TestCase(nameof(InspectorOptions.SignalAmplification), 3)]
+    [TestCase(nameof(InspectorOptions.CenterFocuserBeforeRun), true)]
     [TestCase(nameof(InspectorOptions.LoopingExposureAnalysisEnabled), true)]
     [TestCase(nameof(InspectorOptions.MicronsPerFocuserStep), 2.5)]
     [TestCase(nameof(InspectorOptions.SensorROI), 0.6)]
     [TestCase(nameof(InspectorOptions.UseRANSAC), false)]
+    [TestCase(nameof(InspectorOptions.FrameReviewEnabled), true)]
     [TestCase(nameof(InspectorOptions.MaxStarsPerRegion), 30)]
     public void Setter_RaisesPropertyChanged(string propertyName, object newValue) {
         var (options, _, _) = Build();
@@ -224,6 +251,53 @@ public class InspectorOptionsTests {
         options.ResetDefaults();
 
         Assert.That(options.AcceptableRSquaredMin, Is.EqualTo(0.05));
+    }
+
+    [Test]
+    public void StepCount_ContaminatedByOldTimeoutBug_ResetsToDefaultAndHealsStore() {
+        // Profiles written by builds with the old TimeoutSeconds bug can hold a timeout value (e.g. 300)
+        // under the StepCount key. Load must reset it to -1 (use profile default) AND write the
+        // correction back through the accessor so the store is healed.
+        var profile = Substitute.For<IProfileService>();
+        var store = new InMemoryPluginOptionsAccessor();
+        store.SetValueInt32(nameof(InspectorOptions.StepCount), 300);
+
+        var options = new InspectorOptions(profile, store);
+
+        Assert.Multiple(() => {
+            Assert.That(options.StepCount, Is.EqualTo(-1));
+            Assert.That(store.GetValueInt32(nameof(InspectorOptions.StepCount), -999), Is.EqualTo(-1));
+        });
+    }
+
+    [TestCase(-1)]
+    [TestCase(4)]
+    [TestCase(20)]
+    public void StepCount_PlausibleStoredValues_SurviveLoadUnchanged(int stored) {
+        var profile = Substitute.For<IProfileService>();
+        var store = new InMemoryPluginOptionsAccessor();
+        store.SetValueInt32(nameof(InspectorOptions.StepCount), stored);
+
+        var options = new InspectorOptions(profile, store);
+
+        Assert.That(options.StepCount, Is.EqualTo(stored));
+    }
+
+    [Test]
+    public void TimeoutSeconds_PersistsUnderItsOwnKey() {
+        var (options, store, _) = Build();
+        options.TimeoutSeconds = 120;
+        Assert.Multiple(() => {
+            Assert.That(store.GetValueInt32(nameof(InspectorOptions.TimeoutSeconds), -999), Is.EqualTo(120));
+            Assert.That(store.GetValueInt32(nameof(InspectorOptions.StepCount), -999), Is.EqualTo(-999),
+                "TimeoutSeconds must not clobber the StepCount key");
+        });
+    }
+
+    [Test]
+    public void CenterFocuserBeforeRun_DefaultsToOff() {
+        var (options, _, _) = Build();
+        Assert.That(options.CenterFocuserBeforeRun, Is.False);
     }
 
     [Test]

@@ -124,7 +124,10 @@
                                 <RowDefinition />
                                 <RowDefinition />
                             </Grid.RowDefinitions>
-                            <StackPanel Grid.Column="0" Orientation="Vertical">
+                            <!--  The "Optimize Star Detection" button now lives INSIDE the options ContentControl
+                                  (HocusFocus_StarDetection_Options) so it centers over the settings' label/value
+                                  columns. Only "Reset Defaults" stays host-side (the dock VM has no reset command).  -->
+                            <StackPanel Grid.Column="0" HorizontalAlignment="Left" Orientation="Vertical">
                                 <ContentControl Content="{Binding}" ContentTemplate="{StaticResource HocusFocus_StarDetection_Options}" />
                                 <Button
                                     Margin="5"

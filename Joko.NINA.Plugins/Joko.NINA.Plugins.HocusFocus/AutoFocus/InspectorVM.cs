@@ -19,6 +19,7 @@ using NINA.Core.Model;
 using NINA.Core.Model.Equipment;
 using NINA.Core.Utility;
 using NINA.Core.Utility.Notification;
+using NINA.Core.Utility.WindowService;
 using NINA.Equipment.Equipment;
 using NINA.Equipment.Equipment.MyCamera;
 using NINA.Equipment.Equipment.MyFocuser;
@@ -28,11 +29,15 @@ using NINA.Equipment.Interfaces.ViewModel;
 using NINA.Equipment.Model;
 using NINA.Image.ImageAnalysis;
 using NINA.Image.Interfaces;
+using NINA.Joko.Plugins.HocusFocus.AutoFocus.Replay;
+using NINA.Joko.Plugins.HocusFocus.AutoFocus.Review;
 using NINA.Joko.Plugins.HocusFocus.Controls;
 using NINA.Joko.Plugins.HocusFocus.Inspection;
 using NINA.Joko.Plugins.HocusFocus.Interfaces;
 using NINA.Joko.Plugins.HocusFocus.Scottplot;
 using NINA.Joko.Plugins.HocusFocus.StarDetection;
+using NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization.Review;
+using NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard;
 using NINA.Joko.Plugins.HocusFocus.Utility;
 using NINA.Profile.Interfaces;
 using NINA.WPF.Base.Interfaces.Mediator;
@@ -57,6 +62,8 @@ using System.Windows;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using RelayCommand = CommunityToolkit.Mvvm.Input.RelayCommand;
+using AsyncRelayCommand = CommunityToolkit.Mvvm.Input.AsyncRelayCommand;
 using static NINA.Joko.Plugins.HocusFocus.Inspection.SensorModel;
 using DrawingColor = System.Drawing.Color;
 using Logger = NINA.Core.Utility.Logger;
@@ -89,6 +96,25 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
         private readonly IApplicationDispatcher applicationDispatcher;
         private readonly IProgress<ApplicationStatus> progress;
         private readonly ITiltAdapterOptions tiltAdapterOptions;
+
+        // WindowServiceFactory is not a MEF export (NINA exposes the concrete type with a default ctor only), so it
+        // is instantiated directly here, mirroring HocusFocusPlugin — used to show the modal Review Frames dialog.
+        private readonly IWindowServiceFactory windowServiceFactory = new WindowServiceFactory();
+
+        // SignalAmplificationSummary reads the ACTIVE profile's FocuserSettings; these track the settings
+        // object currently subscribed so in-place edits refresh the summary and profile swaps re-hook cleanly.
+        private readonly System.ComponentModel.PropertyChangedEventHandler focuserSettingsHandler;
+        private IFocuserSettings hookedFocuserSettings;
+
+        private void HookActiveProfileFocuserSettings() {
+            if (hookedFocuserSettings != null) {
+                hookedFocuserSettings.PropertyChanged -= focuserSettingsHandler;
+            }
+            hookedFocuserSettings = profileService?.ActiveProfile?.FocuserSettings;
+            if (hookedFocuserSettings != null) {
+                hookedFocuserSettings.PropertyChanged += focuserSettingsHandler;
+            }
+        }
 
         [ImportingConstructor]
         public InspectorVM(
@@ -159,6 +185,29 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             TiltModel = new TiltModel(inspectorOptions);
             SensorModel = new SensorModel(profileService, inspectorOptions, autoFocusOptions, alglibAPI);
 
+            inspectorOptions.PropertyChanged += (s, e) => {
+                if (e.PropertyName == nameof(IInspectorOptions.SignalAmplification) ||
+                    e.PropertyName == nameof(IInspectorOptions.StepCount) ||
+                    e.PropertyName == nameof(IInspectorOptions.FramesPerPoint)) {
+                    RaisePropertyChanged(nameof(SignalAmplificationSummary));
+                }
+            };
+            // SignalAmplificationSummary also reads the active profile's FocuserSettings (offset steps /
+            // frames per point), which the user can edit in place without swapping profiles —
+            // ProfileChanged alone would leave the summary stale. Track the active profile's
+            // FocuserSettings and re-hook on every profile change (unsubscribe old, subscribe new).
+            focuserSettingsHandler = (s, e) => {
+                if (e.PropertyName == nameof(IFocuserSettings.AutoFocusInitialOffsetSteps) ||
+                    e.PropertyName == nameof(IFocuserSettings.AutoFocusNumberOfFramesPerPoint)) {
+                    RaisePropertyChanged(nameof(SignalAmplificationSummary));
+                }
+            };
+            HookActiveProfileFocuserSettings();
+            profileService.ProfileChanged += (s, e) => {
+                HookActiveProfileFocuserSettings();
+                RaisePropertyChanged(nameof(SignalAmplificationSummary));
+            };
+
             this.tiltAdapterOptions = tiltAdapterOptions;
             TiltGuidance = new TiltAdapterGuidanceVM();
             if (tiltAdapterOptions != null) {
@@ -169,14 +218,15 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             ImageGeometry = (System.Windows.Media.GeometryGroup)dict["InspectorSVG"];
             ImageGeometry.Freeze();
 
-            RunAutoFocusAnalysisCommand = new AsyncCommand<bool>(() => AnalyzeAutoFocusImpl(true), canExecute: (o) => !AnalysisRunning() && CameraInfo.Connected && FocuserInfo.Connected);
-            RunExposureAnalysisCommand = new AsyncCommand<bool>(AnalyzeExposure, canExecute: (o) => !AnalysisRunning() && CameraInfo.Connected);
-            RerunSavedAutoFocusAnalysisCommand = new AsyncCommand<bool>(AnalyzeSavedAutoFocusRun, canExecute: (o) => !AnalysisRunning());
-            ClearAnalysesCommand = new RelayCommand(ClearAnalyses, canExecute: (o) => !AnalysisRunning());
+            RunAutoFocusAnalysisCommand = new AsyncRelayCommand(() => AnalyzeAutoFocusImpl(true), canExecute: () => !AnalysisRunning() && CameraInfo.Connected && FocuserInfo.Connected);
+            RunExposureAnalysisCommand = new AsyncRelayCommand(AnalyzeExposure, canExecute: () => !AnalysisRunning() && CameraInfo.Connected);
+            RerunSavedAutoFocusAnalysisCommand = new AsyncRelayCommand(AnalyzeSavedAutoFocusRun, canExecute: () => !AnalysisRunning());
+            ClearAnalysesCommand = new RelayCommand(ClearAnalyses, canExecute: () => !AnalysisRunning());
             CancelAnalyzeCommand = new RelayCommand(CancelAnalyze);
-            SlewToZenithEastCommand = new AsyncCommand<bool>(() => SlewToZenith(false), canExecute: (o) => TelescopeInfo.Connected && (slewToZenithTask == null || slewToZenithTask?.Status >= TaskStatus.RanToCompletion));
-            SlewToZenithWestCommand = new AsyncCommand<bool>(() => SlewToZenith(true), canExecute: (o) => TelescopeInfo.Connected && (slewToZenithTask == null || slewToZenithTask?.Status >= TaskStatus.RanToCompletion));
-            CancelSlewToZenithCommand = new RelayCommand((o) => slewToZenithCts?.Cancel());
+            SlewToZenithEastCommand = new AsyncRelayCommand(() => SlewToZenith(false), canExecute: () => TelescopeInfo.Connected && (slewToZenithTask == null || slewToZenithTask?.Status >= TaskStatus.RanToCompletion));
+            SlewToZenithWestCommand = new AsyncRelayCommand(() => SlewToZenith(true), canExecute: () => TelescopeInfo.Connected && (slewToZenithTask == null || slewToZenithTask?.Status >= TaskStatus.RanToCompletion));
+            CancelSlewToZenithCommand = new RelayCommand(() => slewToZenithCts?.Cancel());
+            ReviewFramesCommand = new RelayCommand(ShowFrameReview, canExecute: () => ReviewFramesAvailable);
         }
 
         private bool AnalysisRunning() {
@@ -193,13 +243,32 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
         private CancellationTokenSource analyzeCts;
         private Task<bool> analyzeTask;
 
-        public async Task<bool> AnalyzeAutoFocus(CancellationToken token, bool captureCameraBlock = false) {
-            var task = AnalyzeAutoFocusImpl(captureCameraBlock);
+        // Folder of the most recent AutoFocus run (the engine's timestamped attempt root, == result.SaveFolder).
+        // Set after a successful run that saved frames; null/empty when the last run did not save. The Tilt
+        // Adapter Wizard reads this to record each calibration step's saved location for later replay.
+        public string LastSaveFolder { get; private set; }
+
+        public async Task<bool> AnalyzeAutoFocus(CancellationToken token, bool captureCameraBlock = false, AutoFocusSaveOverride saveOverride = null) {
+            var task = AnalyzeAutoFocusImpl(captureCameraBlock, saveOverride);
             token.Register(() => analyzeCts?.Cancel());
             return await task;
         }
 
-        public async Task<bool> AnalyzeAutoFocusFromSaved(CancellationToken token, Action onFolderSelected = null) {
+        /// <summary>
+        /// Re-analyzes a saved AutoFocus attempt from an explicit folder path (no folder-picker dialog), for
+        /// replaying a saved calibration step. The folder should be the engine's attempt root (the level that
+        /// contains a single <c>attempt*</c> subfolder), i.e. <see cref="LastSaveFolder"/> from the original run.
+        /// </summary>
+        public async Task<bool> AnalyzeAutoFocusFromSavedPath(string folderPath, CancellationToken token, IStarDetectionOptions starDetectionOptionsOverride = null) {
+            if (string.IsNullOrEmpty(folderPath)) {
+                return false;
+            }
+            var task = AnalyzeAutoFocusFromSavedImpl(folderPath, starDetectionOptionsOverride: starDetectionOptionsOverride);
+            token.Register(() => analyzeCts?.Cancel());
+            return await task;
+        }
+
+        public async Task<bool> AnalyzeAutoFocusFromSaved(CancellationToken token, Action onFolderSelected = null, AutoFocusSaveOverride saveOverride = null) {
             string folderPath;
             using (var dialog = new System.Windows.Forms.FolderBrowserDialog()) {
                 if (!String.IsNullOrEmpty(autoFocusOptions.LastSelectedLoadPath)) {
@@ -212,12 +281,12 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                 autoFocusOptions.LastSelectedLoadPath = folderPath;
             }
             onFolderSelected?.Invoke();
-            var task = AnalyzeAutoFocusFromSavedImpl(folderPath);
+            var task = AnalyzeAutoFocusFromSavedImpl(folderPath, saveOverride);
             token.Register(() => analyzeCts?.Cancel());
             return await task;
         }
 
-        private async Task<bool> AnalyzeAutoFocusFromSavedImpl(string folderPath) {
+        private async Task<bool> AnalyzeAutoFocusFromSavedImpl(string folderPath, AutoFocusSaveOverride saveOverride = null, IStarDetectionOptions starDetectionOptionsOverride = null) {
             var localAnalyzeTask = analyzeTask;
             if (localAnalyzeTask != null && !localAnalyzeTask.IsCompleted) {
                 Notification.ShowError("Analysis still in progress");
@@ -240,9 +309,20 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             }
 
             Logger.Info($"Rerunning auto focus attempt from {folderPath}");
+            bool suppressAuxiliaryFiles = saveOverride?.SuppressAuxiliaryFiles == true;
             localAnalyzeTask = Task.Run(async () => {
+                // A rerun re-analyzes existing frames and never captures, so the engine cannot write raw frames to a
+                // new location. Leave the engine save OFF (no annotated/JSON artifacts) and, on success, copy the
+                // source raw frames into the requested per-step folder so the calibration run stays replayable.
                 var options = GetAutoFocusEngineOptions(autoFocusEngine, savedAttempt);
-                var sensorCurveModelEnabled = inspectorOptions.SensorCurveModelEnabled;
+                // Headless (Tilt Adapter Wizard) replay: when a capture-time detection snapshot is supplied, replay
+                // uses it without mutating the profile; null = current settings. Never prompts from this path.
+                options.StarDetectionOptionsOverride = starDetectionOptionsOverride;
+                // This path re-analyzes existing frames and manages its own replayable copy via CopySavedFramesForReplay;
+                // keep the engine save OFF so it neither writes auxiliary artifacts nor a replay metadata.json into the
+                // global save path during tilt calibration replay.
+                options.Save = false;
+                var sensorCurveModelEnabled = ResolveSensorCurveModelEnabled();
                 var regions = GetStarDetectionRegions(options, sensorCurveModelEnabled: sensorCurveModelEnabled);
 
                 autoFocusEngine.Started += AutoFocusEngine_Started;
@@ -256,6 +336,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                 ResetErrors();
                 ResetExposureAnalysis();
 
+                LastSaveFolder = null;
                 var result = await autoFocusEngine.RerunWithRegions(options, savedAttempt, imagingFilter, regions, localAnalyzeCts.Token, this.progress);
                 if (result == null) {
                     InspectorErrorText = "AutoFocus Analysis Failed";
@@ -263,12 +344,15 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                     return false;
                 }
 
-                var analysisResult = await AnalyzeAutoFocusResult(options, result, sensorCurveModelEnabled: sensorCurveModelEnabled, ct: localAnalyzeCts.Token, true);
+                var analysisResult = await AnalyzeAutoFocusResult(options, result, sensorCurveModelEnabled: sensorCurveModelEnabled, ct: localAnalyzeCts.Token, forRerun: true, suppressRegisteredImages: suppressAuxiliaryFiles);
                 if (!analysisResult) {
                     Notification.ShowError("AutoFocus Analysis Failed");
                     InspectorErrorText = "AutoFocus Analysis Failed";
                     DeactivateAutoFocusAnalysis();
                     return false;
+                }
+                if (saveOverride?.Save == true && !string.IsNullOrEmpty(saveOverride.SavePath)) {
+                    LastSaveFolder = CopySavedFramesForReplay(savedAttempt, saveOverride.SavePath);
                 }
                 ActivateTiltMeasurement();
                 return true;
@@ -294,7 +378,37 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             }
         }
 
-        private async Task<bool> AnalyzeAutoFocusImpl(bool captureCameraBlock) {
+        // Copies a saved attempt's raw exposure frames into a fresh AutoFocus_<ts>/attempt01 folder under
+        // <savePathRoot>, returning that AutoFocus_<ts> folder (the level a replay points at). Used by the Tilt
+        // Adapter Wizard so re-analyzing a saved run still produces a self-contained, replayable per-step folder.
+        // Best-effort: the tilt measurement has already succeeded by the time this runs, so any copy failure is
+        // logged and yields a null result (this step simply won't be replayable) rather than failing the step.
+        private static string CopySavedFramesForReplay(SavedAutoFocusAttempt savedAttempt, string savePathRoot) {
+            try {
+                var runFolder = Path.Combine(savePathRoot, $"AutoFocus_{DateTime.Now:yyyyMMdd_HHmmss}");
+                var attemptFolder = Path.Combine(runFolder, "attempt01");
+                Directory.CreateDirectory(attemptFolder);
+                int copied = 0;
+                foreach (var img in savedAttempt.SavedImages) {
+                    if (string.IsNullOrEmpty(img.Path) || !File.Exists(img.Path)) {
+                        continue;
+                    }
+                    var dest = Path.Combine(attemptFolder, Path.GetFileName(img.Path));
+                    File.Copy(img.Path, dest, overwrite: true);
+                    copied++;
+                }
+                if (copied == 0) {
+                    Logger.Warning($"No source frames could be copied to {runFolder}; this calibration step will not be replayable.");
+                    return null;
+                }
+                return runFolder;
+            } catch (Exception ex) {
+                Logger.Error(ex, "Failed to copy saved frames for replay; this calibration step will not be replayable");
+                return null;
+            }
+        }
+
+        private async Task<bool> AnalyzeAutoFocusImpl(bool captureCameraBlock, AutoFocusSaveOverride saveOverride = null) {
             var localAnalyzeTask = analyzeTask;
             if (localAnalyzeTask != null && !localAnalyzeTask.IsCompleted) {
                 Notification.ShowError("Analysis still in progress");
@@ -305,6 +419,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             var localAnalyzeCts = new CancellationTokenSource();
             analyzeCts = localAnalyzeCts;
 
+            bool suppressAuxiliaryFiles = saveOverride?.SuppressAuxiliaryFiles == true;
             localAnalyzeTask = Task.Run(async () => {
                 try {
                     if (captureCameraBlock) {
@@ -313,7 +428,18 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
 
                     var autoFocusEngine = autoFocusEngineFactory.Create();
                     var options = GetAutoFocusEngineOptions(autoFocusEngine);
-                    var sensorCurveModelEnabled = inspectorOptions.SensorCurveModelEnabled;
+                    if (saveOverride != null) {
+                        options.Save = saveOverride.Save;
+                        options.SavePath = saveOverride.SavePath;
+                        if (options.Save) {
+                            // Mirror GetAutoFocusEngineOptions: keep exposures so the run can be re-analyzed later.
+                            options.PreserveExposures = true;
+                            // A saved calibration run keeps only the raw frames — no per-region annotated TIFFs /
+                            // detection-result JSONs (and, below, no registered/alignment images).
+                            options.SaveExposuresOnly = suppressAuxiliaryFiles;
+                        }
+                    }
+                    var sensorCurveModelEnabled = ResolveSensorCurveModelEnabled();
                     var regions = GetStarDetectionRegions(options, sensorCurveModelEnabled: sensorCurveModelEnabled);
                     var imagingFilter = GetImagingFilter();
 
@@ -327,14 +453,44 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                     ActivateAutoFocusChart();
                     ResetErrors();
                     ResetExposureAnalysis();
+                    LastSaveFolder = null;
+
+                    // Pre-center the focuser at best focus before the detailed multi-region sweep, so the sweep
+                    // brackets focus symmetrically. This reduces extreme one-sided defocus frames that fail RANSAC
+                    // alignment and improves the per-star paraboloid fit the tilt is read from. A plain (single-region)
+                    // AutoFocus is run on a SEPARATE engine — no inspector chart wiring. It uses GetOptions() (profile
+                    // step size/count), so it is deliberately NOT signal-amplified: the finer steps are only needed for
+                    // the sensor-model run, a quick coarse centering pass is sufficient. The centering run is NEVER
+                    // saved (Save forced off, independent of the global AutoFocus save toggle and of any saveOverride):
+                    // only the actual sensor-model / per-tilt-step run that follows is persisted. Failure is non-fatal:
+                    // the detailed run proceeds from the current focuser position.
+                    if (inspectorOptions.CenterFocuserBeforeRun) {
+                        try {
+                            var centeringEngine = autoFocusEngineFactory.Create();
+                            var centeringOptions = centeringEngine.GetOptions();
+                            centeringOptions.Save = false;
+                            centeringOptions.PreserveExposures = false;
+                            this.progress.Report(new ApplicationStatus() { Status = "Centering focuser before sensor model run" });
+                            var centeringResult = await centeringEngine.Run(centeringOptions, imagingFilter, localAnalyzeCts.Token, this.progress);
+                            if (centeringResult == null || !centeringResult.Succeeded) {
+                                Logger.Warning("Centering AutoFocus did not succeed; continuing the sensor-model run from the current focuser position.");
+                            }
+                        } catch (OperationCanceledException) {
+                            throw;
+                        } catch (Exception ex) {
+                            Logger.Warning($"Centering AutoFocus failed: {ex.Message}; continuing the sensor-model run from the current focuser position.");
+                        }
+                    }
+
                     var result = await autoFocusEngine.RunWithRegions(options, imagingFilter, regions, localAnalyzeCts.Token, this.progress);
                     if (result == null) {
                         InspectorErrorText = "AutoFocus Analysis Failed";
                         DeactivateAutoFocusAnalysis();
                         return false;
                     }
+                    LastSaveFolder = result.SaveFolder;
 
-                    var autoFocusAnalysisResult = await AnalyzeAutoFocusResult(options, result, sensorCurveModelEnabled: sensorCurveModelEnabled, ct: localAnalyzeCts.Token);
+                    var autoFocusAnalysisResult = await AnalyzeAutoFocusResult(options, result, sensorCurveModelEnabled: sensorCurveModelEnabled, ct: localAnalyzeCts.Token, suppressRegisteredImages: suppressAuxiliaryFiles);
                     if (!autoFocusAnalysisResult) {
                         InspectorErrorText = "AutoFocus Analysis Failed. View saved AF report in the AutoFocus tab.";
                         Notification.ShowError("AutoFocus Analysis Failed. View saved AF report in the AutoFocus tab.");
@@ -390,12 +546,21 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
 
         private bool focuserStepSizeWarningShowed = false;
 
+        // When set (by the Tilt Adapter Wizard around its own calibration analyses), the per-star sensor-curve model
+        // (paraboloid) is generated even if the SensorCurveModelEnabled display option is off, so calibration can read
+        // its robust tilt. Transient and not persisted; the wizard sets it only for the duration of each analysis call.
+        public bool ForceSensorCurveModelGeneration { get; set; }
+
+        private bool ResolveSensorCurveModelEnabled() =>
+            inspectorOptions.SensorCurveModelEnabled || ForceSensorCurveModelGeneration;
+
         private async Task<bool> AnalyzeAutoFocusResult(
             AutoFocusEngineOptions options,
             AutoFocusResult result,
             bool sensorCurveModelEnabled,
             CancellationToken ct,
-            bool forRerun = false) {
+            bool forRerun = false,
+            bool suppressRegisteredImages = false) {
             if (result == null || !result.Succeeded) {
                 Logger.Error("Inspection analysis failed, due to failed AutoFocus");
                 return false;
@@ -407,6 +572,8 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                 Logger.Warning($"{invalidRegionCount} regions failed to produce a focus curve");
             }
 
+            // Resolve the definitive review request from the SAME flag that gates this block (capture-time flag on replay).
+            frameReviewRequestedForRun = IsFrameReviewRequested(inspectorOptions.FrameReviewEnabled, sensorCurveModelEnabled);
             if (sensorCurveModelEnabled) {
                 double focuserSizeMicrons = InspectorOptions.MicronsPerFocuserStep;
                 if (double.IsNaN(focuserSizeMicrons) || focuserSizeMicrons <= 0.0) {
@@ -419,22 +586,45 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                 }
 
                 var finalFocuserPosition = result.RegionResults[0].EstimatedFinalFocuserPosition;
-                await SensorModel.UpdateModel(
-                    FullSensorDetectedStars,
-                    fRatio: profileService.ActiveProfile.TelescopeSettings.FocalRatio,
-                    focuserSizeMicrons: focuserSizeMicrons,
-                    finalFocusPosition: finalFocuserPosition,
-                    stepSize: result.StepSize,
-                    progress,
-                    ct: ct);
+                try {
+                    await SensorModel.UpdateModel(
+                        FullSensorDetectedStars,
+                        fRatio: profileService.ActiveProfile.TelescopeSettings.FocalRatio,
+                        focuserSizeMicrons: focuserSizeMicrons,
+                        finalFocusPosition: finalFocuserPosition,
+                        stepSize: result.StepSize,
+                        progress,
+                        ct: ct);
 
-                if ((!forRerun) || (inspectorOptions.SaveImagesOnReruns)) {
-                    if (!String.IsNullOrEmpty(result.SaveFolder)) {
-                        await SaveRegisteredImages(result.SaveFolder,
-                            SensorModel.SensorModelResult.RegisteredStars,
-                            SensorModel.TrianglesByImage,
-                            SensorModel.ReferenceImage,
-                            inspectorOptions.SaveAlignmentImages);
+                    if (!suppressRegisteredImages && ((!forRerun) || (inspectorOptions.SaveImagesOnReruns))) {
+                        if (!String.IsNullOrEmpty(result.SaveFolder)) {
+                            await SaveRegisteredImages(result.SaveFolder,
+                                SensorModel.SensorModelResult.RegisteredStars,
+                                SensorModel.TrianglesByImage,
+                                SensorModel.ReferenceImage,
+                                inspectorOptions.SaveAlignmentImages);
+                        }
+                    }
+                } finally {
+                    // Build the Review Frames snapshot even if UpdateModel threw (failed/poor fit): the per-frame
+                    // detections + bitmaps are exactly what the user needs to "see why the fit looks wrong". The
+                    // builder handles a null/partial registration result gracefully. Don't let snapshot-build errors
+                    // mask the original UpdateModel exception. Skip on cancellation.
+                    if (frameReviewRequestedForRun && !ct.IsCancellationRequested) {
+                        try {
+                            List<SensorDetectedStars> framesForReview;
+                            lock (fullSensorDetectedStarsLock) {
+                                framesForReview = FullSensorDetectedStars.ToList();
+                            }
+                            reviewSnapshot = FrameReviewSnapshotBuilder.Build(
+                                framesForReview,
+                                SensorModel.SensorModelResult?.RegisteredStars,
+                                SensorModel.ReferenceImage,
+                                inspectorOptions.UseRANSAC);
+                            NotifyReviewFramesAvailabilityChanged();
+                        } catch (Exception snapEx) {
+                            Logger.Warning($"Failed to build Review Frames snapshot after model fit: {snapEx.Message}");
+                        }
                     }
                 }
             }
@@ -859,6 +1049,12 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             }
         }
 
+        // Pure retention decision: Review Frames needs both the user toggle on AND the resolved (capture-time on
+        // replay) sensor-curve-model flag that actually gates the snapshot build, so the two never disagree.
+        internal static bool IsFrameReviewRequested(bool frameReviewEnabled, bool resolvedSensorCurveModelEnabled) {
+            return frameReviewEnabled && resolvedSensorCurveModelEnabled;
+        }
+
         private AutoFocusEngineOptions GetAutoFocusEngineOptions(IAutoFocusEngine autoFocusEngine, SavedAutoFocusAttempt savedAutoFocusAttempt = null) {
             var options = autoFocusEngine.GetOptions(savedAutoFocusAttempt);
             if (inspectorOptions.FramesPerPoint > 0) {
@@ -870,17 +1066,70 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             if (inspectorOptions.StepSize > 0 && savedAutoFocusAttempt != null) {
                 options.AutoFocusStepSize = inspectorOptions.StepSize;
             }
+            // Signal amplification: capture more, finer-spaced points over the same sweep range by dividing the step
+            // size and multiplying the step count by the factor. Only meaningful for LIVE captures — a replay re-uses
+            // the saved frames' fixed focuser positions (savedAutoFocusAttempt != null), so those stay untouched.
+            ApplySignalAmplification(options, inspectorOptions.SignalAmplification, isLiveCapture: savedAutoFocusAttempt == null);
             if (inspectorOptions.TimeoutSeconds > 0) {
                 options.AutoFocusTimeout = TimeSpan.FromSeconds(inspectorOptions.TimeoutSeconds);
             }
             if (inspectorOptions.DetailedAnalysisExposureSeconds > 0) {
                 options.OverrideAutoFocusExposureTime = TimeSpan.FromSeconds(inspectorOptions.DetailedAnalysisExposureSeconds);
             }
-            if (options.Save) {
+            // Freeze the frame-review decision at run start (atomically with the retention decision). Review needs the
+            // per-frame images retained, which the engine only does when PreserveExposures is on; force it on for review
+            // even on non-saving runs. Applies to all run/rerun paths since they all build options through here.
+            // Force exposure retention whenever review is enabled; the definitive frameReviewRequestedForRun
+            // (which gates the snapshot build) is set in AnalyzeAutoFocusResult from the RESOLVED sensor-curve
+            // flag, because option (b) replay runs with the captured flag, not the live inspectorOptions one.
+            if (options.Save || inspectorOptions.FrameReviewEnabled) {
                 options.PreserveExposures = true;
             }
             return options;
         }
+
+        // Applies the Signal Amplification factor to a live sensor-model / tilt sweep: divides the focuser step size
+        // and multiplies the step count by the factor, so the same sweep range is covered with more, finer-spaced
+        // points (more signal, smaller defocus jumps between adjacent frames). No-op at factor <= 1 or on replay
+        // (isLiveCapture == false), since replay re-uses the saved frames' fixed focuser positions. Internal for tests.
+        internal static void ApplySignalAmplification(AutoFocusEngineOptions options, int signalAmplification, bool isLiveCapture) {
+            var amp = Math.Max(1, signalAmplification);
+            if (amp > 1 && isLiveCapture) {
+                options.AutoFocusInitialOffsetSteps *= amp;
+                options.AutoFocusStepSize = Math.Max(1, (int)Math.Round(options.AutoFocusStepSize / (double)amp));
+            }
+        }
+
+        // Estimated sweep size for one live sensor-model autofocus run at the given settings.
+        // points ≈ 2·offsetSteps·amp + 1 (the engine can extend a sweep, so callers label it "~");
+        // images = points × framesPerPoint. Returns (0, 0) when the inputs cannot be resolved.
+        internal static (int points, int images) EstimateImagesPerRun(
+            int stepCount, int framesPerPoint, int signalAmplification, int profileOffsetSteps, int profileFramesPerPoint) {
+            int offsetSteps = stepCount > 0 ? stepCount : profileOffsetSteps;
+            int frames = framesPerPoint > 0 ? framesPerPoint : profileFramesPerPoint;
+            if (offsetSteps <= 0 || frames <= 0) return (0, 0);
+            int amp = Math.Max(1, signalAmplification);
+            int points = 2 * offsetSteps * amp + 1;
+            return (points, points * frames);
+        }
+
+        // Prose shown beside the Signal Amplification control. Internal for tests.
+        internal static string BuildSignalAmplificationSummary(
+            int stepCount, int framesPerPoint, int signalAmplification, int profileOffsetSteps, int profileFramesPerPoint) {
+            var (points, images) = EstimateImagesPerRun(stepCount, framesPerPoint, signalAmplification, profileOffsetSteps, profileFramesPerPoint);
+            if (images <= 0) return string.Empty;
+            int frames = framesPerPoint > 0 ? framesPerPoint : profileFramesPerPoint;
+            return $"Each autofocus run will capture ~{images} images ({points} focus positions × {frames} exposure{(frames == 1 ? "" : "s")} each). " +
+                "Higher values collect more, finer-spaced points for a steadier fit on weak signal; a value of 1 runs a regular autofocus (fastest).";
+        }
+
+        public string SignalAmplificationSummary =>
+            BuildSignalAmplificationSummary(
+                inspectorOptions.StepCount,
+                inspectorOptions.FramesPerPoint,
+                inspectorOptions.SignalAmplification,
+                profileService.ActiveProfile.FocuserSettings.AutoFocusInitialOffsetSteps,
+                profileService.ActiveProfile.FocuserSettings.AutoFocusNumberOfFramesPerPoint);
 
         private StarDetectionRegion GetAutoFocusRegion(AutoFocusEngineOptions options) {
             var analysisParams = new StarDetectionParams() {
@@ -942,10 +1191,34 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             }
 
             Logger.Info($"Rerunning auto focus attempt from {selectedPath}");
+
+            // If the saved run has a metadata.json, prompt for how to replay (current settings / the run's
+            // capture-time settings in memory / update the profile to the captured settings). Resolved on the UI
+            // thread (the modal and any profile update raise INPC). No metadata ⇒ current behavior; cancel ⇒ abort.
+            var resolution = await AutoFocusReplayCoordinator.ResolveAsync(
+                windowServiceFactory,
+                applicationDispatcher,
+                profileService,
+                savedAttempt.FolderPath,
+                isInteractive: true,
+                () => GetAutoFocusEngineOptions(autoFocusEngine, savedAttempt),
+                texts: ReplaySettingsPromptTexts.Inspector);
+            if (resolution.Cancelled) {
+                return false;
+            }
+
             string outputFolder = null;
             localAnalyzeTask = Task.Run(async () => {
-                var options = GetAutoFocusEngineOptions(autoFocusEngine, savedAttempt);
-                var sensorCurveModelEnabled = inspectorOptions.SensorCurveModelEnabled;
+                var options = resolution.Options;
+                // The regions to analyze (and the sensor-curve-model flag that shapes them) are an Inspector
+                // (application) concern, not a captured one — always use the current Inspector grid so ANY saved run,
+                // including a single-region regular AutoFocus run, is analyzed across the Inspector's regions (a
+                // captured single region would otherwise leave RegionHFRs with one entry and crash the inspector
+                // report). Only the capture-time DETECTION settings (option b) are replayed, via
+                // options.StarDetectionOptionsOverride, which the explicit-region detection path applies regardless of
+                // which regions are used. ROI follows the regions: the Inspector grid uses the app's SensorROI/CornersROI
+                // and the AF region uses the app's crop (see GetAutoFocusRegion).
+                var sensorCurveModelEnabled = ResolveSensorCurveModelEnabled();
                 var regions = GetStarDetectionRegions(options, sensorCurveModelEnabled: sensorCurveModelEnabled);
 
                 autoFocusEngine.Started += AutoFocusEngine_Started;
@@ -1087,14 +1360,18 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             RegionPlotFocusPoints[e.RegionIndex].AddSorted(new DataPoint(e.FocuserPosition, e.Measurement.Measure), plotPointComparer);
 
             var focusPoints = RegionFocusPoints[e.RegionIndex];
-            focusPoints.AddSorted(new ScatterErrorPoint(e.FocuserPosition, e.Measurement.Measure, 0, Math.Max(0.001, e.Measurement.Stdev)), focusPointComparer);
+            focusPoints.AddSorted(new ScatterErrorPoint(e.FocuserPosition, e.Measurement.Measure, 0, AutoFocusEngine.SafeDisplayError(e.Measurement.Stdev)), focusPointComparer);
         }
 
         private void AutoFocusEngine_SubMeasurementPointCompleted(object sender, AutoFocusSubMeasurementPointCompletedEventArgs e) {
             if (e.RegionIndex == 6) {
                 var hfStarDetectionResult = e.StarDetectionResult as HocusFocusStarDetectionResult;
                 if (hfStarDetectionResult != null) {
-                    FullSensorDetectedStars.Add(new SensorDetectedStars(e.FocuserPosition, hfStarDetectionResult, e.Image));
+                    // SubMeasurementPointCompleted fires concurrently for different focuser positions, so guard the
+                    // List.Add against concurrent mutation. Order is irrelevant (consumers OrderBy(FocuserPosition)).
+                    lock (fullSensorDetectedStarsLock) {
+                        FullSensorDetectedStars.Add(new SensorDetectedStars(e.FocuserPosition, hfStarDetectionResult, e.Image));
+                    }
                 }
             }
         }
@@ -1261,7 +1538,17 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             BackfocusHFR = OuterHFR - InnerHFR;
         }
 
+        // The Inspector region report indexes RegionHFRs[1..5] (center = 1, corners = 2..5), so it needs the full
+        // Inspector grid of at least 6 regions. Extracted + internal so the precondition is unit-testable.
+        internal static bool HasInspectorRegionLayout(int regionCount) => regionCount >= 6;
+
         private void AutoFocusEngine_CompletedNoReport(object sender, AutoFocusCompletedEventArgs e) {
+            // The reprocess path now always uses the Inspector grid (>= 6 regions), but guard defensively so a run with
+            // fewer regions logs cleanly instead of throwing an unhandled IndexOutOfRange.
+            if (e.RegionHFRs == null || !HasInspectorRegionLayout(e.RegionHFRs.Count)) {
+                Logger.Warning($"Skipping inspector region report: expected the Inspector's >= 6 region grid but got {e.RegionHFRs?.Count ?? 0}. This run is not an Aberration Inspector run.");
+                return;
+            }
             var logReportBuilder = new StringBuilder();
             var centerHFR = e.RegionHFRs[1].EstimatedFinalHFR;
             var centerFocuser = e.RegionHFRs[1].EstimatedFinalFocuserPosition;
@@ -1297,7 +1584,10 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
         }
 
         private void ClearAnalysis() {
-            FullSensorDetectedStars.Clear();
+            lock (fullSensorDetectedStarsLock) {
+                FullSensorDetectedStars.Clear();
+            }
+            ClearReviewSnapshot();
             ClearPlots();
         }
 
@@ -1314,7 +1604,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             AutoFocusCompleted = false;
         }
 
-        private void CancelAnalyze(object o) {
+        private void CancelAnalyze() {
             analyzeCts?.Cancel();
         }
 
@@ -1333,10 +1623,12 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             slewToZenithCts = localCts;
 
             localTask = Task.Run(async () => {
-                var latitude = Angle.ByDegree(profileService.ActiveProfile.AstrometrySettings.Latitude);
-                var longitude = Angle.ByDegree(profileService.ActiveProfile.AstrometrySettings.Longitude);
+                var astrometry = profileService.ActiveProfile.AstrometrySettings;
+                var latitude = Angle.ByDegree(astrometry.Latitude);
+                var longitude = Angle.ByDegree(astrometry.Longitude);
                 var azimuth = west ? Angle.ByDegree(90) : Angle.ByDegree(270);
-                return await telescopeMediator.SlewToCoordinatesAsync(new TopocentricCoordinates(azimuth, Angle.ByDegree(89), latitude, longitude), localCts.Token);
+                var coordinates = new TopocentricCoordinates(azimuth, Angle.ByDegree(89), latitude, longitude, astrometry.Elevation);
+                return await telescopeMediator.SlewToTopocentricCoordinates(coordinates, localCts.Token);
             }, localCts.Token);
             slewToZenithTask = localTask;
 
@@ -1363,7 +1655,50 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
         public ICommand SlewToZenithWestCommand { get; private set; }
         public ICommand CancelSlewToZenithCommand { get; private set; }
 
+        // RelayCommand (not ICommand) so we can call NotifyCanExecuteChanged when the snapshot becomes (un)available.
+        public RelayCommand ReviewFramesCommand { get; private set; }
+
+        private readonly object fullSensorDetectedStarsLock = new object();
         private readonly List<SensorDetectedStars> FullSensorDetectedStars = new List<SensorDetectedStars>();
+
+        // The immutable per-frame review data built at the end of a sensor-model run when "Keep frames for Review" was
+        // on. Null until a qualifying run completes; cleared at run start and on Clear Analyses. frameReviewRequestedForRun
+        // freezes the toggle's value at run start (when PreserveExposures is decided) so a mid-run toggle change can't
+        // desync image retention from the snapshot build.
+        private FrameReviewSnapshot reviewSnapshot;
+        private bool frameReviewRequestedForRun;
+
+        /// <summary>Whether a completed sensor-model run produced reviewable frames (drives the "Review Frames" button).</summary>
+        public bool ReviewFramesAvailable => reviewSnapshot?.Frames.Count > 0;
+
+        // Raise the availability binding + re-evaluate the command, marshaled to the UI thread (the snapshot is built /
+        // cleared on the analysis background task). DispatchSynchronizationContext is a synchronous Send with a
+        // same-context fast path, so it is safe to call from either thread.
+        private void NotifyReviewFramesAvailabilityChanged() {
+            applicationDispatcher.DispatchSynchronizationContext(() => {
+                RaisePropertyChanged(nameof(ReviewFramesAvailable));
+                ReviewFramesCommand.NotifyCanExecuteChanged();
+            });
+        }
+
+        private void ClearReviewSnapshot() {
+            reviewSnapshot = null;
+            NotifyReviewFramesAvailabilityChanged();
+        }
+
+        // Shows the modal Review Frames dialog, mirroring HocusFocusPlugin.OptimizeStarDetection: the VM is presented in
+        // a ContentPresenter resolved by the implicit DataType DataTemplate for FrameReviewVM, and is disposed when the
+        // window closes (releasing the retained frame bitmaps).
+        private void ShowFrameReview() {
+            var snapshot = reviewSnapshot;
+            if (snapshot == null || snapshot.Frames.Count == 0) {
+                return;
+            }
+
+            // Release this VM's frozen snapshot bitmaps on close (F36) via the shared host's afterClosed callback.
+            var vm = new FrameReviewVM(snapshot);
+            ReviewDialogHost.Show(windowServiceFactory, vm, "Review Frames", ClearReviewSnapshot);
+        }
         public AsyncObservableCollection<ScatterErrorPoint>[] RegionFocusPoints { get; private set; }
         public AsyncObservableCollection<DataPoint>[] RegionPlotFocusPoints { get; private set; }
         public AsyncObservableCollection<DataPoint> RegionFinalFocusPoints { get; private set; }
@@ -1509,6 +1844,11 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             var guidance = new TiltAdapterGuidanceVM { ScrewCount = n };
 
             if (HasTiltAdapterCalibration) {
+                // σ resolved for the arrow rows; FillNumericGuidance resolves the same 0→default
+                // rule for the numeric rows.
+                int curvatureSign = tiltAdapterOptions.ScrewInwardCurvatureSign;
+                int resolvedSign = curvatureSign == 0 ? TiltScrewGeometry.DefaultScrewInwardCurvatureSign : curvatureSign;
+
                 var tiltPlane = TiltModel?.TiltPlaneModel;
                 if (tiltPlane != null) {
                     double a = tiltPlane.A;
@@ -1520,6 +1860,9 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                         angles[2] = tiltAdapterOptions.Screw3AngleDegrees;
                         if (n == 4) angles[3] = tiltAdapterOptions.Screw4AngleDegrees;
 
+                        // Per-screw CW-positive correction turns from the tilt plane. The arrows grid
+                        // shows the adapter MOTION those turns produce (⬆ = toward the objective), not
+                        // the rotation itself — the rotation glyphs on the numeric rows carry that.
                         var turns = new double[n];
                         for (int i = 0; i < n; i++) {
                             double theta = angles[i] * Math.PI / 180.0;
@@ -1532,7 +1875,9 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                             if (maxAbs < GuidanceNoiseThreshold) {
                                 tiltArrows[i] = "—";
                             } else {
-                                double ratio = turns[i] / maxAbs;
+                                // turns[i] is CW-positive (the stored response-convention angles encode
+                                // the rig direction), so adapter MOTION toward the objective = −σ·turns.
+                                double ratio = (-resolvedSign * turns[i]) / maxAbs;
                                 if (ratio >= GuidanceLargeArrowThreshold) tiltArrows[i] = "⬆";
                                 else if (ratio >= GuidanceMinArrowThreshold) tiltArrows[i] = "↑";
                                 else if (ratio <= -GuidanceLargeArrowThreshold) tiltArrows[i] = "⬇";
@@ -1548,12 +1893,12 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                     }
                 }
 
-                // Backfocus row: adjust curvature toward 0 using sensor model CurvatureEffectMicrons and ScrewInwardCurvatureSign.
-                // CurvatureEffectMicrons is in focuser-µm at the sensor corner — positive when C > 0.
-                // ScrewInwardCurvatureSign = +1 means turning all screws inward raises curvature; -1 means it lowers it.
-                // To reduce |curvature| toward 0: go inward when curvatureEffect and curvatureSign have opposite signs.
-                int curvatureSign = tiltAdapterOptions.ScrewInwardCurvatureSign;
-                if (curvatureSign != 0 && SensorModel?.DisplayedSensorModel != null) {
+                // Backfocus row: adapter MOTION needed to null the curvature effect. Toward the
+                // objective ⇔ the local best-focus position must decrease; the σ in "which rotation
+                // is needed" and the σ in "what a rotation does" cancel, so the motion arrow is
+                // sign(CurvatureEffectMicrons) — rig-independent physics (see
+                // docs/tilt-guidance-motion-arrows-design.md).
+                if (SensorModel?.DisplayedSensorModel != null) {
                     double curvatureEffectMicrons = SensorModel.SensorModelResult.CurvatureEffectMicrons;
                     double absMicrons = Math.Abs(curvatureEffectMicrons);
 
@@ -1561,9 +1906,9 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                     if (absMicrons < BackfocusNoiseThresholdMicrons) {
                         backfocusArrow = "—";
                     } else {
-                        bool needsInward = curvatureEffectMicrons * curvatureSign < 0;
-                        string bigArrow = needsInward ? "⬆" : "⬇";
-                        string smallArrow = needsInward ? "↑" : "↓";
+                        bool towardObjective = curvatureEffectMicrons > 0;
+                        string bigArrow = towardObjective ? "⬆" : "⬇";
+                        string smallArrow = towardObjective ? "↑" : "↓";
                         backfocusArrow = absMicrons >= BackfocusLargeArrowThresholdMicrons ? bigArrow : smallArrow;
                     }
 
@@ -1575,8 +1920,96 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                 }
             }
 
+            FillNumericGuidance(guidance, n);
+
+            // Direction legend only when the arrows/totals it annotates are actually on screen
+            // (the arrows grid is gated by HasTiltGuidance, the numeric totals by HasNumericGuidance).
+            // Otherwise the calibrated-but-unmeasured state would show a legend right under
+            // "Run a measurement to see guidance." with nothing to explain.
+            if (guidance.HasTiltGuidance || guidance.HasNumericGuidance) {
+                guidance.DirectionLegend = TiltAdapterGuidanceVM.BuildDirectionLegend(
+                    steps: tiltAdapterOptions.AdjustmentType == TiltAdjustmentType.StepperMotors,
+                    signIsMeasured: tiltAdapterOptions.ScrewInwardCurvatureSignIsMeasured);
+            }
+
             TiltGuidance = guidance;
             RaisePropertyChanged(nameof(TiltGuidance));
+        }
+
+        private const double PitchMismatchFraction = 0.15;
+
+        // Populate the precise per-screw turn/step amounts from the fitted paraboloid model and the
+        // configured adapter hardware. All three rows carry their own rotation direction (⟳/⟲ glyphs
+        // for screws, signed steps for steppers); the arrows grid above describes adapter MOTION
+        // (⬆ = toward the objective), not rotation. Everything is computed in axial best-focus microns
+        // (tilt = -TiltAt, backfocus = -CurvatureAt) then divided by the saved pitch/step size — there
+        // is no square root, the curvature term is already a length.
+        private void FillNumericGuidance(TiltAdapterGuidanceVM guidance, int n) {
+            if (!HasTiltAdapterCalibration) return;
+            var model = SensorModel?.DisplayedSensorModel;
+            if (model == null) return;
+
+            bool steps = tiltAdapterOptions.AdjustmentType == TiltAdjustmentType.StepperMotors;
+            double unitMicrons = steps ? tiltAdapterOptions.StepperStepSizeMicrons : tiltAdapterOptions.ThreadPitchMicrons;
+            double radiusMm = tiltAdapterOptions.ScrewRadiusMillimeters;
+            if (unitMicrons <= 0 || radiusMm <= 0) return;
+
+            double radiusMicrons = radiusMm * 1000.0;
+            // σ is never 0 from persisted options (defaulted since the direction-setting feature);
+            // resolve defensively to the assumed default so every row can carry a direction.
+            int curvatureSign = tiltAdapterOptions.ScrewInwardCurvatureSign;
+            int resolvedSign = curvatureSign == 0 ? TiltScrewGeometry.DefaultScrewInwardCurvatureSign : curvatureSign;
+
+            var angles = new double[n];
+            angles[0] = tiltAdapterOptions.Screw1AngleDegrees;
+            angles[1] = tiltAdapterOptions.Screw2AngleDegrees;
+            angles[2] = tiltAdapterOptions.Screw3AngleDegrees;
+            if (n == 4) angles[3] = tiltAdapterOptions.Screw4AngleDegrees;
+            if (angles.Any(double.IsNaN)) return;
+
+            var tiltText = new string[n];
+            var backText = new string[n];
+            var totalText = new string[n];
+            for (int i = 0; i < n; i++) {
+                var corr = TiltScrewGeometry.ScrewCorrectionMicrons(
+                    model.Gx, model.Gy, model.Kx, model.Ky, model.X0, model.Y0, angles[i], radiusMicrons);
+                tiltText[i] = TiltAdapterGuidanceVM.FormatAmount(corr.TiltMicrons / unitMicrons, steps);
+                backText[i] = TiltAdapterGuidanceVM.FormatAmount(resolvedSign * corr.BackfocusMicrons / unitMicrons, steps);
+                // The curvature sign applies ONLY to the backfocus component: the tilt component's
+                // direction is already encoded by the stored response-convention screw angle (the same
+                // convention the tilt arrows invert), so multiplying the whole total by the sign would
+                // double-apply the rig direction to the tilt part on sign = -1 rigs.
+                double totalSigned = TiltScrewGeometry.SignedTotalAdjustment(
+                    corr.TiltMicrons, corr.BackfocusMicrons, unitMicrons, resolvedSign);
+                totalText[i] = TiltAdapterGuidanceVM.FormatAmount(totalSigned, steps);
+            }
+
+            guidance.Screw1TiltAmount = tiltText[0];
+            guidance.Screw2TiltAmount = tiltText[1];
+            guidance.Screw3TiltAmount = tiltText[2];
+            if (n == 4) guidance.Screw4TiltAmount = tiltText[3];
+            guidance.Screw1BackfocusAmount = backText[0];
+            guidance.Screw2BackfocusAmount = backText[1];
+            guidance.Screw3BackfocusAmount = backText[2];
+            if (n == 4) guidance.Screw4BackfocusAmount = backText[3];
+            guidance.Screw1TotalAmount = totalText[0];
+            guidance.Screw2TotalAmount = totalText[1];
+            guidance.Screw3TotalAmount = totalText[2];
+            if (n == 4) guidance.Screw4TotalAmount = totalText[3];
+
+            guidance.UnitsAreSteps = steps;
+            guidance.HasNumericGuidance = true;
+
+            double measured = steps
+                ? tiltAdapterOptions.LastMeasuredStepperStepSizeMicrons
+                : tiltAdapterOptions.LastMeasuredThreadPitchMicrons;
+            if (TiltScrewGeometry.PitchMismatchExceeds(unitMicrons, measured, PitchMismatchFraction)) {
+                string label = steps ? "step size" : "thread pitch";
+                string units = steps ? "µm/step" : "µm/turn";
+                guidance.PitchMismatchWarning =
+                    $"Saved {label} ({unitMicrons:0.###} {units}) differs from the wizard's last measured value " +
+                    $"({measured:0.###} {units}). Re-run the Tilt Adapter Wizard or update the saved value.";
+            }
         }
 
         private TrendlineFitting GetLineFitting(AutoFocusFitting fitting) {
@@ -1865,7 +2298,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             }
         }
 
-        private void ClearAnalyses(object o) {
+        private void ClearAnalyses() {
             DeactivateAutoFocusAnalysis();
             ResetExposureAnalysis();
             AutoFocusChartActivatedOnce = false;
@@ -1875,6 +2308,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             AutoFocusCompleted = false;
             ResetErrors();
             RebuildTiltGuidance();
+            ClearReviewSnapshot();
         }
 
         private void ActivateAutoFocusChart() {
