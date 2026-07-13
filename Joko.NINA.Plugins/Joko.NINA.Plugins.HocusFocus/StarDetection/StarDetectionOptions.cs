@@ -113,12 +113,11 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection {
 
         private void DerivePresetSettings() {
             HotpixelFiltering = Simple_NoiseLevel != NoiseLevelEnum.None;
-            // F4: σ-based knobs are honest multiples of the measured image's σ. The old code measured σ on a
-            // blurred copy (~4× understated for white noise) on the Low/Typical path only, so the same knob value
-            // used to mean very different effective thresholds across noise presets. sensitivityScale compensates
-            // per preset so each preset's EFFECTIVE behavior is approximately unchanged (the real-data before/after
-            // sweep arbitrates the constant): ×0.2 where the mismatch existed, ×1 where σ was already honest
-            // (None: no blur; High: measurement noise reduction blurs the measured image itself).
+            // INTERIM (v3.0.0.26 revert): the F4 per-preset sensitivity compensation is DISABLED — sensitivityScale is
+            // held at 1.0 so BrightnessSensitivity reverts to its unscaled v3 base of 10.0 (and the WideRange /
+            // LongFocalLength deltas to an unscaled 2.0). CAVEAT: v4 measures honest σ (F4), ~4× larger than v3's
+            // blurred-σ estimate on Low/Typical, so a literal BrightnessSensitivity=10 is ~4× STRICTER there than v3's
+            // effective ~2.5σ. To re-enable F4, restore the two `sensitivityScale = 0.2;` lines in the switch below.
             double sensitivityScale = 1.0;
             switch (Simple_NoiseLevel) {
                 case NoiseLevelEnum.None:
@@ -129,13 +128,11 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection {
                 case NoiseLevelEnum.Low:
                     StarMeasurementNoiseReductionEnabled = false;
                     NoiseReductionRadius = 3;
-                    sensitivityScale = 0.2;
                     break;
 
                 case NoiseLevelEnum.Typical:
                     StarMeasurementNoiseReductionEnabled = false;
                     NoiseReductionRadius = 3;
-                    sensitivityScale = 0.2;
                     break;
 
                 case NoiseLevelEnum.High:
@@ -143,17 +140,18 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection {
                     NoiseReductionRadius = 5;
                     break;
             }
-            NoiseClippingMultiplier = 2.0; // structure-map binarize threshold: lowered 4→2 per the golden-set recall
-                                           // audit — candidate formation was the recall bottleneck (~79% of real
-                                           // stars never formed a candidate at 4σ). See docs/star-detection-golden-audit-cwhite-results.md
+            NoiseClippingMultiplier = 4.0; // INTERIM revert to v3.0.0.26 (was 2.0). Faithful revert: the binarize
+                                           // threshold uses the blurred structure-map σ in both v3 and v4, so the σ
+                                           // reference is identical across versions. Re-evaluate with the F4 recalibration.
             StarClippingMultiplier = 2.0; // uniform honest τ level, chosen empirically (F3) — see docs/sigma-consistency-f3-results.md
             StructureLayers = 4;
             BrightnessSensitivity = 10.0 * sensitivityScale;
             if (Simple_FocusRange == FocusRangeEnum.WideRange) {
                 StructureLayers += 1;
-                // As we get further from focus, we want to be more sensitive as the chance for bad data
-                // increases. BrightnessSensitivity is a threshold where SMALLER = more sensitive, so we LOWER it.
-                BrightnessSensitivity -= 2.0 * sensitivityScale;
+                // WideRange reaches heavier defocus, where small noise / donut-fragment detections (tiny HFRs)
+                // would corrupt the median HFR. BrightnessSensitivity is a threshold where SMALLER = more sensitive,
+                // so we RAISE it to reject those fragments (matches v3.0.0.26; see the design doc §14 for evidence).
+                BrightnessSensitivity += 2.0 * sensitivityScale;
             }
 
             MinStarBoundingBoxSize = 5;
@@ -165,9 +163,9 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection {
             } else if (Simple_PixelScale == PixelScaleEnum.LongFocalLength) {
                 StructureLayers += 1;
                 MinStarBoundingBoxSize += 1;
-                // Longer focal length spreads star flux over more pixels, so we want to be more sensitive.
-                // BrightnessSensitivity is a threshold where SMALLER = more sensitive, so we LOWER it.
-                BrightnessSensitivity -= 2.0 * sensitivityScale;
+                // Longer focal length spreads star flux over more pixels. RAISE BrightnessSensitivity (SMALLER =
+                // more sensitive) to reject faint fragments that would corrupt the HFR median (matches v3.0.0.26; §14).
+                BrightnessSensitivity += 2.0 * sensitivityScale;
             }
 
             if (HotpixelThresholdingEnabled && HotpixelFiltering) {
@@ -213,14 +211,14 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection {
             useAutoFocusCrop = optionsAccessor.GetValueBoolean("UseAutoFocusCrop", true);
             starMeasurementNoiseReductionEnabled = optionsAccessor.GetValueBoolean(nameof(StarMeasurementNoiseReductionEnabled), false);
             noiseReductionRadius = optionsAccessor.GetValueInt32("NoiseReductionRadius", 3);
-            noiseClippingMultiplier = optionsAccessor.GetValueDouble("NoiseClippingMultiplier", 2.0);
+            noiseClippingMultiplier = optionsAccessor.GetValueDouble("NoiseClippingMultiplier", 4.0);
             starClippingMultiplier = optionsAccessor.GetValueDouble("StarClippingMultiplier", 2.0);
             contaminationSensitivity = optionsAccessor.GetValueDouble("ContaminationSensitivity", 5.0);
             rejectContaminatedStars = optionsAccessor.GetValueBoolean("RejectContaminatedStars", true);
             structureLayers = optionsAccessor.GetValueInt32("StructureLayers", 4);
             defocusAwareStructure = optionsAccessor.GetValueBoolean("DefocusAwareStructure", false);
             structureLayerBoost = optionsAccessor.GetValueInt32("StructureLayerBoost", 0);
-            brightnessSensitivity = optionsAccessor.GetValueDouble("BrightnessSensitivity", 2.0);
+            brightnessSensitivity = optionsAccessor.GetValueDouble("BrightnessSensitivity", 10.0);
             starPeakResponse = optionsAccessor.GetValueDouble("StarPeakResponse", 0.75);
             maxDistortion = optionsAccessor.GetValueDouble("MaxDistortion", 0.5);
             defocusAwareGates = optionsAccessor.GetValueBoolean("DefocusAwareGates", false);
@@ -284,14 +282,14 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection {
             UseAutoFocusCrop = true;
             StarMeasurementNoiseReductionEnabled = false;
             NoiseReductionRadius = 3;
-            NoiseClippingMultiplier = 2.0; // lowered 4→2 per the golden-set recall audit (candidate-formation bottleneck)
+            NoiseClippingMultiplier = 4.0; // INTERIM revert to v3.0.0.26 (lockstep with the Simple preset + optimizer seed)
             StarClippingMultiplier = 2.0;
             ContaminationSensitivity = 5.0;
             RejectContaminatedStars = true;
             StructureLayers = 4;
             DefocusAwareStructure = false;
             StructureLayerBoost = 0;
-            BrightnessSensitivity = 2.0;
+            BrightnessSensitivity = 10.0; // INTERIM revert to v3.0.0.26 (lockstep with the Simple preset + optimizer seed)
             StarPeakResponse = 0.75;
             MaxDistortion = 0.5;
             DefocusAwareGates = false;
