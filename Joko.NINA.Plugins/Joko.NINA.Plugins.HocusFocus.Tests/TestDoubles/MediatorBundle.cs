@@ -9,10 +9,15 @@ using NINA.Image.ImageAnalysis;
 using NINA.Image.Interfaces;
 using NINA.Joko.Plugins.HocusFocus.AutoFocus;
 using NINA.Joko.Plugins.HocusFocus.Interfaces;
+using NINA.Joko.Plugins.HocusFocus.TiltAdapterDevices;
+using NINA.Joko.Plugins.HocusFocus.TiltAdapterDevices.Prompt;
 using NINA.Joko.Plugins.HocusFocus.Utility;
 using NINA.Profile.Interfaces;
 using NINA.WPF.Base.Interfaces.Mediator;
 using NSubstitute;
+using System;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace NINA.Joko.Plugins.HocusFocus.Tests.TestDoubles;
 
@@ -32,6 +37,7 @@ internal sealed class MediatorBundle {
     public IInspectorOptions InspectorOptions { get; } = Substitute.For<IInspectorOptions>();
     public IAutoFocusOptions AutoFocusOptions { get; } = Substitute.For<IAutoFocusOptions>();
     public ITiltAdapterOptions TiltAdapterOptions { get; } = Substitute.For<ITiltAdapterOptions>();
+    public IPerFilterStarDetectionStore PerFilterStarDetectionStore { get; } = Substitute.For<IPerFilterStarDetectionStore>();
 
     public IAutoFocusEngineFactory AutoFocusEngineFactory { get; } = Substitute.For<IAutoFocusEngineFactory>();
     public IPluggableBehaviorSelector<IStarDetection> StarDetectionSelector { get; } = Substitute.For<IPluggableBehaviorSelector<IStarDetection>>();
@@ -64,7 +70,16 @@ internal sealed class MediatorBundle {
         return this;
     }
 
-    public InspectorVM BuildInspectorVM() {
+    public MediatorBundle WithPerFilterStarDetectionEnabled(bool enabled = true) {
+        PerFilterStarDetectionStore.Enabled.Returns(enabled);
+        return this;
+    }
+
+    public InspectorVM BuildInspectorVM(
+        TiltDeviceConnectionService tiltDeviceConnectionService = null,
+        Func<string, string, Task<bool>> confirmPromptAsync = null,
+        Func<Func<bool, bool, TiltDevicePlanPreview>, bool, string, bool, double, Task<TiltDeviceAdjustmentChoice>> showAdjustmentPromptAsync = null,
+        Func<CancellationToken, Task<bool>> reRunAnalysisAsync = null) {
         return new InspectorVM(
             profileService: ProfileService,
             applicationStatusMediator: ApplicationStatusMediator,
@@ -83,7 +98,12 @@ internal sealed class MediatorBundle {
             starAnnotatorSelector: StarAnnotatorSelector,
             applicationDispatcher: ApplicationDispatcher,
             alglibAPI: AlglibAPI,
-            tiltAdapterOptions: TiltAdapterOptions);
+            tiltAdapterOptions: TiltAdapterOptions,
+            tiltDeviceConnectionService: tiltDeviceConnectionService,
+            confirmPromptAsync: confirmPromptAsync,
+            showAdjustmentPromptAsync: showAdjustmentPromptAsync,
+            reRunAnalysisAsync: reRunAnalysisAsync,
+            perFilterStarDetectionStore: PerFilterStarDetectionStore);
     }
 
     public HocusFocusVM BuildHocusFocusVM() {
@@ -97,6 +117,7 @@ internal sealed class MediatorBundle {
             applicationStatusMediator: ApplicationStatusMediator,
             starDetectionSelector: StarDetectionSelector,
             alglibAPI: AlglibAPI,
-            applicationDispatcher: ApplicationDispatcher);
+            applicationDispatcher: ApplicationDispatcher,
+            perFilterStore: PerFilterStarDetectionStore);
     }
 }

@@ -31,7 +31,7 @@ Turn on the parts you want. Go to **Options → Imaging → Image Options** and,
 
 - **Star Detector** — the improved detector (see [Star Detection](overview/star-detection.md)).
 - **Star Annotator** — the customizable overlay (see [Star Annotation](overview/star-annotation.md)).
-- **Autofocus** — the concurrent autofocus engine (see [Autofocus](overview/autofocus.md)).
+- **Auto Focus** — the concurrent autofocus engine (see [Autofocus](overview/autofocus.md)).
 
 ![The Image Options dropdowns set to Hocus Focus for Star Detector, Star Annotator, and Autofocus](assets/screenshots/image-options-all.png){ width=510 }
 
@@ -39,7 +39,7 @@ Turn on the parts you want. Go to **Options → Imaging → Image Options** and,
 
 !!! note "Some features need both"
     The autofocus engine and the Aberration Inspector require Hocus Focus to be selected for both
-    **Autofocus** and **Star Detector**. You can otherwise mix and match, for example keeping only the detector.
+    **Auto Focus** and **Star Detector**. You can otherwise mix and match, for example keeping only the detector.
 
 ## 3. Get a first autofocus working
 
@@ -72,8 +72,8 @@ this stage.*
 If the curve looks flat, the step size is too small. If stars vanish at the ends of the sweep, the step
 size is too large; reduce it, or set **Focus Range** to **Wide Range** so heavily defocused donut stars
 are still detected. If few stars are found even near focus, increase the exposure time. Narrowband
-filters in particular can need much longer autofocus exposures at first; the tip in step 6 shows how to
-work back down.
+filters in particular can need much longer autofocus exposures at first; step 7 shows how to bootstrap
+them and work the exposure back down.
 
 → Full detail: [Autofocus](overview/autofocus.md).
 
@@ -105,7 +105,7 @@ Now hand the saved run to the [Optimization Wizard](optimization/index.md). It r
 searching for the detection settings that produce the cleanest, most repeatable focus curve, and it
 never returns a result worse than your current settings.
 
-1. Launch the wizard from the top of the **Star Detection** options page.
+1. Launch the wizard from the top of the **Star Detector** tab.
 2. Choose your saved run as the source and keep the default objective, autofocus repeatability (leave
    **Optimize for aberration inspection** off).
 3. When the search finishes, review the improvement (reported relative to your current settings), press
@@ -118,21 +118,44 @@ computationally expensive and can take a while on a slow imaging computer.
 !!! tip "Run the wizard on another machine"
     The wizard works entirely from the saved folder, so it does not have to run on your imaging
     computer. Copy the `AutoFocus_*` folder to a faster machine with NINA and Hocus Focus installed, run
-    the wizard there, and press **Export** on the Star Detection options page. Back on the imaging
+    the wizard there, and press **Export** at the bottom of the **Star Detector** tab. Back on the imaging
     computer, **Import** the exported `.json` file, review exactly what will change, and apply. See
     [exporting and importing settings](settings/index.md#exporting-and-importing-star-detection-settings).
 
-!!! tip "Narrowband filters: start long, then shorten"
-    Through a narrowband filter, autofocus may need long exposures before enough stars appear. Get your
-    first working autofocus that way, capture saved runs, and optimize. Then shorten the exposure as far
-    as autofocus keeps working; a properly tuned detector can handle much fainter stars than the
-    defaults. Save a run at the shorter exposure and optimize once more. The wizard tunes against the
-    run you feed it, so make the final pass use the exposure time, filter, and settings you will
-    actually autofocus with during imaging.
-
 → Full detail: [Star Detection Optimization](optimization/index.md).
 
-## 7. If you run into trouble
+## 7. Narrowband filters: tune with a live sweep
+
+Skip this step unless you autofocus through narrowband filters. Through Hα, OIII, or SII, so few
+stars appear that autofocus often will not converge at all, which leaves you with no saved run for
+the wizard to replay. The wizard's **Live Auto-Focus** source breaks that deadlock: instead of
+replaying a run, it captures one, without needing a working autofocus first.
+
+Reach focus manually before starting (a Bahtinov mask or a careful manual pass is fine); the sweep
+is centered on the current focuser position, so it has to begin near focus. Then, in the wizard:
+
+1. Choose **Live Auto-Focus** as the **Source**, and set the **Exposure**. Start with an exposure
+   time you know shows stars through this filter, even if it is far longer than you would ever
+   autofocus with. The sweep needs stars visible out at its defocused ends, and a too-short
+   exposure just produces empty frames that nothing can be tuned against.
+2. Choose the folder to **Save captured frames to** and press **Start**. The wizard sweeps the
+   focuser across a fixed range (built from your profile's auto-focus step size and offset steps),
+   saves an image at every point whether or not any stars are detected, returns the focuser to
+   where it started, and then searches for the detection settings that build the cleanest focus
+   curve from those frames.
+3. Once a run succeeds, run it again with a shorter exposure, and keep shortening until the result
+   degrades. This finds how far you can push this filter: a well-tuned detector handles much
+   fainter stars than the defaults, and narrowband autofocus exposures often end up several times
+   shorter than the safe starting value.
+4. Finish with the exposure you will actually autofocus with. On the summary, turn on **Apply
+   these auto-focus settings to my profile when I click Accept**: along with the recommended step
+   size, it writes the sweep's exposure into your profile as the auto-focus exposure time, so you
+   focus with the exposure you optimized against.
+
+→ Full detail: the live-run walkthrough in
+[Star Detection Optimization](optimization/index.md#saved-and-live-sources).
+
+## 8. If you run into trouble
 
 Saved runs replay deterministically, so sharing one lets the plugin author reproduce exactly what your
 rig did, frame by frame. If autofocus misbehaves or a result looks wrong:
@@ -155,10 +178,14 @@ With autofocus working and tuned, the same detector and saved-run machinery feed
   tilt, backfocus error, and field curvature. Consider first re-running the
   [Optimization Wizard](optimization/index.md) with **Optimize for aberration inspection** turned on: it
   tunes detection to recover many more stars across the whole frame, which is what the tilt model needs.
-  → [Tilt &amp; Aberration Inspector](overview/tilt-aberration-inspector.md)
+  → [Tilt & Aberration Inspector](overview/tilt-aberration-inspector.md)
 - **If you have a tilt adapter, calibrate it.** The **Tilt Adapter Wizard** learns where each screw sits
   relative to your sensor and how far a turn moves it, turning tilt measurements into concrete
   screw-turn guidance. → [Tilt Adapter Wizard](overview/tilt-adapter-wizard.md)
+- **Practice in the daytime.** The **Camera Simulator** renders realistic star fields from an ASTAP
+  star database, complete with defocus, donuts, and injectable sensor tilt, so you can test autofocus
+  settings or rehearse a full tilt calibration with no sky at all.
+  → [Camera Simulator](overview/camera-simulator.md)
 - **Customize the annotation overlay**: colors, fonts, and what gets drawn over accepted and rejected
   stars. → [Star Annotation](overview/star-annotation.md)
 - **Go deeper on the settings.** Every detection knob, and everything the optimizer searches over, is

@@ -6,7 +6,7 @@ Before Hocus Focus can find and measure stars, it has to decide what is *signal*
 2. **Thresholding** — how far above the noise floor a pixel must sit to count as a star candidate (`NoiseClippingMultiplier`, applied as a per-region surface when `LocallyAdaptiveBinarization` is on) or to be included in a star's flux/HFR measurement (`StarClippingMultiplier`).
 3. **Sub-pixel sampling** — how finely star centers and HFR are sampled between whole pixels (`PixelSampleSize`).
 
-A key idea runs through all of these: Hocus Focus keeps **two images**. A *structure-detection image* is used to find where the candidate stars are, and a *measurement image* is used to measure each star's centroid, flux, HFR, and PSF. By default the noise reduction is applied **only** to the structure-detection image, so candidate-finding is robust to noise while the measurements stay on the sharp, unblurred pixels.
+A key idea runs through all of these: Hocus Focus keeps **two images**. A *structure-detection image* is used to find where the candidate stars are, and a *measurement image* is used to measure each star's centroid, flux, HFR, and PSF. By default the noise reduction is applied **only** to the structure-detection image, so candidate-finding tolerates noise while the measurements stay on the sharp, unblurred pixels.
 
 ![The preprocessing and noise settings highlighted in the advanced Star Detector list](../assets/screenshots/advanced-preprocessing.png){ width=375 }
 
@@ -15,13 +15,13 @@ A key idea runs through all of these: Hocus Focus keeps **two images**. A *struc
 !!! note
     These are **Advanced** settings. In Simple mode they are derived for you from the **Noise Level**, **Pixel Scale**, and **Focus Range** presets, so you normally never touch them directly. Switch on Advanced mode to expose them.
 
-## Summary
+## Settings at a glance
 
 | Setting | Default | Range | Effect |
 |---|---|---|---|
 | Noise Reduced Star Measurement (`StarMeasurementNoiseReductionEnabled`) | Off | On / Off | Also blur the *measurement* image, not just the structure-detection image |
 | Noise Reduction Radius (`NoiseReductionRadius`) | 3 | ≥ 0 (UI requires > 0) | Half-size of the Gaussian blur applied for noise reduction |
-| Noise Clipping Multiplier (`NoiseClippingMultiplier`) | 2.0 | ≥ 0 (UI requires > 0) | σ multiplier for the structure-map binarization floor (candidate finding) |
+| Noise Clipping Multiplier (`NoiseClippingMultiplier`) | 4.0 | ≥ 0 (UI requires > 0) | σ multiplier for the structure-map binarization floor (candidate finding) |
 | Locally Adaptive Binarization (`LocallyAdaptiveBinarization`) | On | On / Off | Make the binarization floor a per-region surface instead of one global value |
 | Adaptive Noise Block Size (`AdaptiveNoiseBlockSize`) | 128 px | 64–256 (UI) | Block size for the adaptive floor's local statistics |
 | Star Clipping Multiplier (`StarClippingMultiplier`) | 2.0 | ≥ 0 (UI requires > 0) | σ multiplier for the per-star measurement-pixel inclusion gate |
@@ -55,7 +55,7 @@ The radius is a *half-size*: the convolution kernel spans roughly twice the radi
 
 This is the switch that controls Hocus Focus's two-image design. With it **off** (default), candidate *finding* runs on the blurred structure-detection image, but every measurement (centroid, flux, HFR, PSF) is taken from the sharp, unblurred image, so the blur cannot bias the numbers. With it **on**, the same blurred pixels feed both stages.
 
-Turning it on changes what the noise σ is measured against. Hocus Focus tracks two noise estimates: a structure σ (on the noise-reduced structure source, used only by the binarize threshold) and a measurement σ (on the image actually sampled). The brightness and star clipping multipliers are honest multiples of that **measurement** σ, so they keep their meaning regardless of this switch.
+Turning it on changes what the noise σ is measured against. Hocus Focus tracks two noise estimates: a structure σ (on the noise-reduced structure source, used only by the binarization threshold) and a measurement σ (on the image actually sampled). The brightness and star clipping multipliers are honest multiples of that **measurement** σ, so they keep their meaning regardless of this switch.
 
 !!! tip "When this helps"
     Enable it only for **very noisy** data where the unblurred pixels are too noisy to measure HFR reliably. The High noise preset turns it on for you and also raises the radius. It can hurt in normal conditions: blurring the measurement pixels inflates measured HFR and softens the PSF, biasing the autofocus curve. Leave it off unless you have a specific noise problem.
@@ -68,7 +68,7 @@ Turning it on changes what the noise σ is measured against. Hocus Focus tracks 
 
 > Structure map generation binarizes pixels above the noise floor after noise detection and before star detection. This floor is calculated based on the background (median of the whole image) + this multiplier times the noise standard deviation, as calculated using the Kappa-Sigma algorithm. When Locally Adaptive Binarization is enabled (the default), the background median and noise are measured locally per region rather than across the whole image. Increasing this value more aggressively clips the background, which can be useful if star bounding boxes include too much background data.
 
-**Default:** `2.0` &nbsp;•&nbsp; **Range:** must be non-negative. The Advanced UI field requires a value greater than zero.
+**Default:** `4.0` &nbsp;•&nbsp; **Range:** must be non-negative. The Advanced UI field requires a value greater than zero.
 
 This multiplier governs **candidate finding only**. After noise reduction and wavelet structure detection, the structure map is binarized at a threshold of
 
@@ -84,11 +84,13 @@ where the median is the background and \(\sigma_{\text{structure}}\) is the Kapp
 !!! tip "When this helps"
     Raise it when star bounding boxes are swallowing too much background (loose, bloated boxes), or when faint noise structure is being detected as junk candidates, especially after adding light noise reduction. **Lower it** to recover faint stars on clean data. It does **not** affect the measured HFR of an accepted star; that is the job of the Star Clipping Multiplier below.
 
-!!! note "Why the default is 2"
-    The default was lowered from 4 to 2 after a recall audit found that a 4σ floor left most real stars below
-    the candidate threshold: roughly 79% of real stars never formed a candidate at all. Dropping it to 2 about
-    doubled the recall of bright stars at a small precision cost, with no loss of focus-curve accuracy. The full
-    data is on [Adaptive Binarization](adaptive-binarization.md). With Locally Adaptive
+!!! note "Why 4, and why 2 is worth trying"
+    The default was once lowered from 4 to 2 after a recall audit found that a 4σ floor left most real stars
+    below the candidate threshold: roughly 79% of real stars never formed a candidate at all. Dropping it to 2
+    about doubled the recall of bright stars at a small precision cost, with no loss of focus-curve accuracy.
+    That change has since been **reverted on an interim basis**, so 4.0 is what ships today, pending a
+    recalibration. The full data is on [Adaptive Binarization](adaptive-binarization.md), and lowering this
+    value toward 2 remains a reasonable thing to try if faint stars are going undetected. With Locally Adaptive
     Binarization on (the default, below), this multiplier scales a *local* floor that varies across the frame
     rather than a single global one.
 

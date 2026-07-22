@@ -1,4 +1,4 @@
-#region "copyright"
+﻿#region "copyright"
 
 /*
     Copyright © 2021 - 2026 George Hilios <ghilios+NINA@googlemail.com>
@@ -14,6 +14,7 @@ using CommunityToolkit.Mvvm.Input;
 using NINA.Core.Model;
 using NINA.Core.Utility;
 using NINA.Core.Utility.Notification;
+using NINA.Core.Utility.SerialCommunication;
 using NINA.Core.Utility.WindowService;
 using NINA.Equipment.Equipment;
 using NINA.Equipment.Equipment.MyCamera;
@@ -23,9 +24,12 @@ using NINA.Equipment.Interfaces.ViewModel;
 using NINA.Equipment.Model;
 using NINA.Joko.Plugins.HocusFocus.AutoFocus;
 using NINA.Joko.Plugins.HocusFocus.AutoFocus.Replay;
+using NINA.Joko.Plugins.HocusFocus.CameraSimulator;
 using NINA.Joko.Plugins.HocusFocus.Interfaces;
 using NINA.Joko.Plugins.HocusFocus.StarDetection;
 using NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization;
+using NINA.Joko.Plugins.HocusFocus.TiltAdapterDevices;
+using NINA.Joko.Plugins.HocusFocus.TiltAdapterDevices.AsgEat;
 using NINA.Profile.Interfaces;
 using NINA.WPF.Base.Interfaces.Mediator;
 using NINA.WPF.Base.ViewModel;
@@ -34,12 +38,14 @@ using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Collections.Specialized;
 using System.ComponentModel.Composition;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Input;
 using Logger = NINA.Core.Utility.Logger;
+using MyMessageBox = NINA.Core.MyMessageBox.MyMessageBox;
 using RelayCommand = CommunityToolkit.Mvvm.Input.RelayCommand;
 
 namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
@@ -73,6 +79,40 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
         private readonly IWindowServiceFactory windowServiceFactory = new WindowServiceFactory();
         private readonly IProgress<ApplicationStatus> progress;
 
+        // Shared motorized-device connection singleton (HocusFocusPlugin.TiltDeviceConnectionService in
+        // production, injected in tests; null-tolerant so device-less test rigs stay valid — the pane's
+        // commands/properties then degrade to "not connected"/disabled).
+        private readonly TiltDeviceConnectionService tiltDeviceConnectionService;
+        // Lazily created: SerialPortProvider's own constructor runs a WMI scan, so the real provider is only
+        // built on first port enumeration (when the pane is actually shown), never during VM construction.
+        private ISerialPortProvider serialPortProvider;
+        // The idle-disconnect confirmation, injectable for tests. Production default shows the NINA
+        // message box (ShowIdleDisconnectPromptAsync); tests inject a fake returning true/false and assert
+        // the right TiltDeviceConnectionService method is called.
+        private readonly Func<Task<bool>> confirmIdleDisconnectAsync;
+        // The simulator config the "Simulator" port checks against the selected EAT preset. Null-tolerant: a
+        // device-less test rig may not wire it, in which case the Simulator-port config check is skipped.
+        private readonly ICameraSimulatorOptions cameraSimulatorOptions;
+        // The "change the simulator config to match?" confirmation, injectable for tests (mirrors
+        // confirmIdleDisconnectAsync). Production default shows the NINA Yes/No message box (default No).
+        private readonly Func<string, string, Task<bool>> confirmSimConfigChangeAsync;
+        private IReadOnlyList<string> availablePortNames;
+        // Live per-motor device positions for the connection pane (device order TR/TL/BR/BL). During a device-
+        // driven run the service's cp poll is paused (the run holds the operation lease), so these are refreshed
+        // per move from the controller; when idle they mirror the service's polled CurrentPositions.
+        private IReadOnlyList<int> deviceDisplayPositions;
+        // Per-motor positions captured at the start of the current calibration run, for the "Δ since start" display.
+        private int[] calibrationBaselinePositions;
+        private string connectedPortName;
+
+        // Fix 3: ConnectTiltDeviceAsync defaults MeasureCurvatureDuringCalibration ON, but only once per VM
+        // lifetime (this is a [PartCreationPolicy(CreationPolicy.Shared)] singleton, so "lifetime" == "session")
+        // and never once the user has explicitly turned it off — otherwise a disconnect -> reconnect cycle
+        // would silently re-force a deliberately disabled option back on. See the options PropertyChanged
+        // handler (ctor) and ConnectTiltDeviceAsync below.
+        private bool hasDefaultedMeasureCurvatureOnConnect;
+        private bool userExplicitlyDisabledMeasureCurvatureThisSession;
+
         private CameraInfo cameraInfo = DeviceInfo.CreateDefaultInstance<CameraInfo>();
         private FocuserInfo focuserInfo = DeviceInfo.CreateDefaultInstance<FocuserInfo>();
 
@@ -91,6 +131,51 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
         private string confidenceWarningText = string.Empty;
         private bool hasMeasurementFailureChoice = false;
         private string measurementFailureText = string.Empty;
+        private bool hasDeviceLinkDroppedWarning = false;
+        private string deviceLinkDroppedWarningText = string.Empty;
+
+        // ---- T11: hands-off device-driven calibration state ------------------------------------------------
+        // Captured at StartAsync (and, when it bootstraps a not-yet-running wizard, AutoRunAllAsync) time:
+        // true when the run began connected to a motorized device, so every step's move is sent by the wizard
+        // itself instead of instructing the user. Read at NextStep's Complete transition to decide whether the
+        // device-linked calibration marker (ITiltAdapterOptions.DeviceLinkedCalibrationDeviceName) is set or
+        // cleared -- see RunCalibrationMath.
+        private bool currentRunIsDeviceDriven;
+        // The exclusive T9 operation lease held for the WHOLE duration of a device-driven run: StartAsync
+        // acquires it (refusing to start if the device is busy elsewhere); it is released once the run reaches
+        // Complete (right after the restore move is attempted, successful or not) or the run is abandoned via
+        // Restart. Null for a disconnected/manual run.
+        private IDisposable tiltDeviceOperationToken;
+        // Guards against re-sending a step's device move on a measurement retry: set to the step whose move
+        // has already been applied to the (real) device. A retry after a measurement-only failure (the move
+        // itself succeeded; AutoFocus/sensor-modeling failed) must not re-apply the same move a second time.
+        private WizardStep? deviceMoveAppliedForStep;
+        // Every device move successfully applied during the current device-driven run, in send order -- used
+        // to walk backwards (inverse, reverse order) to return the device to baseline on an Auto Run All
+        // cancellation or a hard failure partway through the sequence.
+        private readonly List<TiltAdapterMove> appliedDeviceMovesThisRun = new List<TiltAdapterMove>();
+        // AutoRunAllCommand re-entrancy guard.
+        private bool isAutoRunningAll;
+        // Latched when an automated run takes its cancel/failure exit. That exit rolls this run's device moves
+        // back (RecoverAppliedMovesAsync) and releases the exclusive operation lease, which together make the
+        // run unresumable: the readings already in stepReadings describe a device position that no longer
+        // exists, and re-entering AutoRunAllAsync skips StartAsync (IsWizardRunning is still true) so it would
+        // resume at the stale CurrentStep, unleased, sending moves computed from the rolled-back position.
+        // Gates AutoRunAllCommand and the failure panel's RetryMeasurementCommand; cleared by StartAsync and
+        // Restart. Deliberately does NOT tear the run panel down -- the failure text explaining what happened
+        // lives inside it.
+        private bool deviceRunAbandoned;
+        // IProgress<string> adapter over the ApplicationStatus progress reporter, mirroring
+        // InspectorVM.RunAutomaticAdjustmentAsync's moveProgress -- the same status-bar wording convention for
+        // the other automated tilt-device consumer (T14).
+        private readonly IProgress<string> moveProgress;
+        // Test seam: when set, MeasureStep uses this instead of invoking the live inspector for a step's
+        // measurement. The delegate is responsible for seeding stepReadings for the step (via
+        // SeedStepReading) and returns whether the "measurement" succeeded. Lets Auto Run All's full-sequence
+        // orchestration (device move -> measurement -> NextStep, repeated to Complete) be exercised without a
+        // live inspector analysis, mirroring how RunCalibrationForTest bypasses RunCalibrationMath's live
+        // sensor-model input. Always null in production.
+        internal Func<WizardStep, CancellationToken, Task<bool>> MeasurementStepOverrideForTest { get; set; }
 
         // One (A, B, mean) tilt-plane reading plus the per-step field-curvature characterization, keyed by step.
         private readonly Dictionary<WizardStep, StepReading> stepReadings = new Dictionary<WizardStep, StepReading>();
@@ -111,7 +196,6 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
             }
         }
 
-        private double calibrationAppliedAmount = 1.0;
         private double measuredHardwareMicrons = double.NaN;
         private TiltCalibrationConfidence lastConfidence;
         private double pitchUncertaintyMicrons = double.NaN;
@@ -177,7 +261,9 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
             IFocuserMediator focuserMediator,
             InspectorVM inspector)
             : this(profileService, applicationStatusMediator, cameraMediator, focuserMediator, inspector,
-                   HocusFocusPlugin.ApplicationDispatcher, HocusFocusPlugin.TiltAdapterOptions) { }
+                   HocusFocusPlugin.ApplicationDispatcher, HocusFocusPlugin.TiltAdapterOptions,
+                   HocusFocusPlugin.TiltDeviceConnectionService,
+                   cameraSimulatorOptions: HocusFocusPlugin.CameraSimulatorOptions) { }
 
         public TiltAdapterWizardVM(
             IProfileService profileService,
@@ -186,12 +272,23 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
             IFocuserMediator focuserMediator,
             InspectorVM inspector,
             IApplicationDispatcher applicationDispatcher,
-            ITiltAdapterOptions tiltAdapterOptions)
+            ITiltAdapterOptions tiltAdapterOptions,
+            TiltDeviceConnectionService tiltDeviceConnectionService = null,
+            ISerialPortProvider serialPortProvider = null,
+            Func<Task<bool>> confirmIdleDisconnectAsync = null,
+            ICameraSimulatorOptions cameraSimulatorOptions = null,
+            Func<string, string, Task<bool>> confirmSimConfigChangeAsync = null)
             : base(profileService) {
             this.inspector = inspector;
             this.tiltAdapterOptions = tiltAdapterOptions;
             this.applicationDispatcher = applicationDispatcher;
+            this.tiltDeviceConnectionService = tiltDeviceConnectionService;
+            this.serialPortProvider = serialPortProvider; // null => created lazily on first enumeration
+            this.confirmIdleDisconnectAsync = confirmIdleDisconnectAsync ?? ShowIdleDisconnectPromptAsync;
+            this.cameraSimulatorOptions = cameraSimulatorOptions;
+            this.confirmSimConfigChangeAsync = confirmSimConfigChangeAsync ?? ShowSimConfigChangePromptAsync;
             this.progress = ProgressFactory.Create(applicationStatusMediator, "Tilt Adapter Wizard");
+            this.moveProgress = new Progress<string>(text => this.progress.Report(new ApplicationStatus { Status = $"Tilt Adapter Wizard: {text}" }));
 
             this.Title = "Tilt Adapter Wizard";
 
@@ -206,15 +303,34 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
             StepMeasurementSummary.CollectionChanged += OnSummaryCollectionChanged;
 
             StartCommand = new AsyncRelayCommand(StartAsync, () => !IsWizardRunning);
-            RunMeasurementCommand = new AsyncRelayCommand(RunMeasurementAsync, () => IsOnMeasurementStep && !IsMeasuring && AreDevicesConnected);
-            UseSavedAFCommand = new AsyncRelayCommand(RunSavedMeasurementAsync, () => IsOnMeasurementStep && !IsMeasuring);
+            // deviceRunAbandoned gates EVERY re-entry into the measurement loop, not just Auto Run All: these two
+            // buttons sit in the same Panel B row, stay visible in exactly the post-rollback state, and reach the
+            // same handlers (RunMeasurementCommand shares RunMeasurementAsync with RetryMeasurementCommand below).
+            // Leaving either open would let one click resume a run whose device moves had just been undone.
+            RunMeasurementCommand = new AsyncRelayCommand(RunMeasurementAsync, () => IsOnMeasurementStep && !IsMeasuring && AreDevicesConnected && !deviceRunAbandoned);
+            UseSavedAFCommand = new AsyncRelayCommand(RunSavedMeasurementAsync, () => IsOnMeasurementStep && !IsMeasuring && !deviceRunAbandoned);
             CancelCommand = new RelayCommand(CancelMeasurement, () => IsMeasuring);
             RestartCommand = new RelayCommand(Restart);
             UseMeasuredHardwareCommand = new RelayCommand(UseMeasuredHardware, () => HasMeasuredHardware);
             BrowseSaveFolderCommand = new RelayCommand(BrowseSaveFolder);
             ReplayCommand = new AsyncRelayCommand(ReplayAsync, () => !IsWizardRunning && !IsMeasuring);
-            RetryMeasurementCommand = new AsyncRelayCommand(RunMeasurementAsync, () => HasMeasurementFailureChoice && IsOnMeasurementStep && !IsMeasuring && AreDevicesConnected);
+            RetryMeasurementCommand = new AsyncRelayCommand(RunMeasurementAsync, () => HasMeasurementFailureChoice && IsOnMeasurementStep && !IsMeasuring && AreDevicesConnected && !deviceRunAbandoned);
             ApplyManualCalibrationCommand = new RelayCommand(ApplyManualCalibration);
+            ClearCalibrationCommand = new RelayCommand(ClearCalibration);
+            RefreshPortsCommand = new RelayCommand(RefreshPorts);
+            ConnectDeviceCommand = new AsyncRelayCommand(ConnectTiltDeviceAsync, () =>
+                IsMotorizedDevice && this.tiltDeviceConnectionService != null && !IsTiltDeviceConnected && !string.IsNullOrEmpty(SelectedPortName));
+            DisconnectDeviceCommand = new AsyncRelayCommand(DisconnectTiltDeviceAsync, () => IsTiltDeviceConnected);
+            AutoRunAllCommand = new AsyncRelayCommand(AutoRunAllAsync, () =>
+                IsMotorizedDevice && this.tiltDeviceConnectionService != null && IsTiltDeviceConnected &&
+                !isAutoRunningAll && !IsMeasuring && !deviceRunAbandoned && HasValidDeviceAppliedAmount());
+
+            // This VM is a Shared MEF singleton, so these ctor-time subscriptions intentionally live for the
+            // whole app run (like every other subscription in this ctor).
+            if (this.tiltDeviceConnectionService != null) {
+                this.tiltDeviceConnectionService.PropertyChanged += TiltDeviceConnectionService_PropertyChanged;
+                this.tiltDeviceConnectionService.IdlePromptRequested += TiltDeviceConnectionService_IdlePromptRequested;
+            }
 
             tiltAdapterOptions.PropertyChanged += (s, e) => OnUIThread(() => {
                 if (e.PropertyName == nameof(ITiltAdapterOptions.ScrewInwardCurvatureSign)) {
@@ -233,6 +349,15 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
                 }
                 if (e.PropertyName == nameof(ITiltAdapterOptions.MeasureCurvatureDuringCalibration)) {
                     RaisePropertyChanged(nameof(CurvatureSignProvenance));
+                    // Fix 3: the only two writers of this option are the checkbox (XAML binds it directly to
+                    // TiltAdapterOptions.MeasureCurvatureDuringCalibration, a user action) and
+                    // ConnectTiltDeviceAsync's own first-connect default (which only ever sets it to TRUE, never
+                    // false — see below). So a change to FALSE observed here can only be the user explicitly
+                    // unchecking it; remember that for the rest of this VM's lifetime so a later reconnect never
+                    // silently re-forces it back on.
+                    if (!tiltAdapterOptions.MeasureCurvatureDuringCalibration) {
+                        userExplicitlyDisabledMeasureCurvatureThisSession = true;
+                    }
                 }
                 if (e.PropertyName == nameof(ITiltAdapterOptions.CalibrationIsManual)) {
                     RaisePropertyChanged(nameof(IsCalibrationValid));
@@ -249,6 +374,12 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
                 if (e.PropertyName == nameof(ITiltAdapterOptions.DeviceName)) {
                     RaisePropertyChanged(nameof(SelectedDevice));
                     RaisePropertyChanged(nameof(IsManualDevice));
+                    RaisePropertyChanged(nameof(IsMotorizedDevice));
+                    NotifyCommandsCanExecuteChangedCore(); // ConnectDeviceCommand gates on IsMotorizedDevice
+                }
+                if (e.PropertyName == nameof(ITiltAdapterOptions.TiltDeviceSerialPortName)) {
+                    RaisePropertyChanged(nameof(SelectedPortName));
+                    NotifyCommandsCanExecuteChangedCore(); // ConnectDeviceCommand gates on a selected port
                 }
                 if (e.PropertyName == nameof(ITiltAdapterOptions.SaveAFRunsPath)) {
                     RaisePropertyChanged(nameof(SaveAFRunsPath));
@@ -300,6 +431,15 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
                 RaisePropertyChanged(nameof(FocuserStepSizeMicronsValue));
                 RaisePropertyChanged(nameof(SelectedDevice));
                 RaisePropertyChanged(nameof(IsManualDevice));
+                // TiltAdapterOptions' ProfileChanged reload raises one broadcast PropertyChanged (null name)
+                // that the per-name filters above never match, so the device-connection wrappers must be
+                // re-raised here like every other wrapper property (see the comment below). The connection
+                // service force-disconnects on profile change on its own; its Connected INPC refreshes the
+                // connected-state wrappers separately.
+                RaisePropertyChanged(nameof(IsMotorizedDevice));
+                RaisePropertyChanged(nameof(SelectedPortName));
+                RaisePropertyChanged(nameof(TiltDeviceStatusText));
+                NotifyCommandsCanExecuteChangedCore();
                 RaisePropertyChanged(nameof(SaveAFRunsPath));
                 RaisePropertyChanged(nameof(WizardSweepSummary));
                 // TiltAdapterOptions reloads its values from the new profile in its own ProfileChanged handler
@@ -319,6 +459,10 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
                 RaisePropertyChanged(nameof(AdjustmentType));
                 RaisePropertyChanged(nameof(IsStepperAdjustment));
                 RaisePropertyChanged(nameof(CalibrationAmountLabel));
+                // CalibrationAppliedAmount is now a wrapper over the persisted option (per-profile), so a
+                // profile swap can genuinely change its resolved value — re-raise it here for the same reason
+                // as the other wrapper properties above.
+                RaisePropertyChanged(nameof(CalibrationAppliedAmount));
                 // CalibrationAppliedAmountDisplay (turns/steps units) is intentionally not re-raised in this
                 // list: RaiseHardwareSummaryChanged() below already raises it on every ProfileChanged.
                 RaisePropertyChanged(nameof(ThreadPitchMicronsValue));
@@ -394,6 +538,8 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
                 RaisePropertyChanged(nameof(IsComplete));
                 RaisePropertyChanged(nameof(IsOnMeasurementStep));
                 RaisePropertyChanged(nameof(StepInstructions));
+                RaisePropertyChanged(nameof(StepProgressDisplay));
+                RaisePropertyChanged(nameof(StepTitle));
                 RaisePropertyChanged(nameof(IsCurrentStepAtBaseline));
                 RaisePropertyChanged(nameof(BaselineRecoveryInstructions));
                 NotifyCommandsCanExecuteChanged();
@@ -404,6 +550,66 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
 
         // Steps that end with running the aberration inspector (measurement auto-advances)
         public bool IsOnMeasurementStep => activeMeasurementSteps.Contains(currentStep);
+
+        // "Step N of M" over the active measurement-step set (4- or 6-step, captured at run start). Empty on
+        // the terminal Complete panel, which shows its own "Calibration Complete!" header instead.
+        public string StepProgressDisplay {
+            get {
+                if (currentStep == WizardStep.Complete) {
+                    return string.Empty;
+                }
+                int idx = Array.IndexOf(activeMeasurementSteps, currentStep);
+                if (idx < 0) {
+                    return string.Empty;
+                }
+                return string.Format(CultureInfo.InvariantCulture, "Step {0} of {1}", idx + 1, activeMeasurementSteps.Length);
+            }
+        }
+
+        // Short, scannable title shown above the longer StepInstructions paragraph so the user can tell where
+        // they are without re-reading the instructions.
+        public string StepTitle => StepTitleText(currentStep);
+
+        internal static string StepTitleText(WizardStep step) {
+            switch (step) {
+                case WizardStep.Baseline: return "Baseline Measurement";
+                case WizardStep.AllInward: return "All Screws Inward";
+                case WizardStep.ReBaseline1: return "Return to Baseline";
+                case WizardStep.Screw1: return "Move Screw 1";
+                case WizardStep.ReBaseline2: return "Return to Baseline";
+                case WizardStep.Screw2: return "Move Screw 2";
+                case WizardStep.Complete: return "Calibration Complete";
+                default: return string.Empty;
+            }
+        }
+
+        // True while ReplayAsync is re-analyzing a saved run. Exposed (INPC) for the same reason as
+        // IsAutoRunningAll below: the step copy must drop its "turn the screws / click Run Measurement"
+        // imperatives, since a replay touches no hardware and those buttons are collapsed for its duration.
+        public bool IsReplaying {
+            get => isReplaying;
+            private set {
+                if (isReplaying != value) {
+                    isReplaying = value;
+                    RaisePropertyChanged();
+                    RaisePropertyChanged(nameof(StepInstructions));
+                }
+            }
+        }
+
+        // T11: true while Auto Run All is driving the calibration hands-off. Exposed (INPC) so the step copy
+        // can drop its "click Run Measurement" imperatives — those buttons are hidden during an automated run.
+        public bool IsAutoRunningAll {
+            get => isAutoRunningAll;
+            private set {
+                if (isAutoRunningAll != value) {
+                    isAutoRunningAll = value;
+                    RaisePropertyChanged();
+                    RaisePropertyChanged(nameof(StepInstructions));
+                    RaisePropertyChanged(nameof(StepTitle));
+                }
+            }
+        }
 
         public bool IsCalibrationValid =>
             tiltAdapterOptions.IsCalibrated &&
@@ -558,7 +764,7 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
 
         // Per-step guidance for returning to baseline before retrying, shown in the failure panel.
         public string BaselineRecoveryInstructions =>
-            BaselineRecoveryText(currentStep, tiltAdapterOptions.ScrewCount, IsStepperAdjustment, calibrationAppliedAmount);
+            BaselineRecoveryText(currentStep, tiltAdapterOptions.ScrewCount, IsStepperAdjustment, CalibrationAppliedAmount);
 
         public bool HasRebaselineDriftWarning {
             get => hasRebaselineDriftWarning;
@@ -594,6 +800,27 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
             }
         }
 
+        // Fix 2 / [CRITICAL GATE]: set the moment a "Use Saved AF" measurement occurs mid-run during what
+        // started as a device-driven calibration (see MeasureStep) — the run has silently dropped out of
+        // device-driven mode, so DeviceLinkedCalibrationDeviceName will NOT be set at Complete and no further
+        // device moves will be sent. Survives the step advance to Complete (like HasMeasurementConsistencyWarning),
+        // so it is rendered on both the step panel and the Complete panel.
+        public bool HasDeviceLinkDroppedWarning {
+            get => hasDeviceLinkDroppedWarning;
+            private set {
+                hasDeviceLinkDroppedWarning = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public string DeviceLinkDroppedWarningText {
+            get => deviceLinkDroppedWarningText;
+            private set {
+                deviceLinkDroppedWarningText = value;
+                RaisePropertyChanged();
+            }
+        }
+
         // Transient per-run toggle: save each calibration step's AutoFocus sweep so the run can be replayed.
         // Always starts OFF and must be explicitly enabled before each run (not persisted). The folder is
         // persisted (SaveAFRunsPath) so the location is reused.
@@ -625,8 +852,48 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
             }
         }
 
+        // T11 item 6: when a motorized device is connected, the wizard drives the moves itself, so the
+        // instruction becomes automated status (what the wizard is about to send) instead of the manual
+        // "turn screw" wording. Disconnected: EXACTLY the prior expression, unchanged (mandatory regression —
+        // IsTiltDeviceConnected is false whenever the service is null or not connected).
         public string StepInstructions =>
-            StepInstructionsText(currentStep, tiltAdapterOptions.ScrewCount, IsStepperAdjustment, calibrationAppliedAmount);
+            IsReplaying
+                ? ReplayStepInstructionsText(currentStep)
+                : (IsTiltDeviceConnected && IsMotorizedDevice)
+                    ? DeviceStepInstructionsText(currentStep, (int)Math.Round(CalibrationAppliedAmount), IsAutoRunningAll)
+                    : StepInstructionsText(currentStep, tiltAdapterOptions.ScrewCount, IsStepperAdjustment, CalibrationAppliedAmount);
+
+        // Replay wording: a replay re-analyzes already-captured frames, so every imperative in the live copy
+        // ("turn ALL screws CLOCKWISE", "click Run Measurement") is wrong — nothing is captured, no hardware
+        // moves, and the measurement buttons are collapsed by the IsMeasuring trigger for the whole replay.
+        internal static string ReplayStepInstructionsText(WizardStep step) =>
+            $"Replaying — re-analyzing the saved frames for {StepTitleText(step)}. No action needed: nothing is " +
+            "captured and the tilt adapter is not moved during a replay.";
+
+        // Automated-status wording for a connected, device-driven run: describes what the wizard will send
+        // (Move.Description) rather than what the user must do by hand. Baseline has no move (measurement
+        // only); every other step maps 1:1 via EatWizardMapping.MoveForStep. When <paramref name="autoRunning"/>
+        // (Auto Run All is active) the "click Run Measurement" imperatives are dropped — those buttons are
+        // hidden during an automated run, so telling the user to click them reads as a stalled manual run.
+        internal static string DeviceStepInstructionsText(WizardStep step, int appliedSteps, bool autoRunning) {
+            if (step == WizardStep.Baseline) {
+                return autoRunning
+                    ? "Running automatically — the wizard is driving the tilt adapter through the calibration. " +
+                        "No action needed; it will apply each move, measure, and advance on its own."
+                    : "Connected: the wizard will drive the tilt adapter through each calibration step automatically. " +
+                        "Ensure the device is at its starting position (as zeroed in the vendor app), then click Run Measurement " +
+                        "or Auto Run All to begin.";
+            }
+            var move = EatWizardMapping.MoveForStep(step, appliedSteps);
+            if (autoRunning) {
+                return move == null
+                    ? "Running automatically — measuring…"
+                    : $"Running automatically — {move.Description}. The wizard applies this move, measures, and advances without further input.";
+            }
+            return move == null
+                ? "Click Run Measurement to continue."
+                : $"Automated: {move.Description}. Click Run Measurement (or Auto Run All) to apply this move and measure.";
+        }
 
         // Formats the calibration move amount: "1 full turn" / "1.5 turns" for screws, whole "+N"
         // magnitude for steppers (sign is added by the caller's wording).
@@ -746,14 +1013,24 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
         public ICommand ReplayCommand { get; }
         public ICommand RetryMeasurementCommand { get; }
         public ICommand ApplyManualCalibrationCommand { get; }
+        public ICommand ClearCalibrationCommand { get; }
+        public ICommand RefreshPortsCommand { get; }
+        public ICommand ConnectDeviceCommand { get; }
+        public ICommand DisconnectDeviceCommand { get; }
+        public ICommand AutoRunAllCommand { get; }
 
-        // Known amount the user moves each screw during the per-screw calibration steps (full turns
-        // for screws, steps for steppers). Defaults to 1.0 to match the "1 full turn" instructions.
+        // Amount the user moves each screw during the per-screw calibration steps (full turns for
+        // screws, steps for steppers). Persisted per profile via tiltAdapterOptions; -1 (unset) resolves
+        // to the selected device preset's default (TiltAdapterDevicePreset.DefaultCalibrationAmount) so
+        // it still matches the "1 full turn" / "150 steps" instructions before the user ever edits it.
         public double CalibrationAppliedAmount {
-            get => calibrationAppliedAmount;
+            get {
+                var raw = tiltAdapterOptions.CalibrationAppliedAmount;
+                return raw >= 0 ? raw : TiltAdapterDevicePreset.ByName(tiltAdapterOptions.DeviceName).DefaultCalibrationAmount;
+            }
             set {
-                if (calibrationAppliedAmount != value) {
-                    calibrationAppliedAmount = value;
+                if (value != tiltAdapterOptions.CalibrationAppliedAmount) {
+                    tiltAdapterOptions.CalibrationAppliedAmount = value;
                     RaisePropertyChanged();
                     RaisePropertyChanged(nameof(CalibrationAppliedAmountDisplay));
                     // The prompts embed the applied amount, so editing it must refresh them.
@@ -852,6 +1129,15 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
             tiltAdapterOptions.IsCalibrated = true;
             tiltAdapterOptions.ScrewInwardCurvatureSignIsMeasured = false;
             tiltAdapterOptions.CalibrationIsManual = true;
+            // [CRITICAL GATE] A manual entry's screw numbering/orientation is not guaranteed to match how the
+            // device's motors are wired — clear any device-linked marker so automation (the wizard's
+            // hands-off calibration and the inspector's Automatic Adjustment, T14) stays blocked until a
+            // fresh connected, device-driven calibration re-establishes the correspondence.
+            tiltAdapterOptions.DeviceLinkedCalibrationDeviceName = string.Empty;
+            // [CRITICAL GATE] A manual entry has no confidence computation to reuse (there are no per-step
+            // tilt vectors — the user typed a single angle) — conservative default: not automation-trusted
+            // until a fresh calibration run demonstrably passes its own confidence check.
+            tiltAdapterOptions.CalibrationIsReliable = false;
             // A manual entry supersedes whatever wizard run last measured the hardware — reset to the
             // unset sentinel (-1, what the options initialize to; PitchMismatchExceeds ignores <= 0) so
             // the inspector's pitch-mismatch warning can't compare the new adapter's configured pitch
@@ -861,6 +1147,43 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
             // Clear stale wizard-run display state (measured-hardware panel, per-run warnings, summary
             // rows — the same state Restart clears) that would otherwise describe the previous run next
             // to a manually entered calibration.
+            measuredHardwareMicrons = double.NaN;
+            lastConfidence = null;
+            pitchUncertaintyMicrons = double.NaN;
+            lastRawAngleDiff = double.NaN;
+            lastMoveMagnitudeRatio = double.NaN;
+            HasWarning = false;
+            WarningText = string.Empty;
+            HasMeasurementConsistencyWarning = false;
+            MeasurementConsistencyWarningText = string.Empty;
+            HasRebaselineDriftWarning = false;
+            RebaselineDriftWarningText = string.Empty;
+            HasConfidenceWarning = false;
+            ConfidenceWarningText = string.Empty;
+            ClearSummaryRows();
+            RaiseHardwareSummaryChanged();
+            RebuildDiagram();
+        }
+
+        /// <summary>
+        /// Clears the saved calibration RESULTS — screw angles, the calibrated/manual flags, the calibrated screw
+        /// count, the measured-curvature-sign flag, and the measured-hardware sentinels — leaving the device
+        /// selection and its configured hardware/direction intact. Reverses <see cref="ApplyManualCalibration"/>'s
+        /// field writes and runs the same display-state cleanup, so the pane returns to the "No calibration saved"
+        /// state without a wizard run.
+        /// </summary>
+        private void ClearCalibration() {
+            tiltAdapterOptions.Screw1AngleDegrees = double.NaN;
+            tiltAdapterOptions.Screw2AngleDegrees = double.NaN;
+            tiltAdapterOptions.Screw3AngleDegrees = double.NaN;
+            tiltAdapterOptions.Screw4AngleDegrees = double.NaN;
+            tiltAdapterOptions.CalibratedScrewCount = 0;
+            tiltAdapterOptions.IsCalibrated = false;
+            tiltAdapterOptions.CalibrationIsManual = false;
+            tiltAdapterOptions.ScrewInwardCurvatureSignIsMeasured = false;
+            tiltAdapterOptions.LastMeasuredThreadPitchMicrons = -1;
+            tiltAdapterOptions.LastMeasuredStepperStepSizeMicrons = -1;
+
             measuredHardwareMicrons = double.NaN;
             lastConfidence = null;
             pitchUncertaintyMicrons = double.NaN;
@@ -923,7 +1246,7 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
         public string CalibrationPixelSizeDisplay => calibrationPixelSizeMicrons > 0 ? $"{calibrationPixelSizeMicrons:0.##} µm" : "—";
         public string CalibrationFocuserStepDisplay => calibrationFocuserStepMicrons > 0 ? $"{calibrationFocuserStepMicrons:0.###} µm" : "—";
         public string CalibrationScrewRadiusDisplay => calibrationScrewRadiusMm > 0 ? $"{calibrationScrewRadiusMm:0.##} mm" : "not set";
-        public string CalibrationAppliedAmountDisplay => IsStepperAdjustment ? $"{calibrationAppliedAmount:0.##} steps" : $"{calibrationAppliedAmount:0.##} turns";
+        public string CalibrationAppliedAmountDisplay => IsStepperAdjustment ? $"{CalibrationAppliedAmount:0.##} steps" : $"{CalibrationAppliedAmount:0.##} turns";
 
         public bool HasConfidenceInfo => lastConfidence != null;
 
@@ -983,6 +1306,648 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
 
         public bool IsManualDevice => TiltAdapterDevicePreset.ByName(tiltAdapterOptions.DeviceName).IsManual;
 
+        // ---- Motorized device connection (T10) --------------------------------------------------------------
+        // Everything below drives the "Motorized Device Connection" GroupBox in Panel A. The pane is only
+        // visible when the selected preset has a registered motion controller (the ASG EAT presets); all
+        // device access flows through the shared TiltDeviceConnectionService singleton. Deliberately NO
+        // zero-positions command anywhere — zeroing the counters is the vendor app's job (user decision #5).
+
+        /// <summary>True when the selected device preset has a registered motion controller (can be connected and automated).</summary>
+        public bool IsMotorizedDevice => TiltMotionControllerRegistry.IsMotorized(tiltAdapterOptions.DeviceName);
+
+        public bool IsTiltDeviceConnected => tiltDeviceConnectionService?.Connected ?? false;
+
+        public bool TiltDevicePositionsKnown => (deviceDisplayPositions != null && deviceDisplayPositions.Count >= 4)
+            || (tiltDeviceConnectionService?.PositionsKnown ?? false);
+
+        public string TiltDeviceStatusText {
+            get {
+                var svc = tiltDeviceConnectionService;
+                if (svc == null || !svc.Connected) return "Not connected";
+                string port = string.IsNullOrEmpty(connectedPortName) ? string.Empty : $" on {connectedPortName}";
+                // Surfaces the exclusive-operation name so T11's hands-off calibration (and the inspector's
+                // plan execution) get a live status line for free.
+                return svc.IsOperationActive && !string.IsNullOrEmpty(svc.CurrentOperationName)
+                    ? $"Connected{port} — {svc.CurrentOperationName}"
+                    : $"Connected{port}";
+            }
+        }
+
+        /// <summary>COM ports available for the device connection. Enumerated lazily on first access (the provider's WMI scan only runs when the pane is shown); RefreshPortsCommand re-enumerates.</summary>
+        public IReadOnlyList<string> AvailablePortNames {
+            get {
+                if (availablePortNames == null) {
+                    availablePortNames = EnumeratePortNames();
+                }
+                return availablePortNames;
+            }
+        }
+
+        /// <summary>The selected COM port, persisted per profile (ITiltAdapterOptions.TiltDeviceSerialPortName).</summary>
+        public string SelectedPortName {
+            get => tiltAdapterOptions.TiltDeviceSerialPortName;
+            set {
+                // Fix 4: WPF's Selector coerces ComboBox.SelectedItem — and pushes the coercion back through
+                // this two-way binding — to null/empty whenever the bound value isn't present in the CURRENT
+                // AvailablePortNames (e.g. the persisted port's device is unplugged when the pane loads, or
+                // simply hasn't been enumerated yet). There is no "no selection" item in this ComboBox, so a
+                // null/empty incoming value can only ever be that coercion, never a genuine user choice —
+                // ignore it rather than wiping a remembered, non-empty persisted port.
+                if (string.IsNullOrEmpty(value)) {
+                    return;
+                }
+                if (tiltAdapterOptions.TiltDeviceSerialPortName != value) {
+                    tiltAdapterOptions.TiltDeviceSerialPortName = value;
+                    RaisePropertyChanged();
+                    NotifyCommandsCanExecuteChanged(); // ConnectDeviceCommand gates on a selected port
+                }
+            }
+        }
+
+        // Per-corner position counters in the 2x2 spatial layout of the physical adapter. The service's
+        // CurrentPositions list is in DEVICE motor order: [0]=TR (motor 1), [1]=TL (motor 2), [2]=BR (motor 3),
+        // [3]=BL (motor 4). "unknown" whenever PositionsKnown is false (e.g. the cp response is not parseable
+        // yet) or the index is missing.
+        public string ScrewPositionTopRightDisplay => TiltDevicePositionDisplay(0);
+        public string ScrewPositionTopLeftDisplay => TiltDevicePositionDisplay(1);
+        public string ScrewPositionBottomRightDisplay => TiltDevicePositionDisplay(2);
+        public string ScrewPositionBottomLeftDisplay => TiltDevicePositionDisplay(3);
+
+        private string TiltDevicePositionDisplay(int deviceMotorIndex) {
+            // Prefer the wizard's per-move snapshot (kept fresh during a run, when the service poll is paused);
+            // fall back to the service's polled positions when idle.
+            IReadOnlyList<int> positions = deviceDisplayPositions;
+            if (positions == null || positions.Count <= deviceMotorIndex) {
+                var svc = tiltDeviceConnectionService;
+                positions = (svc != null && svc.PositionsKnown) ? svc.CurrentPositions : null;
+            }
+            if (positions == null || positions.Count <= deviceMotorIndex) return "unknown";
+
+            var pos = positions[deviceMotorIndex];
+            var text = pos.ToString(CultureInfo.InvariantCulture);
+            // Delta from the position captured when this calibration run started.
+            if (calibrationBaselinePositions != null && calibrationBaselinePositions.Length > deviceMotorIndex) {
+                var delta = pos - calibrationBaselinePositions[deviceMotorIndex];
+                text += $"  (Δ {delta.ToString("+0;-0;0", CultureInfo.InvariantCulture)})";
+            }
+            return text;
+        }
+
+        private void RaiseScrewPositionDisplays() {
+            RaisePropertyChanged(nameof(TiltDevicePositionsKnown));
+            RaisePropertyChanged(nameof(ScrewPositionTopRightDisplay));
+            RaisePropertyChanged(nameof(ScrewPositionTopLeftDisplay));
+            RaisePropertyChanged(nameof(ScrewPositionBottomRightDisplay));
+            RaisePropertyChanged(nameof(ScrewPositionBottomLeftDisplay));
+        }
+
+        // Refresh the wizard's live device-position snapshot straight from the controller. Used during a run,
+        // when the connection service's cp poll is paused (the run holds the operation lease). Optionally
+        // (re)captures the "delta since start" baseline. Best-effort: a failed/unknown read leaves the last
+        // snapshot in place so the display simply keeps showing the previous value.
+        private async Task RefreshRunDevicePositionsAsync(ITiltMotionController controller, bool captureBaseline) {
+            if (controller == null) {
+                return;
+            }
+            try {
+                var positions = await controller.QueryPositionsAsync(CancellationToken.None).ConfigureAwait(true);
+                if (positions == null || !positions.Known) {
+                    return;
+                }
+                deviceDisplayPositions = positions.PerMotorSteps.ToArray();
+                if (captureBaseline || calibrationBaselinePositions == null) {
+                    calibrationBaselinePositions = deviceDisplayPositions.ToArray();
+                }
+                RaiseScrewPositionDisplays();
+            } catch (Exception ex) {
+                Logger.Warning($"Failed to read tilt device positions for the wizard display: {ex.Message}");
+            }
+        }
+
+        private IReadOnlyList<string> EnumeratePortNames() {
+            // The simulated adapter is always offered first (and even if port enumeration fails), so a user with
+            // no hardware can still connect it. It's only ever visible when an EAT preset is selected -- the whole
+            // connection pane is gated on IsMotorizedDevice -- which is exactly when connecting the sim EAT applies.
+            var result = new List<string> { SimulatedTiltPort.PortName };
+            try {
+                // Created here (not in the ctor): SerialPortProvider's constructor runs a WMI scan.
+                serialPortProvider ??= new SerialPortProvider();
+                result.AddRange(serialPortProvider.GetPortNames(deviceQuery: null, addDivider: false, addGenericPorts: true));
+            } catch (Exception ex) {
+                Logger.Error(ex, "Failed to enumerate serial ports for the tilt device connection");
+            }
+            return result;
+        }
+
+        private void RefreshPorts() {
+            availablePortNames = EnumeratePortNames();
+            RaisePropertyChanged(nameof(AvailablePortNames));
+            // Fix 4: a persisted port not previously enumerated (its device was unplugged) survives in the
+            // options (SelectedPortName's setter guard above never wipes it) but the ComboBox may still be
+            // showing no selection from that earlier mismatch — re-raise so it retries to visually select the
+            // persisted port now that a refresh may have brought it back into AvailablePortNames.
+            RaisePropertyChanged(nameof(SelectedPortName));
+        }
+
+        private async Task ConnectTiltDeviceAsync() {
+            var svc = tiltDeviceConnectionService;
+            var port = SelectedPortName;
+            if (svc == null || string.IsNullOrEmpty(port)) return;
+
+            // Connecting the SIMULATOR port has extra preconditions (active sim camera, matching sim config,
+            // aberrations on); if any is unmet and the user declines to fix it, abort before touching the service.
+            if (SimulatedTiltPort.IsSimulator(port) && !await PrepareSimulatorConnectionAsync()) {
+                return;
+            }
+
+            try {
+                await svc.ConnectAsync(tiltAdapterOptions.DeviceName, port, CancellationToken.None);
+                connectedPortName = port;
+                // The SelectedPortName setter already persisted the port; re-assert here so a port that
+                // actually connected is always the one saved, whatever path selected it.
+                tiltAdapterOptions.TiltDeviceSerialPortName = port;
+                // T11 item 4: default the 6-step (curvature-measuring) flow ON the moment a device connects,
+                // so a hands-off calibration measures sigma via the real `bf` command by default (the exact
+                // command automation later replays) instead of relying on the assumed/manual direction.
+                // Fix 3: this is a DEFAULT applied at most ONCE per VM lifetime (this VM is a
+                // [PartCreationPolicy(CreationPolicy.Shared)] singleton, so "lifetime" == this session), and
+                // never when the user has explicitly disabled it (before OR after a prior connect) — without
+                // both guards, a disconnect -> reconnect cycle would silently re-force a deliberately disabled
+                // option back on every time (the original bug: this ran on EVERY connect).
+                if (!hasDefaultedMeasureCurvatureOnConnect) {
+                    hasDefaultedMeasureCurvatureOnConnect = true;
+                    if (!tiltAdapterOptions.MeasureCurvatureDuringCalibration && !userExplicitlyDisabledMeasureCurvatureThisSession) {
+                        tiltAdapterOptions.MeasureCurvatureDuringCalibration = true;
+                        // Surface the silent 4→6-step change so the extra "all screws" steps aren't confusing.
+                        Notification.ShowInformation("Enabled direction measurement (6-step calibration) for the connected device — " +
+                            "recommended for hands-off runs. You can turn it off under the measurement settings.");
+                    }
+                }
+                RaisePropertyChanged(nameof(TiltDeviceStatusText));
+                RaisePropertyChanged(nameof(StepInstructions));
+            } catch (Exception ex) {
+                Logger.Error(ex, $"Failed to connect to the tilt adapter device on {port}");
+                Notification.ShowError($"Failed to connect to the tilt adapter device on {port}: {ex.Message}");
+            }
+        }
+
+        private async Task DisconnectTiltDeviceAsync() {
+            var svc = tiltDeviceConnectionService;
+            if (svc == null) return;
+            try {
+                await svc.DisconnectAsync();
+            } catch (Exception ex) {
+                Logger.Error(ex, "Failed to disconnect the tilt adapter device");
+                Notification.ShowError($"Failed to disconnect the tilt adapter device: {ex.Message}");
+            }
+        }
+
+        private void TiltDeviceConnectionService_PropertyChanged(object sender, System.ComponentModel.PropertyChangedEventArgs e) {
+            // The service raises INPC from its polling/idle timer threads; marshal without blocking them
+            // (same rationale as the device-info broadcasts, see PostToUIThread).
+            PostToUIThread(() => {
+                if (e.PropertyName == nameof(TiltDeviceConnectionService.Connected)) {
+                    // Fix 4: clear the remembered connected-port display field on EVERY disconnect (user-
+                    // initiated, an idle-timeout forced disconnect, or a connection loss) -- not just the
+                    // explicit Disconnect button -- so a later reconnect (possibly to a different port) never
+                    // has a stale value to leak into TiltDeviceStatusText.
+                    if (!IsTiltDeviceConnected) {
+                        connectedPortName = string.Empty;
+                        // A disconnect invalidates the live positions and the delta baseline.
+                        deviceDisplayPositions = null;
+                        calibrationBaselinePositions = null;
+                        RaiseScrewPositionDisplays();
+                    }
+                    RaisePropertyChanged(nameof(IsTiltDeviceConnected));
+                    RaisePropertyChanged(nameof(TiltDeviceStatusText));
+                    RaisePropertyChanged(nameof(StepInstructions));
+                    NotifyCommandsCanExecuteChangedCore();
+                }
+                if (e.PropertyName == nameof(TiltDeviceConnectionService.CurrentPositions) ||
+                    e.PropertyName == nameof(TiltDeviceConnectionService.PositionsKnown)) {
+                    // Idle poll update (paused during a run — then per-move RefreshRunDevicePositionsAsync drives this).
+                    var svc = tiltDeviceConnectionService;
+                    if (svc != null && svc.PositionsKnown && svc.CurrentPositions?.Count >= 4) {
+                        deviceDisplayPositions = svc.CurrentPositions.ToArray();
+                    }
+                    RaiseScrewPositionDisplays();
+                }
+                if (e.PropertyName == nameof(TiltDeviceConnectionService.IsOperationActive) ||
+                    e.PropertyName == nameof(TiltDeviceConnectionService.CurrentOperationName)) {
+                    RaisePropertyChanged(nameof(TiltDeviceStatusText));
+                }
+            });
+        }
+
+        // Test-observability hook for the fire-and-forget idle-prompt handling (mirrors the service's
+        // LastForcedDisconnectTask): tests await it for deterministic completion.
+        internal Task LastIdlePromptTask { get; private set; }
+
+        private void TiltDeviceConnectionService_IdlePromptRequested(object sender, EventArgs e) {
+            // Fires on the service's timer thread; the modal must be shown from the UI thread. Post (never
+            // block the timer thread) and let the async handler route the answer back to the service.
+            PostToUIThread(() => LastIdlePromptTask = HandleIdlePromptRequestedAsync());
+        }
+
+        private async Task HandleIdlePromptRequestedAsync() {
+            var svc = tiltDeviceConnectionService;
+            if (svc == null) return;
+            bool disconnect;
+            try {
+                disconnect = await confirmIdleDisconnectAsync();
+            } catch (Exception ex) {
+                // Treat a failed prompt as "keep connected" but still resolve it, so the service re-arms
+                // rather than suppressing every future idle prompt behind a permanently-outstanding one.
+                Logger.Error(ex, "Tilt device idle-disconnect prompt failed; keeping the device connected");
+                svc.KeepConnectedResetIdle();
+                return;
+            }
+            try {
+                if (disconnect) {
+                    await svc.ConfirmIdleDisconnectAsync();
+                } else {
+                    svc.KeepConnectedResetIdle();
+                }
+            } catch (Exception ex) {
+                Logger.Error(ex, "Tilt device idle disconnect failed");
+            }
+        }
+
+        // Production idle prompt: NINA's message box (it marshals onto the application dispatcher itself,
+        // and the caller is already posted to the UI thread). Default answer is No — never disconnect the
+        // hardware because a dialog was dismissed.
+        private Task<bool> ShowIdleDisconnectPromptAsync() {
+            var result = MyMessageBox.Show(
+                "The tilt adapter device has been connected but idle for 30 minutes. Disconnect it?",
+                "Tilt Adapter Device Idle",
+                System.Windows.MessageBoxButton.YesNo,
+                System.Windows.MessageBoxResult.No);
+            return Task.FromResult(result == System.Windows.MessageBoxResult.Yes);
+        }
+
+        // Pre-connect checks for the "Simulator" port. Returns false to ABORT the connect. The simulated adapter
+        // only affects the HocusFocus camera simulator's images, its geometry must match the selected EAT preset
+        // for the calibration loop to converge, and aberration rendering must be on or the loop is inert.
+        private async Task<bool> PrepareSimulatorConnectionAsync() {
+            // 1) Block unless the HocusFocus camera simulator is the active, connected camera.
+            var camInfo = CameraInfo;
+            if (camInfo == null || !camInfo.Connected ||
+                !string.Equals(camInfo.DeviceId, HocusFocusSimulatorCamera.DeviceId, StringComparison.Ordinal)) {
+                Notification.ShowError(
+                    "Connect the HocusFocus camera simulator before connecting the simulated tilt adapter — " +
+                    "the simulated adapter only changes the HocusFocus simulator's images.");
+                return false;
+            }
+
+            // No simulator options wired (device-less test rig): nothing to check or fix, allow the connect.
+            if (cameraSimulatorOptions == null) {
+                return true;
+            }
+
+            // 2) The simulator's tilt-adapter geometry must match the selected EAT preset or the loop can't
+            //    converge. If it differs, offer to change the simulator config to match; if declined, don't connect.
+            var preset = TiltAdapterDevicePreset.ByName(tiltAdapterOptions.DeviceName);
+            if (SimConfigDiffersFromPreset(preset)) {
+                var apply = await confirmSimConfigChangeAsync(
+                    "The camera simulator's tilt-adapter configuration (screw count, motor/screw type, step size, " +
+                    "screw radius) differs from the selected EAT preset, so the automated calibration loop can't " +
+                    "converge. Change the simulator configuration to match and connect?",
+                    "Simulated Tilt Adapter Configuration");
+                if (!apply) {
+                    return false;
+                }
+                // Mirror ApplyDevice's preset -> options copy, into the Sim* fields. Screw angles and adapter
+                // direction are deliberately NOT synced: the device-linked calibration measures them, and forcing
+                // them would both be discarded and remove the coverage the simulator exists to provide.
+                cameraSimulatorOptions.SimScrewCount = preset.ScrewCount;
+                cameraSimulatorOptions.SimAdjustmentType = preset.AdjustmentType;
+                cameraSimulatorOptions.SimStepperStepSizeMicrons = preset.StepperStepSizeMicrons;
+                cameraSimulatorOptions.SimScrewRadiusMillimeters = preset.ScrewRadiusMillimeters;
+            }
+
+            // 3) Aberration rendering must be on or every simulated exposure is flat and the loop measures nothing.
+            if (!cameraSimulatorOptions.EnableAberrations) {
+                cameraSimulatorOptions.EnableAberrations = true;
+                Notification.ShowInformation(
+                    "Enabled camera-simulator aberrations so the tilt calibration loop can measure changes.");
+            }
+
+            return true;
+        }
+
+        // Compares only the four hardware fields the user cares about (screw count, motor/screw type, step size,
+        // screw radius) between the simulator config and the selected EAT preset.
+        private bool SimConfigDiffersFromPreset(TiltAdapterDevicePreset preset) =>
+            cameraSimulatorOptions.SimScrewCount != preset.ScrewCount ||
+            cameraSimulatorOptions.SimAdjustmentType != preset.AdjustmentType ||
+            !HardwareValuesMatch(cameraSimulatorOptions.SimStepperStepSizeMicrons, preset.StepperStepSizeMicrons) ||
+            !HardwareValuesMatch(cameraSimulatorOptions.SimScrewRadiusMillimeters, preset.ScrewRadiusMillimeters);
+
+        // Tolerant compare for the hardware doubles (step size, radius): a benign rounding difference must not force
+        // the prompt. After a "Yes" the fields are set from the preset verbatim, so a later connect matches exactly.
+        private static bool HardwareValuesMatch(double a, double b) {
+            if (a <= 0 || b <= 0) {
+                return a <= 0 && b <= 0;
+            }
+            return Math.Abs(a - b) / b <= 0.001;
+        }
+
+        // Production "change the simulator config?" prompt: NINA's Yes/No message box, default No (a dismissed
+        // dialog must never silently rewrite the simulator's configuration).
+        private static Task<bool> ShowSimConfigChangePromptAsync(string message, string title) {
+            var result = MyMessageBox.Show(
+                message, title, System.Windows.MessageBoxButton.YesNo, System.Windows.MessageBoxResult.No);
+            return Task.FromResult(result == System.Windows.MessageBoxResult.Yes);
+        }
+
+        // ---- End motorized device connection ----------------------------------------------------------------
+
+        // ---- T11: hands-off device-driven calibration --------------------------------------------------------
+
+        /// <summary>
+        /// Sends the device move that realizes <paramref name="step"/>'s instruction (see
+        /// <see cref="EatWizardMapping.MoveForStep"/>) and awaits its completion. No-op (returns true
+        /// immediately) for <see cref="WizardStep.Baseline"/>, which is measurement-only — no move. On
+        /// failure or cancellation, surfaces the error through the existing measurement-failure panel
+        /// (<see cref="HasMeasurementFailureChoice"/> / <see cref="MeasurementFailureText"/>) and returns
+        /// false; callers must not proceed to a measurement for this step when this returns false.
+        ///
+        /// Recovery (sending <see cref="EatWizardMapping.InverseMove"/>) is attempted only when the device
+        /// may actually have moved: per <c>EatTiltMotionController.ExecuteMoveAsync</c>'s documented
+        /// exception taxonomy, a <c>TiltDeviceLimitException</c> or an <see cref="OperationCanceledException"/>
+        /// both mean NOTHING was sent (every soft-limit check and the single cancellation boundary run
+        /// strictly before any device I/O) — inverting in that case would send a spurious, physically real
+        /// move for a step that never happened. Any other exception (a command-failed/ambiguous-ack timeout,
+        /// or the serial port closing) means a command WAS sent and its outcome is ambiguous ("state-dirty"),
+        /// so a best-effort inverse is worth attempting. This mirrors the same taxonomy
+        /// InspectorVM's Automatic Adjustment (T14) journal-revert path already relies on.
+        /// </summary>
+        internal async Task<bool> ExecuteDeviceMoveForCurrentStepAsync(WizardStep step, CancellationToken ct) {
+            if (step == WizardStep.Baseline) {
+                return true;
+            }
+            var controller = tiltDeviceConnectionService?.Controller;
+            if (controller == null) {
+                StatusText = string.Empty;
+                MeasurementFailureText = "The tilt adapter device is not connected. Reconnect it before continuing this automated calibration.";
+                HasMeasurementFailureChoice = true;
+                return false;
+            }
+
+            int appliedSteps = (int)Math.Round(CalibrationAppliedAmount);
+            var move = EatWizardMapping.MoveForStep(step, appliedSteps);
+            if (move == null) {
+                return true; // Unreachable for a non-Baseline step today, but guard defensively.
+            }
+
+            try {
+                if (calibrationBaselinePositions == null) {
+                    // Capture the "delta since start" baseline before this run's first move.
+                    await RefreshRunDevicePositionsAsync(controller, captureBaseline: true).ConfigureAwait(true);
+                }
+                progress.Report(new ApplicationStatus { Status = $"Tilt Adapter Wizard: {move.Description}" });
+                StatusText = move.Description;
+                await controller.ExecuteMoveAsync(move, moveProgress, ct).ConfigureAwait(true);
+                appliedDeviceMovesThisRun.Add(move);
+                // Refresh the live position display + delta after the move (the poll is paused during the run).
+                await RefreshRunDevicePositionsAsync(controller, captureBaseline: false).ConfigureAwait(true);
+                return true;
+            } catch (Exception ex) {
+                Logger.Error(ex, $"Tilt adapter device move failed for wizard step {step}.");
+                bool deviceMayHaveMoved = !(ex is TiltDeviceLimitException) && !(ex is OperationCanceledException);
+                if (deviceMayHaveMoved) {
+                    await TryRecoverFailedMoveAsync(controller, move).ConfigureAwait(true);
+                }
+                StatusText = string.Empty;
+                MeasurementFailureText = BuildDeviceMoveFailureText(move, ex, deviceMayHaveMoved);
+                HasMeasurementFailureChoice = true;
+                return false;
+            } finally {
+                // Clear the transient bottom-left status. moveProgress leaves the last move step (e.g.
+                // "bf,150 complete") showing, which otherwise lingers in NINA's status bar after the command
+                // finishes; the next step (or its AutoFocus run) reports its own status afresh.
+                progress.Report(new ApplicationStatus { Status = string.Empty });
+            }
+        }
+
+        // Best-effort single-move recovery after a move that may have reached the device: sends the inverse
+        // of the move that just failed so the device returns to its position before this step. Always uses
+        // CancellationToken.None — a recovery attempt must never itself be skipped due to cancellation.
+        private async Task TryRecoverFailedMoveAsync(ITiltMotionController controller, TiltAdapterMove move) {
+            var inverse = EatWizardMapping.InverseMove(move);
+            if (inverse == null) {
+                return;
+            }
+            try {
+                await controller.ExecuteMoveAsync(inverse, moveProgress, CancellationToken.None).ConfigureAwait(true);
+            } catch (Exception ex) {
+                Logger.Error(ex, "Failed to recover tilt adapter device position after a failed move; the device may not be at its expected position.");
+            }
+        }
+
+        private static string BuildDeviceMoveFailureText(TiltAdapterMove move, Exception ex, bool recoveryAttempted) {
+            string reason = ex is OperationCanceledException ? "was cancelled before it was sent"
+                : ex is TiltDeviceLimitException ? $"was refused: {ex.Message}"
+                : $"failed: {ex.Message}";
+            string recovery = recoveryAttempted
+                ? " The device was sent the inverse move to return it to its position before this step; verify positions before continuing."
+                : " Nothing was sent to the device for this step.";
+            return $"Automated device move ({move.Description}) {reason}.{recovery}";
+        }
+
+        // Auto Run All cancellation/failure recovery: walks every device move successfully applied during the
+        // current run, in reverse, sending each one's inverse — returning the device to baseline. Best-effort;
+        // stops and surfaces a warning if a recovery move itself fails (device position becomes uncertain).
+        // Returns what actually happened, which the caller needs in order to decide whether the run is still
+        // resumable: anyRolledBack is true once at least one inverse move has been sent (the device no longer
+        // matches this run's readings), recoveryFailed is true if a recovery move threw (position uncertain).
+        // A run that had applied nothing yields (false, false) and is untouched.
+        private async Task<(bool anyRolledBack, bool recoveryFailed)> RecoverAppliedMovesAsync() {
+            var controller = tiltDeviceConnectionService?.Controller;
+            var moves = appliedDeviceMovesThisRun.ToArray();
+            appliedDeviceMovesThisRun.Clear();
+            deviceMoveAppliedForStep = null;
+            if (controller == null || moves.Length == 0) {
+                return (false, false);
+            }
+            bool anyRolledBack = false;
+            try {
+                for (int i = moves.Length - 1; i >= 0; i--) {
+                    var inverse = EatWizardMapping.InverseMove(moves[i]);
+                    if (inverse == null) {
+                        continue;
+                    }
+                    try {
+                        progress.Report(new ApplicationStatus { Status = $"Tilt Adapter Wizard: recovering — {inverse.Description}" });
+                        await controller.ExecuteMoveAsync(inverse, moveProgress, CancellationToken.None).ConfigureAwait(true);
+                        anyRolledBack = true;
+                    } catch (Exception ex) {
+                        Logger.Error(ex, "Failed to fully recover tilt adapter device position after an automated-run cancellation/failure.");
+                        MeasurementFailureText = $"Recovery failed while returning the device to its original position: {ex.Message}. Verify screw/motor positions before continuing.";
+                        HasMeasurementFailureChoice = true;
+                        return (anyRolledBack, true);
+                    }
+                }
+            } finally {
+                // Clear the transient "recovering — …" bottom-left status so it doesn't linger after recovery.
+                progress.Report(new ApplicationStatus { Status = string.Empty });
+            }
+            return (anyRolledBack, false);
+        }
+
+        // The single cancel/failure exit for an automated run: roll this run's device moves back, release the
+        // exclusive lease, and — when the rollback actually changed the device — latch the run as unresumable
+        // (see deviceRunAbandoned). Every caller previously did the first two by hand and none did the third,
+        // which left the measurement buttons live on a run whose device state had been undone underneath them.
+        private async Task AbandonDeviceRunAsync(bool cancelled) {
+            var (anyRolledBack, recoveryFailed) = await RecoverAppliedMovesAsync();
+            ReleaseTiltDeviceOperationToken();
+
+            if (cancelled) {
+                StatusText = anyRolledBack
+                    ? "Auto Run All cancelled; the tilt adapter was returned to its original position."
+                    : "Auto Run All cancelled.";
+            }
+
+            // Only a run whose moves were actually undone — or whose rollback failed, leaving the position
+            // uncertain — is unresumable: its stored readings no longer describe where the device is. A run
+            // that had applied nothing (e.g. an AutoFocus failure on Baseline, which has no move) is physically
+            // untouched, so leave it retryable exactly as it was before this latch existed.
+            if (!anyRolledBack && !recoveryFailed) {
+                return;
+            }
+            deviceRunAbandoned = true;
+
+            string reason = recoveryFailed
+                ? "This calibration run cannot be resumed: the tilt adapter could not be fully returned to its original position."
+                : "This calibration run cannot be resumed because the tilt adapter was returned to its original position.";
+            string cannotResume = $"{reason} Click Abort Wizard, then Calibrate, to start a new run.";
+            // Say so wherever the user is already looking: the failure panel when there is one (it owns the
+            // retry button this just disabled), otherwise the status line used by the cancel path.
+            if (HasMeasurementFailureChoice) {
+                MeasurementFailureText = string.IsNullOrEmpty(MeasurementFailureText)
+                    ? cannotResume
+                    : $"{MeasurementFailureText} {cannotResume}";
+            } else {
+                StatusText = string.IsNullOrEmpty(StatusText) ? cannotResume : $"{StatusText} {cannotResume}";
+            }
+        }
+
+        private void ReleaseTiltDeviceOperationToken() {
+            var t = tiltDeviceOperationToken;
+            tiltDeviceOperationToken = null;
+            t?.Dispose();
+        }
+
+        // Whether the currently configured CalibrationAppliedAmount is safe to send to a connected motorized
+        // device: positive, and within both the per-command and cumulative-excursion safety caps (T8
+        // options). Used for AutoRunAllCommand's canExecute (fast/sync, no side effects).
+        private bool HasValidDeviceAppliedAmount() => TryValidateDeviceAppliedAmount(out _);
+
+        // Same check as HasValidDeviceAppliedAmount, with a human-readable reason for Notification.ShowError
+        // — called before StartAsync/AutoRunAllAsync actually proceeds with a device-driven run (T11 item 4).
+        private bool TryValidateDeviceAppliedAmount(out string error) {
+            int appliedSteps = (int)Math.Round(CalibrationAppliedAmount);
+            if (appliedSteps <= 0) {
+                error = "The applied amount per calibration step must be greater than zero to run a hands-off calibration.";
+                return false;
+            }
+            int maxSteps = tiltAdapterOptions.TiltDeviceMaxStepsPerCommand;
+            if (maxSteps > 0 && appliedSteps > maxSteps) {
+                error = $"The applied amount ({appliedSteps} steps) exceeds the configured maximum steps per command ({maxSteps}). Reduce the applied amount or increase the limit before running a hands-off calibration.";
+                return false;
+            }
+            int maxExcursion = tiltAdapterOptions.TiltDeviceMaxExcursionSteps;
+            if (maxExcursion > 0 && appliedSteps > maxExcursion) {
+                error = $"The applied amount ({appliedSteps} steps) exceeds the configured maximum excursion ({maxExcursion} steps). Reduce the applied amount or increase the limit before running a hands-off calibration.";
+                return false;
+            }
+            error = null;
+            return true;
+        }
+
+        /// <summary>
+        /// Drives every remaining calibration step from <see cref="CurrentStep"/> through
+        /// <see cref="WizardStep.Complete"/> automatically: device move, live measurement, advance — repeated
+        /// without further clicks — finishing with Complete's restore move (returns the device to baseline;
+        /// handled by <see cref="MeasureStep"/>, which this reuses for every step so the manual "Run
+        /// Measurement" flow and this loop share one code path). If the wizard is not yet running, starts it
+        /// first (mirrors clicking Start, including the applied-amount validation and exclusive
+        /// operation-token acquisition in <see cref="StartAsync"/>).
+        ///
+        /// Cancelling (the existing <see cref="CancelCommand"/> / measureCts) lets the CURRENT move/measurement
+        /// finish — the device has no abort command — then recovers toward baseline by sending the inverse of
+        /// every move applied so far, in reverse order (<see cref="RecoverAppliedMovesAsync"/>), and stops. A
+        /// hard failure partway through (a move or a measurement failing) is recovered the same way, UNLESS
+        /// the failure was Complete's own restore move — by then the calibration has already succeeded (and
+        /// the device-linked marker is already set), and ExecuteDeviceMoveForCurrentStepAsync already
+        /// attempted its own single-move recovery; layering a second whole-run rollback on top of that would
+        /// risk compounding an already-ambiguous device state.
+        /// </summary>
+        private async Task AutoRunAllAsync() {
+            if (!IsMotorizedDevice || !IsTiltDeviceConnected) {
+                Notification.ShowWarning("Connect the tilt adapter device before running the automated calibration.");
+                return;
+            }
+            if (!TryValidateDeviceAppliedAmount(out var validationError)) {
+                Notification.ShowError(validationError);
+                return;
+            }
+
+            if (!IsWizardRunning) {
+                await StartAsync();
+                if (!IsWizardRunning) {
+                    return; // StartAsync already surfaced why (validation failure or device busy).
+                }
+            } else if (!currentRunIsDeviceDriven) {
+                Notification.ShowWarning("Restart the wizard (Abort Wizard, then Calibrate) while the tilt adapter device is connected to use Auto Run All.");
+                return;
+            }
+
+            IsAutoRunningAll = true;
+            NotifyCommandsCanExecuteChanged();
+
+            measureCts?.Dispose();
+            measureCts = new CancellationTokenSource();
+            var token = measureCts.Token;
+            IsMeasuring = true;
+            try {
+                while (CurrentStep != WizardStep.Complete) {
+                    if (token.IsCancellationRequested) {
+                        await AbandonDeviceRunAsync(cancelled: true);
+                        return;
+                    }
+                    var stepBefore = CurrentStep;
+                    await MeasureStep(stepBefore, token, fromSaved: false);
+                    if (HasMeasurementFailureChoice) {
+                        if (CurrentStep != WizardStep.Complete) {
+                            // A move or measurement failed before the run finished — undo everything applied so far,
+                            // which also latches the run as unresumable if that rollback moved the device.
+                            await AbandonDeviceRunAsync(cancelled: false);
+                        } else {
+                            // Only Complete's own restore move failed: the calibration itself already succeeded, so
+                            // there is nothing to abandon (and MeasureStep already released the lease at Complete).
+                            ReleaseTiltDeviceOperationToken();
+                        }
+                        return;
+                    }
+                    if (CurrentStep == stepBefore) {
+                        // Defensive: NextStep() did not advance (unreachable when HasMeasurementFailureChoice
+                        // is false); never spin forever.
+                        break;
+                    }
+                }
+            } catch (OperationCanceledException) {
+                await AbandonDeviceRunAsync(cancelled: true);
+            } finally {
+                IsMeasuring = false;
+                IsAutoRunningAll = false;
+                NotifyCommandsCanExecuteChanged();
+            }
+        }
+
+        // ---- End T11: hands-off device-driven calibration ------------------------------------------------
+
         // Inputs that feed the screw-turn calculation, wired to their source of truth: pixel size to
         // the active NINA camera profile, focuser step size to the Inspector's MicronsPerFocuserStep.
         public double PixelSizeMicronsValue {
@@ -1009,8 +1974,33 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
         }
 
         private Task StartAsync() {
+            // T11 item 4/5: a connected, motorized run drives its own moves and must hold the exclusive T9
+            // operation lease for the whole run — acquire (or refuse) it BEFORE touching any other state, so
+            // a validation/busy failure leaves everything exactly as it was (no partial reset).
+            bool deviceDriven = IsTiltDeviceConnected && IsMotorizedDevice;
+            if (deviceDriven) {
+                if (!TryValidateDeviceAppliedAmount(out var validationError)) {
+                    Notification.ShowError(validationError);
+                    return Task.CompletedTask;
+                }
+                var opToken = tiltDeviceConnectionService.TryBeginOperation("Tilt Adapter Wizard Calibration");
+                if (opToken == null) {
+                    Notification.ShowError("The tilt adapter device is busy with another operation.");
+                    return Task.CompletedTask;
+                }
+                ReleaseTiltDeviceOperationToken(); // defensive; should already be null at this point
+                tiltDeviceOperationToken = opToken;
+            }
+            currentRunIsDeviceDriven = deviceDriven;
+            deviceMoveAppliedForStep = null;
+            appliedDeviceMovesThisRun.Clear();
+            // Re-capture the position-delta baseline for this run on the first device move below (the cp poll is
+            // paused for the whole run, so live positions come from the controller per move).
+            calibrationBaselinePositions = null;
+
             StatusText = string.Empty;
             ClearMeasurementFailureChoice();
+            deviceRunAbandoned = false; // a fresh run starts from Baseline and re-acquires the exclusive lease
             stepReadings.Clear();
             HasMeasurementConsistencyWarning = false;
             MeasurementConsistencyWarningText = string.Empty;
@@ -1020,6 +2010,8 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
             ConfidenceWarningText = string.Empty;
             HasWarning = false;
             WarningText = string.Empty;
+            HasDeviceLinkDroppedWarning = false;
+            DeviceLinkDroppedWarningText = string.Empty;
             ClearSummaryRows();
             runRootFolder = null;
             metadataPath = null;
@@ -1068,7 +2060,7 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
                 ScrewRadiusMillimeters = tiltAdapterOptions.ScrewRadiusMillimeters,
                 PixelSizeMicrons = profileService.ActiveProfile.CameraSettings.PixelSize,
                 FocuserStepSizeMicrons = EffectiveFocuserStepMicrons(),
-                CalibrationAppliedAmount = calibrationAppliedAmount,
+                CalibrationAppliedAmount = CalibrationAppliedAmount,
                 MeasurementAverageCount = Math.Max(1, tiltAdapterOptions.MeasurementAverageCount),
                 OptimizedStarDetectionSettings = CaptureDetectionSettings(),
                 MeasurementContext = CaptureMeasurementContext(
@@ -1174,8 +2166,51 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
             if (step == WizardStep.Baseline) {
                 ClearSummaryRows();
             }
-            var reading = await RunAveragedMeasurement(token, step, StepDescription(step), fromSaved);
-            if (reading == null) {
+
+            // Fix 2 / [CRITICAL GATE]: a "Use Saved AF" measurement (fromSaved) never drives the device — if
+            // this happens during a run that started device-driven, THIS step's real move (which the
+            // wizard-screw <-> device-corner correspondence depends on having actually happened) was skipped,
+            // so the run is no longer purely device-driven. Err safe the instant it happens: drop out of
+            // device-driven mode so (a) RunCalibrationMath — which reads currentRunIsDeviceDriven fresh at
+            // Complete — CLEARS DeviceLinkedCalibrationDeviceName instead of wrongly setting it, and (b) no
+            // further device moves — including Complete's restore move, which would otherwise "restore" a
+            // forward move that, for this step, never actually happened — are sent for the rest of this run.
+            // Release the exclusive operation lease too: this run will never touch the device again, so
+            // holding it would needlessly block other automation (a future run, the inspector's Automatic
+            // Adjustment) until Restart.
+            if (fromSaved && currentRunIsDeviceDriven) {
+                currentRunIsDeviceDriven = false;
+                ReleaseTiltDeviceOperationToken();
+                HasDeviceLinkDroppedWarning = true;
+                DeviceLinkDroppedWarningText =
+                    $"This run is no longer device-linked: \"Use Saved AF\" skipped the device move for step '{step}'. " +
+                    "The remaining steps will not move the device, and this calibration will not be marked as device-linked when it completes.";
+            }
+
+            // T11: a connected, motorized run drives this step's move itself, BEFORE the measurement. Never
+            // for a "Use Saved AF" re-analysis (fromSaved) — that re-analyzes already-captured frames; the
+            // physical device must not be moved again for it. deviceMoveAppliedForStep guards a measurement
+            // RETRY (the move already succeeded; only AutoFocus/sensor-modeling failed) from re-sending the
+            // same move a second time.
+            if (currentRunIsDeviceDriven && !fromSaved && deviceMoveAppliedForStep != step) {
+                bool moved = await ExecuteDeviceMoveForCurrentStepAsync(step, token);
+                if (!moved) {
+                    StatusText = string.Empty;
+                    return; // Failure text/HasMeasurementFailureChoice already set by ExecuteDeviceMoveForCurrentStepAsync.
+                }
+                deviceMoveAppliedForStep = step;
+            }
+
+            bool ok;
+            StepReading? reading;
+            if (MeasurementStepOverrideForTest != null) {
+                ok = await MeasurementStepOverrideForTest(step, token);
+                reading = ok ? Reading(step) : (StepReading?)null;
+            } else {
+                reading = await RunAveragedMeasurement(token, step, StepDescription(step), fromSaved);
+                ok = reading != null;
+            }
+            if (!ok || reading == null) {
                 // Show the inline failure panel (below) instead of the bare "Measurement failed." status — that left the
                 // screw-adjustment instruction on screen (reads as "re-adjust the screw") and duplicated the panel text
                 // right above the panel. Clear StatusText so the visible post-measurement status line doesn't leak the
@@ -1189,6 +2224,20 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
             stepReadings[step] = reading.Value;
             RecordStepIntoMetadata(step, reading.Value);
             NextStep();
+
+            // T11: Complete's restore move (EatWizardMapping.MoveForStep(Complete, N) = DiagonalB(-N)) returns
+            // the device to baseline — sent automatically for ANY device-driven run, whether stepped manually
+            // (repeated "Run Measurement" clicks) or via AutoRunAllAsync's loop (which just calls this method
+            // repeatedly). The operation lease is released here, AFTER the restore move is attempted, so it
+            // still protects that final move — NOT in NextStep(), which runs synchronously and cannot await it.
+            if (CurrentStep == WizardStep.Complete && currentRunIsDeviceDriven) {
+                bool restored = await ExecuteDeviceMoveForCurrentStepAsync(WizardStep.Complete, CancellationToken.None);
+                ReleaseTiltDeviceOperationToken();
+                if (!restored) {
+                    return; // Failure text/HasMeasurementFailureChoice already set; calibration itself already succeeded.
+                }
+                StatusText = "Automated calibration complete; device returned to its original position.";
+            }
         }
 
         // Description shown on each summary row, reflecting the single move performed for the step.
@@ -1215,6 +2264,14 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
         // hardware-recovery path is exercisable without running the paraboloid fit. Always null in production, so
         // CalibrationTiltPlane below is byte-for-byte the live inspector chain.
         private TiltPlaneModel calibrationTiltPlaneOverrideForTest;
+
+        // Test seam: same override as above, settable directly (not just via RunCalibrationForTest's local
+        // try/finally) so ReplayAsync's per-step loop — which reads CalibrationTiltPlane directly, without a
+        // live inspector analysis — can be exercised under test too. Always null in production.
+        internal TiltPlaneModel CalibrationTiltPlaneOverrideForTest {
+            get => calibrationTiltPlaneOverrideForTest;
+            set => calibrationTiltPlaneOverrideForTest = value;
+        }
 
         // The wizard calibrates from the per-star sensor-curve model's tilt (the paraboloid Gx/Gy, expressed as a
         // TiltPlaneModel by SensorModelAberrationResult.CreateTiltPlaneModel) — NEVER the 4-corner region plane. The
@@ -1416,10 +2473,14 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
                     tiltAdapterOptions.ScrewRadiusMillimeters,
                     profileService.ActiveProfile.CameraSettings.PixelSize,
                     EffectiveFocuserStepMicrons(),
-                    calibrationAppliedAmount,
-                    IsStepperAdjustment);
+                    CalibrationAppliedAmount,
+                    IsStepperAdjustment,
+                    deviceDriven: currentRunIsDeviceDriven);
                 RebuildDiagram();
                 FinalizeMetadata();
+                // NOTE: the device operation token (if any) is released by MeasureStep's caller AFTER the
+                // Complete restore move is attempted -- NOT here -- so the lease still protects that final
+                // move (NextStep runs synchronously and cannot await it).
             }
 
             // The measurement-consistency warning is intentionally NOT cleared here: it is set at the end of a
@@ -1435,7 +2496,18 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
             measureCts?.Cancel();
             IsWizardRunning = false;
             IsMeasuring = false;
-            isReplaying = false;
+            IsReplaying = false;
+            IsAutoRunningAll = false;
+            // Abandoning a device-driven run releases the exclusive lease so other automation (a future run,
+            // the inspector's Automatic Adjustment) isn't blocked. Deliberately does NOT attempt to drive the
+            // device back to baseline — an abandoned run's physical recovery is left to the user (mirrors the
+            // existing disconnected-run philosophy of BaselineRecoveryInstructions); only a controlled
+            // Auto Run All cancellation/failure attempts an automatic device recovery (RecoverAppliedMovesAsync).
+            ReleaseTiltDeviceOperationToken();
+            currentRunIsDeviceDriven = false;
+            deviceRunAbandoned = false;
+            deviceMoveAppliedForStep = null;
+            appliedDeviceMovesThisRun.Clear();
             SaveAFRuns = false; // saving must be re-enabled explicitly for each run
             stepReadings.Clear();
             measuredHardwareMicrons = double.NaN;
@@ -1454,6 +2526,8 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
             RebaselineDriftWarningText = string.Empty;
             HasWarning = false;
             WarningText = string.Empty;
+            HasDeviceLinkDroppedWarning = false;
+            DeviceLinkDroppedWarningText = string.Empty;
             StatusText = string.Empty;
             ClearMeasurementFailureChoice();
             CurrentStep = WizardStep.Baseline;
@@ -1461,6 +2535,13 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
 
         private void ApplyDevice(string name) {
             var preset = TiltAdapterDevicePreset.ByName(name);
+            // Captured BEFORE the DeviceName assignment below so the CalibrationAppliedAmount reset (further
+            // down) can tell a genuine user-driven device change apart from ApplyDevice's other call site --
+            // the constructor's re-lock-on-load path, which re-asserts the ALREADY-persisted device on every
+            // app start. Without this guard the ctor call would unconditionally overwrite a persisted, possibly
+            // user-edited CalibrationAppliedAmount with the preset default on every launch (this VM is a
+            // [PartCreationPolicy(CreationPolicy.Shared)] singleton, so the ctor runs exactly once per app run).
+            var previousName = tiltAdapterOptions.DeviceName;
             tiltAdapterOptions.DeviceName = preset.Name;
             if (!preset.IsManual) {
                 tiltAdapterOptions.ScrewCount = preset.ScrewCount;
@@ -1469,15 +2550,30 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
                 tiltAdapterOptions.StepperStepSizeMicrons = preset.StepperStepSizeMicrons;
                 tiltAdapterOptions.ScrewRadiusMillimeters = preset.ScrewRadiusMillimeters;
             }
+            // Reset the applied amount to the newly selected preset's default (still user-editable
+            // afterward) ONLY when the device actually changed. Applies to Manual too, so switching back to
+            // Manual resets to 1 full turn rather than leaving a leftover stepper value (e.g. 150) on screen --
+            // but re-asserting the SAME already-persisted device (the ctor path) must never clobber a value the
+            // user already customized for that device.
+            if (!string.Equals(preset.Name, previousName, System.StringComparison.Ordinal)) {
+                tiltAdapterOptions.CalibrationAppliedAmount = preset.DefaultCalibrationAmount;
+            }
             RaisePropertyChanged(nameof(SelectedDevice));
             RaisePropertyChanged(nameof(IsManualDevice));
+            RaisePropertyChanged(nameof(IsMotorizedDevice));
             RaisePropertyChanged(nameof(AdjustmentType));
             RaisePropertyChanged(nameof(ThreadPitchMicronsValue));
             RaisePropertyChanged(nameof(StepperStepSizeMicronsValue));
             RaisePropertyChanged(nameof(ScrewRadiusMillimetersValue));
             RaisePropertyChanged(nameof(IsStepperAdjustment));
             RaisePropertyChanged(nameof(CalibrationAmountLabel));
+            RaisePropertyChanged(nameof(CalibrationAppliedAmount));
             RaisePropertyChanged(nameof(CalibrationAppliedAmountDisplay));
+            RaisePropertyChanged(nameof(StepInstructions));
+            // ApplyDevice only runs on the UI thread (SelectedDevice setter) or during construction, so the
+            // commands are notified without marshaling (a Dispatch here would break the "device broadcasts
+            // never block on the UI thread" accounting the F15 tests pin).
+            NotifyCommandsCanExecuteChangedCore(); // ConnectDeviceCommand gates on IsMotorizedDevice
         }
 
         private void UseMeasuredHardware() {
@@ -1503,8 +2599,12 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
 
         // Runs the full calibration math from the six step readings and writes the results to the options. Shared
         // by a live run (geometry from the current options/profile) and a replay (geometry from the metadata).
+        // deviceDriven: true only for a completed CONNECTED, device-driven (hands-off) run — the wizard sent
+        // every step's move itself, so the wizard-screw <-> device-corner correspondence (EatWizardMapping) is
+        // known to be correct. False for a disconnected/manual-clicking run, a replay, or the RunCalibrationForTest
+        // seed path (its default) — see the [CRITICAL GATE] note on ITiltAdapterOptions.DeviceLinkedCalibrationDeviceName.
         private void RunCalibrationMath(int screwCount, double radiusMm, double pixelSize, double fStep,
-            double appliedAmount, bool isStepper) {
+            double appliedAmount, bool isStepper, bool deviceDriven) {
             bool measuredCurvature = stepReadings.ContainsKey(WizardStep.AllInward);
             var a = Reading(WizardStep.Baseline);
             var b = Reading(WizardStep.AllInward);
@@ -1535,6 +2635,12 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
             tiltAdapterOptions.CalibratedScrewCount = screwCount;
             tiltAdapterOptions.IsCalibrated = true;
             tiltAdapterOptions.CalibrationIsManual = false;
+            // [CRITICAL GATE] Set ONLY on a successful, connected, device-driven run's completion; cleared for
+            // every other completion (disconnected live run, replay). A stale marker would let automation
+            // (T14's Automatic Adjustment / a future wizard auto-apply) apply corrections against a
+            // wizard-screw <-> device-corner correspondence that was never actually established by this
+            // calibration — err toward clearing whenever the run wasn't a fresh connected hands-off run.
+            tiltAdapterOptions.DeviceLinkedCalibrationDeviceName = deviceDriven ? tiltAdapterOptions.DeviceName : string.Empty;
 
             lastRawAngleDiff = rawDiff;
             lastMoveMagnitudeRatio = TiltCalibrationCalculator.MoveMagnitudeRatio(d1A, d1B, d2A, d2B);
@@ -1595,6 +2701,14 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
                 FallbackCurvatureSign = tiltAdapterOptions.ScrewInwardCurvatureSign
             });
             EvaluateCalibrationConfidence(lastConfidence);
+            // [CRITICAL GATE] Persist the confidence result as the automation-trust marker — the second half
+            // of the automation gate alongside DeviceLinkedCalibrationDeviceName above. Unlike that marker,
+            // this one is NOT conditioned on deviceDriven: a disconnected/manual-clicking live run and a
+            // replay both recompute this exact confidence from their own step readings, so their reliability
+            // is just as real (and just as gating) as a device-driven run's. Reused, never invented: this is
+            // the same lastConfidence.IsReliable the wizard already surfaces as the (previously non-blocking)
+            // HasConfidenceWarning banner above.
+            tiltAdapterOptions.CalibrationIsReliable = lastConfidence?.IsReliable ?? false;
             RaiseHardwareSummaryChanged();
         }
 
@@ -1700,13 +2814,20 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
             stepReadings[step] = new StepReading { A = a, B = b, Mean = mean };
         }
 
+        // Test seam: set the abandoned-run latch directly, so a test can prove StartAsync clears it WITHOUT
+        // going through Restart first (Restart clears it too, which would otherwise mask a missing clear).
+        internal void SetDeviceRunAbandonedForTest(bool value) {
+            deviceRunAbandoned = value;
+            NotifyCommandsCanExecuteChanged();
+        }
+
         // Test seam: run the calibration math over the seeded step readings (mirrors NextStep -> Complete). The
         // optional overrides supply the sensor geometry a live run reads from the inspector/profile + the paraboloid
         // tilt-plane model (all of which the seed path bypasses), so RunCalibrationMath's hardware-recovery + pitch
         // branch can run under test.
         internal void RunCalibrationForTest(
             double? radiusMm = null, double? pixelSizeMicrons = null, double? focuserStepMicrons = null,
-            TiltPlaneModel tiltPlaneOverride = null) {
+            TiltPlaneModel tiltPlaneOverride = null, bool deviceDriven = false) {
             calibrationTiltPlaneOverrideForTest = tiltPlaneOverride;
             try {
                 RunCalibrationMath(
@@ -1714,8 +2835,9 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
                     radiusMm ?? tiltAdapterOptions.ScrewRadiusMillimeters,
                     pixelSizeMicrons ?? profileService.ActiveProfile.CameraSettings.PixelSize,
                     focuserStepMicrons ?? EffectiveFocuserStepMicrons(),
-                    calibrationAppliedAmount,
-                    IsStepperAdjustment);
+                    CalibrationAppliedAmount,
+                    IsStepperAdjustment,
+                    deviceDriven);
             } finally {
                 calibrationTiltPlaneOverrideForTest = null;
             }
@@ -1731,16 +2853,39 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
         //   (profile untouched) + the run's stored geometry — reproduces the original calibration exactly.
         // - Update profile to capture-time: persist the run's star-detection settings to the live profile, then replay
         //   against it + the run's stored geometry.
+        // Test seam: when set, ReplayAsync uses this instead of opening a real (modal, WinForms)
+        // FolderBrowserDialog. Called with the current SaveAFRunsPath (the dialog's initial selection in
+        // production); returns the folder to replay, or null/empty to simulate the dialog being cancelled.
+        // Always null in production.
+        internal Func<string, string> SelectReplayFolderForTest { get; set; }
+
+        // Test seam: when set, ReplayAsync uses this instead of showing the real (WPF-window) shared
+        // replay-settings modal (ReplaySettingsPrompt.ShowAsync). Always null in production.
+        internal Func<AutoFocusReplayMetadata, Task<ReplaySettingsChoice>> SelectReplaySettingsForTest { get; set; }
+
+        // Test seam: mirrors MeasurementStepOverrideForTest for the live wizard flow — when set, ReplayAsync
+        // uses this instead of invoking the live inspector's AnalyzeAutoFocusFromSavedPath for each step (the
+        // reading itself still comes from CalibrationTiltPlane, i.e. CalibrationTiltPlaneOverrideForTest
+        // above). Always null in production.
+        internal Func<WizardStep, CancellationToken, Task<bool>> ReplayStepOverrideForTest { get; set; }
+
         private async Task ReplayAsync() {
             string folder;
-            using (var dialog = new System.Windows.Forms.FolderBrowserDialog()) {
-                if (!string.IsNullOrEmpty(SaveAFRunsPath)) {
-                    dialog.SelectedPath = SaveAFRunsPath;
-                }
-                if (dialog.ShowDialog() != System.Windows.Forms.DialogResult.OK) {
+            if (SelectReplayFolderForTest != null) {
+                folder = SelectReplayFolderForTest(SaveAFRunsPath);
+                if (string.IsNullOrEmpty(folder)) {
                     return;
                 }
-                folder = dialog.SelectedPath;
+            } else {
+                using (var dialog = new System.Windows.Forms.FolderBrowserDialog()) {
+                    if (!string.IsNullOrEmpty(SaveAFRunsPath)) {
+                        dialog.SelectedPath = SaveAFRunsPath;
+                    }
+                    if (dialog.ShowDialog() != System.Windows.Forms.DialogResult.OK) {
+                        return;
+                    }
+                    folder = dialog.SelectedPath;
+                }
             }
 
             var metadataFile = Path.Combine(folder, "metadata.json");
@@ -1769,6 +2914,7 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
             bool replayHasCurvatureSteps = byStep.ContainsKey(WizardStep.AllInward.ToString());
             var replaySteps = GetMeasurementSteps(replayHasCurvatureSteps);
             activeMeasurementSteps = replaySteps;
+            RaisePropertyChanged(nameof(StepProgressDisplay)); // step count (4 vs 6) may differ from the prior run
             foreach (var step in replaySteps) {
                 if (!byStep.ContainsKey(step.ToString())) {
                     Notification.ShowError($"metadata.json has no saved folder for step '{step}'. Cannot replay.");
@@ -1780,7 +2926,9 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
             // representative per-step AutoFocus replay snapshot). Cancelling / closing the modal aborts.
             var representativeStepFolder = byStep[replaySteps.First().ToString()];
             AutoFocusReplayMetadata.TryLoad(representativeStepFolder, out var replayMetadata, out _);
-            var choice = await ReplaySettingsPrompt.ShowAsync(windowServiceFactory, replayMetadata, ReplaySettingsPromptTexts.TiltCalibration);
+            var choice = SelectReplaySettingsForTest != null
+                ? await SelectReplaySettingsForTest(replayMetadata)
+                : await ReplaySettingsPrompt.ShowAsync(windowServiceFactory, replayMetadata, ReplaySettingsPromptTexts.TiltCalibration);
             if (choice == ReplaySettingsChoice.Cancel) {
                 return;
             }
@@ -1813,7 +2961,7 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
             measureCts = new CancellationTokenSource();
             var token = measureCts.Token;
 
-            isReplaying = true;
+            IsReplaying = true;
             IsWizardRunning = true;
             IsMeasuring = true;
             stepReadings.Clear();
@@ -1845,7 +2993,15 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
             try {
                 foreach (var step in replaySteps) {
                     token.ThrowIfCancellationRequested();
-                    StatusText = $"Replaying {step}...";
+                    // Mirror the live path's step advance (NextStep -> CurrentStep). The wizard header is entirely
+                    // derived from currentStep -- StepProgressDisplay ("Step N of M"), StepTitle and StepInstructions
+                    // are re-raised ONLY by this setter -- and Panel B is on screen for the whole replay, so without
+                    // this the header stays frozen on the pre-replay step (every step reading "Step 1 of 6" under a
+                    // "Baseline Measurement" heading). Assigned through the property, not the field, for that reason.
+                    // Safe mid-replay despite the setter's NotifyCommandsCanExecuteChanged: IsMeasuring is true for
+                    // the whole run, which is what actually gates every measurement command's canExecute.
+                    CurrentStep = step;
+                    StatusText = $"Replaying {StepTitleText(step)}...";
                     // Capture-time modes ("use captured in memory" and "update profile") replay each step with its own
                     // detached capture-time star-detection snapshot as an override, so the live profile is untouched
                     // during the replay. "Use current settings" passes null and uses the current profile.
@@ -1853,14 +3009,22 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
                         ? BuildTiltReplayDetectionOverride(byStep[step.ToString()], metadata)
                         : null;
                     bool ok;
-                    // Force the per-star sensor-curve model so replay derives tilt from the paraboloid, like a live run.
-                    var prevForce = inspector.ForceSensorCurveModelGeneration;
-                    inspector.ForceSensorCurveModelGeneration = true;
-                    try {
-                        ok = await inspector.AnalyzeAutoFocusFromSavedPath(byStep[step.ToString()], token, detectionOverride);
-                    } finally {
-                        inspector.ForceSensorCurveModelGeneration = prevForce;
+                    if (ReplayStepOverrideForTest != null) {
+                        ok = await ReplayStepOverrideForTest(step, token);
+                    } else {
+                        // Force the per-star sensor-curve model so replay derives tilt from the paraboloid, like a live run.
+                        var prevForce = inspector.ForceSensorCurveModelGeneration;
+                        inspector.ForceSensorCurveModelGeneration = true;
+                        try {
+                            ok = await inspector.AnalyzeAutoFocusFromSavedPath(byStep[step.ToString()], token, detectionOverride);
+                        } finally {
+                            inspector.ForceSensorCurveModelGeneration = prevForce;
+                        }
                     }
+                    // Failure messages keep the raw WizardStep name: it matches the saved step folder on disk
+                    // (StepFolderName -> "03_ReBaseline1" / "05_ReBaseline2"), whereas StepTitleText maps BOTH
+                    // re-baseline steps to "Return to Baseline". The toast outlives the panel (a failed replay
+                    // collapses it), so it is the only thing telling the user which folder to look at.
                     if (!ok) {
                         StatusText = $"Replay failed at {step}.";
                         Notification.ShowError($"Replay failed at step '{step}'. The saved frames could not be analyzed.{profileNotChangedNote}");
@@ -1891,25 +3055,36 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
                 }
 
                 if (mode.UseMetadataGeometry) {
-                    calibrationAppliedAmount = metadata.CalibrationAppliedAmount;
+                    // Written directly (not via the CalibrationAppliedAmount property setter) so the two
+                    // dependent properties below are ALWAYS re-raised, even if the replayed value happens
+                    // to match what's already persisted (the property setter's no-op guard would otherwise
+                    // skip the raise, leaving a stale value on screen if the user has a pending edit).
+                    tiltAdapterOptions.CalibrationAppliedAmount = metadata.CalibrationAppliedAmount;
                     RaisePropertyChanged(nameof(CalibrationAppliedAmount));
                     RaisePropertyChanged(nameof(CalibrationAppliedAmountDisplay));
+                    // [CRITICAL GATE] deviceDriven: false — a replay never sends live device moves (it
+                    // re-analyzes already-captured frames), so it can never re-establish the wizard-screw <->
+                    // device-corner correspondence, regardless of whether a device happens to be connected
+                    // right now. Always clears any prior device-linked marker.
                     RunCalibrationMath(
                         metadata.NumberOfScrews,
                         metadata.ScrewRadiusMillimeters,
                         metadata.PixelSizeMicrons,
                         metadata.FocuserStepSizeMicrons,
                         metadata.CalibrationAppliedAmount,
-                        metadata.IsStepperAdjustment);
+                        metadata.IsStepperAdjustment,
+                        deviceDriven: false);
                 } else {
                     // Use the current profile / tilt-adapter settings, exactly as a live calibration would.
+                    // [CRITICAL GATE] deviceDriven: false for the same reason as the branch above.
                     RunCalibrationMath(
                         tiltAdapterOptions.ScrewCount,
                         tiltAdapterOptions.ScrewRadiusMillimeters,
                         profileService.ActiveProfile.CameraSettings.PixelSize,
                         EffectiveFocuserStepMicrons(),
-                        calibrationAppliedAmount,
-                        IsStepperAdjustment);
+                        CalibrationAppliedAmount,
+                        IsStepperAdjustment,
+                        deviceDriven: false);
                 }
                 RebuildDiagram();
                 // Update-profile choice: the replay succeeded, so now persist the run's capture-time star-detection
@@ -1929,7 +3104,7 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
                 // The live profile is only persisted on a successful "update profile to capture-time" replay (above), so
                 // a cancelled/failed replay leaves it untouched — nothing to restore. The in-memory per-step override
                 // never touches the profile either.
-                isReplaying = false;
+                IsReplaying = false;
                 IsMeasuring = false;
                 inspector.SensorModelFocuserSizeOverrideMicrons = prevFocuserOverride;
                 inspector.SensorModelFRatioOverride = prevFRatioOverride;
@@ -2119,6 +3294,9 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
             ((RelayCommand)UseMeasuredHardwareCommand).NotifyCanExecuteChanged();
             ((AsyncRelayCommand)ReplayCommand).NotifyCanExecuteChanged();
             ((AsyncRelayCommand)RetryMeasurementCommand).NotifyCanExecuteChanged();
+            ((AsyncRelayCommand)ConnectDeviceCommand).NotifyCanExecuteChanged();
+            ((AsyncRelayCommand)DisconnectDeviceCommand).NotifyCanExecuteChanged();
+            ((AsyncRelayCommand)AutoRunAllCommand).NotifyCanExecuteChanged();
         }
 
         private static double NormalizeAngle(double deg) => ((deg % 360) + 360) % 360;

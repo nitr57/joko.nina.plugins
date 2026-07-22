@@ -11,16 +11,21 @@
 #endregion "copyright"
 
 using CommunityToolkit.Mvvm.Input;
+using NINA.Core.Model;
+using NINA.Core.Model.Equipment;
+using NINA.Core.MyMessageBox;
 using NINA.Core.Utility;
 using NINA.Equipment.Interfaces.Mediator;
 using NINA.Image.FileFormat.FITS;
 using NINA.Image.FileFormat.XISF;
 using NINA.Image.Interfaces;
+using NINA.Joko.Plugins.HocusFocus.AutoFocus;
 using NINA.Joko.Plugins.HocusFocus.Interfaces;
 using NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization.Review;
 using NINA.Joko.Plugins.HocusFocus.Utility;
 using NINA.Profile.Interfaces;
 using OpenCvSharp;
+using OxyPlot.Series;
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
@@ -272,6 +277,9 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
         private readonly IRunEvaluationLoader loader;
         private readonly IAutoFocusEngine autoFocusEngine;
         private readonly Func<string> folderPicker;
+        // The persisted AF options, used only to seed and persist the Live sweep's save folder (AutoFocusOptions.SavePath).
+        // Optional/nullable so the interfaces-only test constructor stays mediator-free; production wires the plugin singleton.
+        private readonly IAutoFocusOptions autoFocusOptions;
         private readonly StarDetectionRegion region;
         private readonly OptimizerSettings optimizerSettings;
         // Standard optimizer evaluation budget, captured from optimizerSettings ONCE at construction so the
@@ -299,6 +307,28 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
         // "connected" when not supplied so the existing tests are unaffected.
         private readonly Func<bool> isCameraConnected;
         private readonly Func<bool> isFocuserConnected;
+
+        // Live-sweep collaborators. confirmRoughFocus asks the user to confirm the current position is roughly focused
+        // (production shows an OK/Cancel dialog; tests default to confirmed). currentFilterName/currentGain report the
+        // actual filter and gain the sweep will expose with (from the filter wheel / camera), for the confirmation panel.
+        private readonly Func<bool> confirmRoughFocus;
+        private readonly Func<string> currentFilterName;
+        private readonly Func<int?> currentGain;
+
+        // Per-filter star detection collaborators (delegates, so the VM stays store/mediator-free and testable).
+        // perFilterEnabled gates the target-filter picker and per-filter routing; the rest resolve profile
+        // filters and the per-filter settings store. Defaults keep the feature off for existing callers/tests.
+        private readonly Func<bool> perFilterEnabled;
+        private readonly Func<bool> isFilterWheelConnected;
+        private readonly Func<IReadOnlyList<string>> getFilterNames;
+        private readonly Func<string> getCurrentFilterName;
+        private readonly Func<string, FilterInfo> resolveFilterByName;
+        private readonly Func<string, IStarDetectionOptions> getFilterDetectionOptions;
+        private readonly Action<string, OptimizedStarDetectionSettings> applyOptimizedToFilter;
+        // Writes the donut master into ONE filter's settings set. Separate from getFilterDetectionOptions because the
+        // store's getters return CLONES: mutating what they hand back persists nothing. Production routes this through
+        // PerFilterEditBinder.MutateFilterSettings, which picks the store or the edit buffer as appropriate.
+        private readonly Action<string, bool> setFilterDonutDetection;
 
         // Snapshotted at the end of a successful run (BEFORE loadedRuns is disposed): the Mat-free per-frame
         // descriptors for every loaded run, the labels dir each run's labels persist to, and the in-memory label
@@ -353,6 +383,7 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             IImageDataFactory imageDataFactory,
             IImagingMediator imagingMediator,
             ICameraMediator cameraMediator,
+            IFilterWheelMediator filterWheelMediator,
             IFocuserMediator focuserMediator,
             IAutoFocusEngine autoFocusEngine,
             IHocusFocusStarDetection detection)
@@ -372,7 +403,48 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
                 frameReviewBuilder: BuildProductionReviewBuilder(profileService, imageDataFactory),
                 // Live pre-flight: probe the camera/focuser mediators for the connection check on Start.
                 isCameraConnected: () => cameraMediator?.GetInfo()?.Connected == true,
-                isFocuserConnected: () => focuserMediator?.GetInfo()?.Connected == true) {
+                isFocuserConnected: () => focuserMediator?.GetInfo()?.Connected == true,
+                // The Live sweep saves its frames under this persisted folder; seed + persist the picker from it.
+                autoFocusOptions: HocusFocusPlugin.AutoFocusOptions,
+                // Confirm rough focus with an OK/Cancel dialog when Start is clicked (the sweep centers on the current position).
+                confirmRoughFocus: () => MyMessageBox.Show(
+                    "The focus sweep is centered on the current focuser position. Is the telescope in focus?",
+                    "Confirm in focus",
+                    System.Windows.MessageBoxButton.OKCancel,
+                    System.Windows.MessageBoxResult.Cancel) == System.Windows.MessageBoxResult.OK,
+                // Live capture readouts: the actual filter and gain the sweep will expose with.
+                currentFilterName: () => ResolveSweepFilterName(profileService, filterWheelMediator),
+                currentGain: () => ResolveSweepGain(profileService, filterWheelMediator, cameraMediator),
+                // Per-filter star detection: resolve the store/binder statics lazily inside the delegates (they
+                // are created by the plugin bootstrap after the options singletons).
+                perFilterEnabled: () => HocusFocusPlugin.PerFilterStarDetection?.Enabled == true,
+                isFilterWheelConnected: () => filterWheelMediator?.GetInfo()?.Connected == true,
+                getFilterNames: () => profileService.ActiveProfile.FilterWheelSettings.FilterWheelFilters.Select(f => f.Name).ToList(),
+                getCurrentFilterName: () => filterWheelMediator?.GetInfo()?.SelectedFilter?.Name,
+                resolveFilterByName: name => profileService.ActiveProfile.FilterWheelSettings.FilterWheelFilters.FirstOrDefault(f => f.Name == name),
+                getFilterDetectionOptions: name => HocusFocusPlugin.PerFilterStarDetection?.GetOrSeedSnapshot(name),
+                applyOptimizedToFilter: (name, dto) => {
+                    // Point the options-page edit buffer at the target filter, then apply through it: the binder
+                    // mirrors the result into the store and the page shows the filter that was just optimized.
+                    // A blank name would leave the binder unbound and the buffer edit would never reach the store,
+                    // silently discarding the optimization — so refuse loudly instead.
+                    if (string.IsNullOrEmpty(name)) {
+                        Logger.Error("Cannot apply optimized star-detection settings: no target filter was selected.");
+                        return;
+                    }
+                    HocusFocusPlugin.PerFilterStarDetectionEditBinder.EditedFilterName = name;
+                    HocusFocusPlugin.StarDetectionOptions.ApplyOptimizedSettings(dto);
+                },
+                // The donut master is a per-filter setting: write it into the TARGET filter's set, through the binder
+                // so the store-vs-buffer choice (and the clone-return trap) is handled in one place.
+                setFilterDonutDetection: (name, value) => {
+                    var binder = HocusFocusPlugin.PerFilterStarDetectionEditBinder;
+                    if (binder == null) {
+                        Logger.Error("Cannot set the defocus-aware donut master: the per-filter edit binder is unavailable.");
+                        return;
+                    }
+                    binder.MutateFilterSettings(name, o => o.DefocusAwareDonutDetection = value);
+                }) {
         }
 
         /// <summary>
@@ -388,7 +460,19 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             OptimizerSettings optimizerSettings,
             Func<IReadOnlyList<FrameReviewDescriptor>, StarDetectorParams, IProgress<RunLoadProgress>, CancellationToken, Task<List<FrameReview>>> frameReviewBuilder = null,
             Func<bool> isCameraConnected = null,
-            Func<bool> isFocuserConnected = null) {
+            Func<bool> isFocuserConnected = null,
+            IAutoFocusOptions autoFocusOptions = null,
+            Func<bool> confirmRoughFocus = null,
+            Func<string> currentFilterName = null,
+            Func<int?> currentGain = null,
+            Func<bool> perFilterEnabled = null,
+            Func<bool> isFilterWheelConnected = null,
+            Func<IReadOnlyList<string>> getFilterNames = null,
+            Func<string> getCurrentFilterName = null,
+            Func<string, FilterInfo> resolveFilterByName = null,
+            Func<string, IStarDetectionOptions> getFilterDetectionOptions = null,
+            Action<string, OptimizedStarDetectionSettings> applyOptimizedToFilter = null,
+            Action<string, bool> setFilterDonutDetection = null) {
             this.profileService = profileService ?? throw new ArgumentNullException(nameof(profileService));
             this.starDetectionOptions = starDetectionOptions ?? throw new ArgumentNullException(nameof(starDetectionOptions));
             this.loader = loader ?? throw new ArgumentNullException(nameof(loader));
@@ -400,11 +484,35 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             this.frameReviewBuilder = frameReviewBuilder;
             this.isCameraConnected = isCameraConnected ?? (() => true);
             this.isFocuserConnected = isFocuserConnected ?? (() => true);
+            this.autoFocusOptions = autoFocusOptions;
+            // Live-sweep collaborators (delegates so the VM stays mediator-free/testable). Default confirm to true so
+            // tests and headless callers proceed without a dialog.
+            this.confirmRoughFocus = confirmRoughFocus ?? (() => true);
+            this.currentFilterName = currentFilterName;
+            this.currentGain = currentGain;
+            this.perFilterEnabled = perFilterEnabled ?? (() => false);
+            this.isFilterWheelConnected = isFilterWheelConnected ?? (() => true);
+            this.getFilterNames = getFilterNames ?? (() => Array.Empty<string>());
+            this.getCurrentFilterName = getCurrentFilterName;
+            this.resolveFilterByName = resolveFilterByName;
+            this.getFilterDetectionOptions = getFilterDetectionOptions;
+            this.applyOptimizedToFilter = applyOptimizedToFilter;
+            this.setFilterDonutDetection = setFilterDonutDetection;
+            if (this.perFilterEnabled()) {
+                // Default the target to the currently-loaded wheel filter, else the first profile filter.
+                var current = this.getCurrentFilterName?.Invoke();
+                targetFilterName = !string.IsNullOrEmpty(current) ? current : this.getFilterNames().FirstOrDefault();
+            }
 
             sourcePaths = new ObservableCollection<string> { null };
             applyRecommendedStepSize = true;
+            // Seed the Live sweep's editable exposure from the profile's current AF exposure, and its save folder from
+            // the persisted AF SavePath (both are just starting points the user can change on the confirmation screen).
+            liveExposureSeconds = profileService.ActiveProfile.FocuserSettings.AutoFocusExposureTime;
+            saveFolderPath = autoFocusOptions?.SavePath;
 
             BrowseSourceCommand = new RelayCommand<object>(BrowseSource);
+            BrowseSaveFolderCommand = new RelayCommand(BrowseSaveFolder);
             StartCommand = new AsyncRelayCommand(() => StartAsync(CancellationToken.None), CanStart);
             CancelCommand = new RelayCommand(Cancel);
             AcceptCommand = new RelayCommand(Accept, CanAccept);
@@ -513,19 +621,50 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             }
         }
 
+        private int focusRecoverySteps = 1;
+
+        /// <summary>Session-only "Focus recovery = N" knob (default 1, VM-only, resets each launch like
+        /// <see cref="StartFromCurrentSettings"/> since the VM is constructed fresh per wizard launch). Only meaningful
+        /// in Live mode: it widens the captured focuser sweep by N extra steps PER SIDE beyond the profile's
+        /// <see cref="SweepOffsetSteps"/> (see <see cref="SweepEffectiveOffsetSteps"/> / <see cref="ApplyFocusRecovery"/>),
+        /// and is snapshotted at Start onto every loaded run's <see cref="RunEvaluationData.RecoveryStepsPerSide"/> so the
+        /// evaluator TAGS those outer frames as recovery (down-weighted in the fit, exempt from star-count gates). Inert
+        /// for Replay and production autofocus: <see cref="SweepEffectiveOffsetSteps"/> adds 0 when not Live, the snapshot
+        /// is 0 unless the run is Live, and <see cref="ApplyFocusRecovery"/> is a no-op at N &lt;= 0.</summary>
+        public int FocusRecoverySteps {
+            get => focusRecoverySteps;
+            set {
+                var clamped = Math.Max(0, value);
+                if (focusRecoverySteps != clamped) {
+                    focusRecoverySteps = clamped;
+                    RaisePropertyChanged();
+                    RaiseSweepReadoutsChanged();
+                }
+            }
+        }
+
         /// <summary>Pass-through to the profile-saved <see cref="IStarDetectionOptions.DefocusAwareDonutDetection"/>
         /// master toggle, surfaced on the wizard start page. Default OFF. UNLIKE <see cref="StartFromCurrentSettings"/>
         /// (VM-only, resets each launch) this is a true profile option: the setter persists IMMEDIATELY on click
         /// (NINA auto-saves the active profile), because it changes what the wizard's seed/baseline detection does
         /// for this very run (it gates the early morph-close and unlocks the defocus axes for the optimizer). The
-        /// optimizer's tuned numeric values still persist only on Accept (ApplyOptimizedSettings).</summary>
+        /// optimizer's tuned numeric values still persist only on Accept (ApplyOptimizedSettings).
+        ///
+        /// <para>While per-filter star detection is on this reads and writes the TARGET filter's settings set, like
+        /// every other input to the run — NOT the options-page edit buffer, which belongs to whichever filter is
+        /// selected over there and is routinely a different one.</para></summary>
         public bool DefocusAwareDonutDetection {
-            get => starDetectionOptions.DefocusAwareDonutDetection;
+            get => EffectiveDetectionOptions.DefocusAwareDonutDetection;
             set {
-                if (starDetectionOptions.DefocusAwareDonutDetection != value) {
-                    starDetectionOptions.DefocusAwareDonutDetection = value;
-                    RaisePropertyChanged();
+                if (EffectiveDetectionOptions.DefocusAwareDonutDetection == value) {
+                    return;
                 }
+                if (setFilterDonutDetection != null && UsesTargetFilterSettings) {
+                    setFilterDonutDetection(TargetFilterName, value);
+                } else {
+                    starDetectionOptions.DefocusAwareDonutDetection = value;
+                }
+                RaisePropertyChanged();
             }
         }
 
@@ -556,8 +695,10 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
                     sourceMode = value;
                     RaisePropertyChanged();
                     RaisePropertyChanged(nameof(IsReplay));
-                    RaisePropertyChanged(nameof(ShowLiveChart));
-                    // Live needs no paths (Start enabled); Saved disables Start until paths are filled.
+                    RaisePropertyChanged(nameof(IsLive));
+                    // Refresh the Live readouts against current equipment/profile state when the panel is shown.
+                    RaiseSweepReadoutsChanged();
+                    // Live gates Start on a save folder; Saved gates on the per-run folders.
                     StartCommand.NotifyCanExecuteChanged();
                 }
             }
@@ -566,6 +707,176 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
         /// <summary>True for the "Saved Auto-Focus" (replay) source. The Number-of-runs input and the per-run
         /// folder pickers are only meaningful here, so the wizard binds their visibility to this.</summary>
         public bool IsReplay => SourceMode == SourceMode.Replay;
+
+        /// <summary>True for the "Live Auto-Focus" source. The Live sweep does a fixed, non-convergent focuser sweep
+        /// from the current rough-focus position (see <see cref="RunLiveAttemptAsync"/>), so the confirmation panel
+        /// (rough-focus acknowledgement, editable exposure, save folder, and the read-only capture summary) binds its
+        /// visibility to this.</summary>
+        public bool IsLive => SourceMode == SourceMode.Live;
+
+        private string targetFilterName;
+
+        /// <summary>The ONE filter this run captures on, seeds its baseline from, and (on Accept) writes its
+        /// result to. Only meaningful while per-filter star detection is enabled. Session-only, not persisted.</summary>
+        public string TargetFilterName {
+            get => targetFilterName;
+            set {
+                if (targetFilterName != value) {
+                    targetFilterName = value;
+                    RaisePropertyChanged();
+                    // The sweep readouts (filter/gain) reflect the target filter while per-filter is on.
+                    RaiseSweepReadoutsChanged();
+                    // So does the donut master: it is read from the target filter's set, so re-targeting changes it.
+                    RaisePropertyChanged(nameof(DefocusAwareDonutDetection));
+                    RaisePropertyChanged(nameof(SummaryFilterName));
+                    RaisePropertyChanged(nameof(HasSummaryFilter));
+                }
+            }
+        }
+
+        /// <summary>True while per-filter star detection is enabled: shows the target-filter picker (both
+        /// modes) and routes baseline/capture/Accept through the target filter's settings set.</summary>
+        public bool IsPerFilterEnabled => perFilterEnabled();
+
+        /// <summary>The active profile's filter names, for the target-filter picker.</summary>
+        public IReadOnlyList<string> AvailableFilterNames => getFilterNames();
+
+        #region Live sweep (fixed-sweep capture)
+
+        private double liveExposureSeconds;
+
+        /// <summary>The exposure the Live sweep uses, seeded from the profile's AF exposure but editable here so the
+        /// user can lengthen it (e.g. narrowband) to keep stars visible at the defocused wings of the sweep. Applied
+        /// per-run via <see cref="AutoFocusEngineOptions.OverrideAutoFocusExposureTime"/>; on Accept it can also be
+        /// written back to the profile with the recommended step size (see <see cref="ApplyRecommendedStepSize"/>).</summary>
+        public double LiveExposureSeconds {
+            get => liveExposureSeconds;
+            set {
+                if (liveExposureSeconds != value) {
+                    liveExposureSeconds = value;
+                    RaisePropertyChanged();
+                    RaisePropertyChanged(nameof(SweepEstimatedDurationText));
+                }
+            }
+        }
+
+        private string saveFolderPath;
+
+        /// <summary>Where the Live sweep writes its captured frames (seeded from the persisted AF SavePath). Required
+        /// before Start is enabled in Live mode; the Browse button both sets this and persists it back to the AF
+        /// options so the choice sticks.</summary>
+        public string SaveFolderPath {
+            get => saveFolderPath;
+            set {
+                if (saveFolderPath != value) {
+                    saveFolderPath = value;
+                    RaisePropertyChanged();
+                    StartCommand.NotifyCanExecuteChanged();
+                }
+            }
+        }
+
+        // Read-only capture summary shown on the Live confirmation panel. All derive from the profile / AF filter and
+        // do not change during the wizard, so they need no change notifications beyond the initial bind.
+        public int SweepStepSize => profileService.ActiveProfile.FocuserSettings.AutoFocusStepSize;
+        public int SweepOffsetSteps => profileService.ActiveProfile.FocuserSettings.AutoFocusInitialOffsetSteps;
+
+        /// <summary>The offset-steps-per-side the Live sweep will actually capture: the profile's
+        /// <see cref="SweepOffsetSteps"/> plus the session-only <see cref="FocusRecoverySteps"/> recovery steps. Adds 0
+        /// unless the source is Live, so the Replay readouts (and any production path) are byte-identical to before.</summary>
+        public int SweepEffectiveOffsetSteps => SweepOffsetSteps + (IsLive ? Math.Max(0, FocusRecoverySteps) : 0);
+
+        public int SweepPointCount => 2 * SweepEffectiveOffsetSteps + 1;
+        public int SweepFramesPerPoint => profileService.ActiveProfile.FocuserSettings.AutoFocusNumberOfFramesPerPoint;
+        public string SweepBinning {
+            get {
+                var b = profileService.ActiveProfile.FocuserSettings.AutoFocusBinning;
+                return $"{b}x{b}";
+            }
+        }
+
+        /// <summary>The gain the sweep will actually expose with: the AF filter's gain when filter-wheel offsets
+        /// designate one with an explicit gain, otherwise the connected camera's current gain.</summary>
+        public string SweepGain {
+            get {
+                if (IsPerFilterEnabled && !string.IsNullOrEmpty(TargetFilterName)) {
+                    var filter = resolveFilterByName?.Invoke(TargetFilterName);
+                    if (filter != null && filter.AutoFocusGain > -1) {
+                        return filter.AutoFocusGain.ToString();
+                    }
+                }
+                var gain = currentGain?.Invoke();
+                return gain.HasValue ? gain.Value.ToString() : "Unavailable";
+            }
+        }
+
+        /// <summary>The filter the sweep will actually expose through: the designated AF filter when offsets are on,
+        /// otherwise the currently loaded filter.</summary>
+        public string SweepFilterName {
+            get {
+                if (IsPerFilterEnabled && !string.IsNullOrEmpty(TargetFilterName)) {
+                    // Don't claim a filter the sweep can't actually select: Start refuses an unresolvable target,
+                    // so the readout says so up front rather than implying a capture that will be blocked.
+                    return resolveFilterByName != null && resolveFilterByName(TargetFilterName) == null
+                        ? $"{TargetFilterName} (not in profile)"
+                        : TargetFilterName;
+                }
+                var name = currentFilterName?.Invoke();
+                return string.IsNullOrEmpty(name) ? "Unavailable" : name;
+            }
+        }
+
+        /// <summary>The filter these summary results are for, shown on the summary page. Null when per-filter
+        /// detection is off (the run tuned the single global set, so there is no filter to name).</summary>
+        public string SummaryFilterName => IsPerFilterEnabled ? TargetFilterName : null;
+
+        /// <summary>Whether to show the summary-page filter readout at all.</summary>
+        public bool HasSummaryFilter => IsPerFilterEnabled && !string.IsNullOrEmpty(TargetFilterName);
+
+        public int SweepEstimatedFrames => SweepPointCount * Math.Max(1, SweepFramesPerPoint);
+
+        /// <summary>A rough capture-time estimate (exposure only; excludes download and focuser-move overhead), so the
+        /// user knows how long the sweep runs. Recomputed when the exposure changes.</summary>
+        public string SweepEstimatedDurationText {
+            get {
+                var seconds = SweepEstimatedFrames * Math.Max(0.0, LiveExposureSeconds);
+                var ts = TimeSpan.FromSeconds(seconds);
+                return ts.TotalMinutes >= 1
+                    ? $"~{(int)ts.TotalMinutes}m {ts.Seconds}s (exposure only)"
+                    : $"~{ts.TotalSeconds:0}s (exposure only)";
+            }
+        }
+
+        private void RaiseSweepReadoutsChanged() {
+            RaisePropertyChanged(nameof(SweepStepSize));
+            RaisePropertyChanged(nameof(SweepEffectiveOffsetSteps));
+            RaisePropertyChanged(nameof(SweepPointCount));
+            RaisePropertyChanged(nameof(SweepBinning));
+            RaisePropertyChanged(nameof(SweepFilterName));
+            RaisePropertyChanged(nameof(SweepGain));
+            RaisePropertyChanged(nameof(SweepEstimatedFrames));
+            RaisePropertyChanged(nameof(SweepEstimatedDurationText));
+        }
+
+        private string captureContextText;
+
+        /// <summary>Which frame the sweep is on and where the focuser is, shown live during capture (e.g.
+        /// "Capturing frame 3 of 9 at focuser position 12345"). Fed by the engine's per-point progress reports.</summary>
+        public string CaptureContextText {
+            get => captureContextText;
+            private set { captureContextText = value; RaisePropertyChanged(); }
+        }
+
+        private string captureExposureText;
+
+        /// <summary>The camera's own exposure status for the current frame (e.g. the exposure countdown), shown live
+        /// during capture. Fed by the camera's progress reports forwarded through the sweep.</summary>
+        public string CaptureExposureText {
+            get => captureExposureText;
+            private set { captureExposureText = value; RaisePropertyChanged(); }
+        }
+
+        #endregion Live sweep (fixed-sweep capture)
 
         private int runCount = 1;
 
@@ -792,19 +1103,34 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             private set { phase = value; RaisePropertyChanged(); }
         }
 
-        private LiveAutoFocusChartVM liveChart;
+        private bool isCapturing;
 
-        /// <summary>The streaming auto-focus curve, non-null only while a live auto-focus run is in flight.
-        /// Created and torn down by <see cref="RunLiveAttemptAsync"/>.</summary>
-        public LiveAutoFocusChartVM LiveChart {
-            get => liveChart;
-            private set { liveChart = value; RaisePropertyChanged(); RaisePropertyChanged(nameof(ShowLiveChart)); }
+        /// <summary>True only while the live sweep is capturing frames. The sweep is a plain capture with no star
+        /// detection (the optimizer detects the saved frames afterward), so there is no focus curve to chart — the
+        /// progress panel instead shows the capture readouts (frame count, focuser position, exposure) gated on this.</summary>
+        public bool IsCapturing {
+            get => isCapturing;
+            private set { isCapturing = value; RaisePropertyChanged(); }
         }
 
-        /// <summary>Whether the progress panel shows the live auto-focus chart. The chart is only ever created on
-        /// the Live path, so the SourceMode check is redundant by construction — it is here to make the invariant
-        /// the requirement states ("never in Saved Auto-Focus") explicit and directly testable.</summary>
-        public bool ShowLiveChart => SourceMode == SourceMode.Live && liveChart != null;
+        private double exposureProgressCurrent;
+
+        /// <summary>Elapsed seconds of the current frame's exposure, straight from the camera's progress reports.</summary>
+        public double ExposureProgressCurrent {
+            get => exposureProgressCurrent;
+            private set { exposureProgressCurrent = value; RaisePropertyChanged(); }
+        }
+
+        private int exposureProgressMax;
+
+        /// <summary>Total seconds of the current frame's exposure. Zero between exposures, which hides the bar.</summary>
+        public int ExposureProgressMax {
+            get => exposureProgressMax;
+            private set { exposureProgressMax = value; RaisePropertyChanged(); RaisePropertyChanged(nameof(HasExposureProgress)); }
+        }
+
+        /// <summary>Whether an exposure is in flight (so the exposure bar is meaningful).</summary>
+        public bool HasExposureProgress => exposureProgressMax > 0;
 
         #endregion Progress
 
@@ -1093,6 +1419,8 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             RaisePropertyChanged(nameof(HasFeedback));
             RaisePropertyChanged(nameof(ApplyRecommendedStepSize));
             RaisePropertyChanged(nameof(CanApplyRecommendedStepSize));
+            RaisePropertyChanged(nameof(CanApplyExposureTime));
+            RaisePropertyChanged(nameof(SweepExposureChangeText));
             RaisePropertyChanged(nameof(ChangedParametersDisplay));
             RaisePropertyChanged(nameof(StarCountChanges));
             RaisePropertyChanged(nameof(HasStarCountChanges));
@@ -1135,6 +1463,8 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
                     RaisePropertyChanged();
                     // The AF rows in the changed-parameters list appear only while this is on.
                     RaisePropertyChanged(nameof(ChangedParametersDisplay));
+                    // When Current is selected, this toggle is the only thing that makes Accept meaningful.
+                    AcceptCommand.NotifyCanExecuteChanged();
                 }
             }
         }
@@ -1142,7 +1472,60 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
         /// <summary>Whether the "apply recommended AF step size" toggle is meaningful — true only when the
         /// recommended step size and/or offset steps actually differ from the current profile values. The
         /// checkbox binds its IsEnabled here so an unchanged recommendation can't be "applied".</summary>
-        public bool CanApplyRecommendedStepSize => Summary?.StepSizeOrOffsetChanged ?? false;
+        public bool CanApplyRecommendedStepSize => (Summary?.StepSizeOrOffsetChanged ?? false) || ExposureChangedForLiveRun;
+
+        // Snapshotted when a Live sweep captures: the exposure it used (for the summary write-back) and a flag that a
+        // live capture happened (gates the exposure write-back offer). A fresh Replay run clears the flag.
+        private double capturedLiveExposureSeconds;
+        private bool lastRunWasLive;
+        // Snapshotted at Start (Live => Math.Max(0, FocusRecoverySteps), else 0) and stamped onto EVERY loaded run's
+        // RunEvaluationData.RecoveryStepsPerSide (acquire AND the re-optimize/feedback reload loop) so both optimize
+        // passes tag the same outer frames as recovery even if the UI box is later edited. 0 for Replay => inert.
+        private int capturedRecoveryStepsPerSide;
+
+        private bool LastRunWasLive {
+            get => lastRunWasLive;
+            set {
+                if (lastRunWasLive != value) {
+                    lastRunWasLive = value;
+                    RaiseExposureRowChanged();
+                }
+            }
+        }
+
+        /// <summary>Whether the summary shows the sweep-exposure row — true only after a Live sweep, since a Replay
+        /// run never chose a sweep exposure.</summary>
+        public bool CanApplyExposureTime => lastRunWasLive;
+
+        /// <summary>The sweep exposure as a "before → after" change against the profile's current AF exposure (or
+        /// "N s (unchanged)"), shown in the auto-focus settings block for a Live run. The single Apply toggle writes it
+        /// alongside the recommended step size/offset.</summary>
+        public string SweepExposureChangeText {
+            get {
+                var current = profileService?.ActiveProfile?.FocuserSettings?.AutoFocusExposureTime ?? 0.0;
+                return Math.Abs(current - capturedLiveExposureSeconds) < 1e-6
+                    ? $"{capturedLiveExposureSeconds:0.##} s (unchanged)"
+                    : $"{current:0.##} s → {capturedLiveExposureSeconds:0.##} s";
+            }
+        }
+
+        /// <summary>True when a Live sweep chose an exposure that differs from the profile's current AF exposure, so
+        /// the Apply-AF-settings toggle is enabled to write it even when the step size/offset are unchanged.</summary>
+        private bool ExposureChangedForLiveRun {
+            get {
+                if (!lastRunWasLive || capturedLiveExposureSeconds <= 0) {
+                    return false;
+                }
+                var current = profileService?.ActiveProfile?.FocuserSettings?.AutoFocusExposureTime ?? 0.0;
+                return Math.Abs(current - capturedLiveExposureSeconds) > 1e-6;
+            }
+        }
+
+        private void RaiseExposureRowChanged() {
+            RaisePropertyChanged(nameof(CanApplyExposureTime));
+            RaisePropertyChanged(nameof(CanApplyRecommendedStepSize));
+            RaisePropertyChanged(nameof(SweepExposureChangeText));
+        }
 
         /// <summary>The changed-parameters rows shown on the summary: the optimized detector params, plus — only
         /// when <see cref="ApplyRecommendedStepSize"/> is on — the AF step size / offset-steps rows so the user
@@ -1239,6 +1622,9 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
         #region Commands
 
         public RelayCommand<object> BrowseSourceCommand { get; }
+
+        /// <summary>Live confirmation panel: pick (and persist) the folder the sweep saves its frames to.</summary>
+        public RelayCommand BrowseSaveFolderCommand { get; }
         public AsyncRelayCommand StartCommand { get; }
         public RelayCommand CancelCommand { get; }
         public RelayCommand AcceptCommand { get; }
@@ -1274,7 +1660,9 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
                 return false;
             }
             if (SourceMode == SourceMode.Live) {
-                return true;
+                // The sweep must save its frames somewhere, so Start stays disabled until a save folder is chosen.
+                // Rough-focus confirmation is asked as an OK/Cancel dialog when Start is clicked (see StartAsync).
+                return !string.IsNullOrWhiteSpace(SaveFolderPath);
             }
             for (var i = 0; i < RunCount; i++) {
                 if (string.IsNullOrWhiteSpace(i < SourcePaths.Count ? SourcePaths[i] : null)) {
@@ -1291,6 +1679,10 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
         /// mistake). Sets <see cref="ErrorMessage"/> and returns false on failure.
         /// </summary>
         private bool ValidateSourceBeforeStart() {
+            if (IsPerFilterEnabled && string.IsNullOrWhiteSpace(TargetFilterName)) {
+                ErrorMessage = "Select a target filter.";
+                return false;
+            }
             if (SourceMode == SourceMode.Live) {
                 if (!isCameraConnected()) {
                     ErrorMessage = "Connect a camera before running a live auto-focus optimization.";
@@ -1298,6 +1690,24 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
                 }
                 if (!isFocuserConnected()) {
                     ErrorMessage = "Connect a focuser before running a live auto-focus optimization.";
+                    return false;
+                }
+                if (IsPerFilterEnabled && !isFilterWheelConnected()) {
+                    ErrorMessage = "Connect a filter wheel before running a live optimization.";
+                    return false;
+                }
+                // The sweep must expose through EXACTLY the target filter. If the name can't be resolved to a
+                // profile filter (a common device-name/profile-name mismatch, since the default target is seeded
+                // from the wheel's reported filter), the engine would silently fall back to the designated AF
+                // filter — or not move the wheel at all — and Accept would then write the result into the target
+                // filter's settings set. Refuse to start rather than optimize the wrong filter.
+                if (IsPerFilterEnabled && resolveFilterByName?.Invoke(TargetFilterName) == null) {
+                    ErrorMessage = $"Filter '{TargetFilterName}' was not found in the profile's filter wheel settings. Choose a filter that exists in the profile.";
+                    return false;
+                }
+                // Belt to CanStart's suspenders (and the engine's own guard): never start a sweep with nowhere to save.
+                if (string.IsNullOrWhiteSpace(SaveFolderPath)) {
+                    ErrorMessage = "Choose a folder to save the captured frames before running a live sweep.";
                     return false;
                 }
                 return true;
@@ -1345,6 +1755,18 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
                 Interlocked.Exchange(ref running, 0);
                 return;
             }
+            // The sweep is centered on the current focuser position, so confirm rough focus before moving anything.
+            // Declining leaves the wizard idle with no error (the user chose not to proceed).
+            if (SourceMode == SourceMode.Live && !confirmRoughFocus()) {
+                Interlocked.Exchange(ref running, 0);
+                return;
+            }
+            // Whether this fresh run is a Live sweep decides whether the Summary offers the exposure write-back.
+            // (Continue/Re-optimize don't reset it — they preserve the original run's nature.)
+            LastRunWasLive = SourceMode == SourceMode.Live;
+            // Snapshot the recovery knob NOW so a later edit of the box can't desync the widened capture from the
+            // tagging, nor the first optimize pass from the re-optimize/feedback pass. Replay => 0 (recovery inert).
+            capturedRecoveryStepsPerSide = (SourceMode == SourceMode.Live) ? Math.Max(0, FocusRecoverySteps) : 0;
             ResetVariants();
             // Clear stale progress so a re-run after a cancel/complete doesn't briefly show the previous run's
             // evaluation count / phase / improvement before the first progress callback overwrites them.
@@ -1500,6 +1922,26 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             }
         }
 
+        /// <summary>Per-filter runs resolve "current settings" from the TARGET filter's stored set, threaded to
+        /// the loader as the baseline optionsOverride (the existing GetStarDetectorParams override seam). Null
+        /// when the feature is off — baseline params byte-identical to today.</summary>
+        private IStarDetectionOptions ResolveBaselineOptionsOverride() {
+            if (!UsesTargetFilterSettings || getFilterDetectionOptions == null) {
+                return null;
+            }
+            return getFilterDetectionOptions(TargetFilterName);
+        }
+
+        /// <summary>True when this run's settings come from the target filter's stored set rather than the
+        /// options-page edit buffer.</summary>
+        private bool UsesTargetFilterSettings => IsPerFilterEnabled && !string.IsNullOrEmpty(TargetFilterName);
+
+        /// <summary>The settings set this RUN reads from: the target filter's stored set while per-filter routing
+        /// applies, otherwise the options singleton — so with the feature off every read is byte-identical to
+        /// before per-filter existed. Read-only: the store hands back clones, so writes must go through
+        /// <see cref="setFilterDonutDetection"/>.</summary>
+        private IStarDetectionOptions EffectiveDetectionOptions => ResolveBaselineOptionsOverride() ?? starDetectionOptions;
+
         /// <summary>Loads each configured source folder into a <see cref="LoadedRun"/>. For Live, runs a fresh AF
         /// attempt first and then loads its saved folder. Sets <see cref="ErrorMessage"/> and returns null on a
         /// missing/invalid source. Each loaded run owns a disposable <see cref="RunEvaluationData"/> (cached source
@@ -1514,7 +1956,7 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
                     if (SourceMode == SourceMode.Live) {
                         folder = await RunLiveAttemptAsync(token).ConfigureAwait(true);
                         if (string.IsNullOrEmpty(folder)) {
-                            ErrorMessage = "The live auto-focus run did not produce a saved attempt folder.";
+                            ErrorMessage = "The live sweep did not produce a saved set of frames. Check the focuser and try again.";
                             CurrentStep = WizardStep.SelectSource;
                             DisposeLoadedRuns(runs);
                             return null;
@@ -1532,7 +1974,8 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
                     SetProgress("Loading frames", 0, 0);
                     var loadProgress = new Progress<RunLoadProgress>(rp =>
                         SetProgress("Loading frames", rp.Current, rp.Total));
-                    var loaded = await loader.LoadSavedRunAsync(folder, region, null, loadProgress, token).ConfigureAwait(true);
+                    // Load + stamp the recovery snapshot together through the single choke-point (see LoadRunStampedAsync).
+                    var loaded = await LoadRunStampedAsync(folder, null, loadProgress, token).ConfigureAwait(true);
                     runs.Add(loaded);
                     // Record the actual folder loaded (in load order) so the re-optimize path can re-read it from disk
                     // after the source Mats are disposed. Snapshotted in SnapshotReviewInputs on full success.
@@ -1561,34 +2004,127 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             }
         }
 
+        /// <summary>The SINGLE load-and-stamp choke-point for every run this VM loads. Loads the run through the loader
+        /// exactly as the inline call sites did (same region/baseline-override; each caller still forwards its own
+        /// <paramref name="frameLabels"/> and <paramref name="progress"/>), then stamps the recovery snapshot onto the
+        /// loaded <see cref="RunEvaluationData"/> so the evaluator tags the outer sweep frames as recovery. Every reload
+        /// path (acquire, re-optimize, continue) routes through here, so a future reload site can't ship un-stamped and
+        /// silently drop the tag. Reads the <see cref="capturedRecoveryStepsPerSide"/> field on purpose: continue /
+        /// re-optimize intentionally reuse the originating Start's snapshot. 0 for Replay/non-Live => the stamp is inert
+        /// (RunEvaluationData is byte-identical to before, <see cref="RunEvaluationMetrics.FrameIsRecovery"/> stays null).</summary>
+        private async Task<LoadedRun> LoadRunStampedAsync(
+            string folder, IReadOnlyList<FrameLabels> frameLabels, IProgress<RunLoadProgress> progress, CancellationToken token) {
+            var loaded = await loader.LoadSavedRunAsync(folder, region, frameLabels, progress, ResolveBaselineOptionsOverride(), token).ConfigureAwait(true);
+            if (loaded?.Data != null) {
+                loaded.Data.RecoveryStepsPerSide = capturedRecoveryStepsPerSide;
+            }
+            return loaded;
+        }
+
         /// <summary>
-        /// Triggers a live auto-focus run that saves its frames, then returns the saved attempt folder so the run
-        /// converges onto the same replay path. For the duration of the run a <see cref="LiveAutoFocusChartVM"/> is
-        /// attached to the engine and published on <see cref="LiveChart"/>, so the progress panel streams the focus
-        /// curve instead of showing a bare marching bar. Replay never reaches here, hence never shows a chart.
+        /// Captures a fixed, non-convergent focuser sweep centered on the current (rough-focus) position, saving its
+        /// frames, then returns the saved attempt folder so the run converges onto the same replay path. Unlike a full
+        /// auto-focus this does NOT require the current settings to build a focus curve — that is the whole point, so
+        /// the wizard can then find settings that do. The sweep runs no star detection (the optimizer detects the saved
+        /// frames afterward), so the progress panel shows capture readouts rather than a focus curve. Replay never
+        /// reaches here.
         /// </summary>
         private async Task<string> RunLiveAttemptAsync(CancellationToken token) {
             if (autoFocusEngine == null) {
                 throw new InvalidOperationException("Live mode requires an auto-focus engine.");
             }
-            Phase = "Running live auto-focus";
+            Phase = "Capturing frames";
+            CaptureContextText = null;
+            CaptureExposureText = null;
+            ExposureProgressMax = 0;
             var options = autoFocusEngine.GetOptions();
-            options.Save = true; // ensure frames land on disk so we can load them like a replay
+            options.Save = true;                        // frames must land on disk so we can load them like a replay
+            options.SavePath = SaveFolderPath;          // honor the folder chosen on the confirmation screen
+            // Use the exposure the user set on the confirmation screen (they can lengthen it for faint/narrowband stars).
+            options.OverrideAutoFocusExposureTime = TimeSpan.FromSeconds(LiveExposureSeconds);
+            capturedLiveExposureSeconds = LiveExposureSeconds;   // remember what we captured with, for the Summary write-back
+            RaiseExposureRowChanged();
 
-            // Constructed here, on the UI thread — the chart's collections capture the dispatcher they are created
-            // on in order to marshal the engine's worker-thread events. See the LiveAutoFocusChartVM class doc.
-            var chart = new LiveAutoFocusChartVM();
-            chart.Attach(autoFocusEngine);
-            LiveChart = chart;
+            // Per-filter runs sweep on EXACTLY the chosen target filter: pass it as the imaging filter and set
+            // UseExactImagingFilter so the engine skips the designated-AF-filter substitution. The wheel moves
+            // as part of the sweep and stays on the target afterward.
+            // ValidateSourceBeforeStart already refused an unresolvable target; this is the last line of defense —
+            // a null filter here would make the engine fall back to the designated AF filter (or not move at all),
+            // so fail loudly rather than sweep the wrong filter and attribute the result to the target.
+            FilterInfo sweepFilter = null;
+            if (IsPerFilterEnabled) {
+                sweepFilter = resolveFilterByName?.Invoke(TargetFilterName);
+                if (sweepFilter == null) {
+                    throw new InvalidOperationException($"Filter '{TargetFilterName}' was not found in the profile's filter wheel settings.");
+                }
+                options.UseExactImagingFilter = true;
+            }
+
+            // Widen the captured sweep by the snapshotted recovery steps (never the live box) so the widened capture and
+            // the tagged evaluation use the identical N, and scale the per-run timeout so the longer sweep doesn't time
+            // out. No-op at N <= 0, keeping the Live path byte-identical when recovery is off.
+            ApplyFocusRecovery(options, capturedRecoveryStepsPerSide);
+
+            // Route the sweep's progress: the engine's per-point reports (tagged with its source) carry the focuser
+            // position + frame count and drive the frame bar; the camera's own reports carry the exposure countdown.
+            var captureProgress = new Progress<ApplicationStatus>(HandleCaptureProgress);
+
+            IsCapturing = true;
             try {
-                var afResult = await autoFocusEngine.Run(options, null, token, null).ConfigureAwait(true);
-                return afResult?.SaveFolder;
+                var afResult = await autoFocusEngine.CaptureFixedSweepAsync(options, sweepFilter, token, captureProgress).ConfigureAwait(true);
+                // A failed/partial sweep may still have created its timestamped folder; treat "not succeeded" as no
+                // usable capture (return null) so AcquireAsync surfaces a clean message rather than a confusing loader
+                // error on an empty or too-short attempt folder.
+                return afResult?.Succeeded == true ? afResult.SaveFolder : null;
             } finally {
-                // Detach on every exit — success, engine failure, and cancellation alike — so the engine never
-                // holds this wizard alive through the chart's event handlers. Clearing LiveChart collapses the
-                // chart before the "Loading frames" phase takes over the progress panel.
-                chart.Detach();
-                LiveChart = null;
+                // Collapse the capture readouts before the "Loading frames" phase takes over the progress panel.
+                IsCapturing = false;
+                CaptureContextText = null;
+                CaptureExposureText = null;
+                ExposureProgressMax = 0;
+            }
+        }
+
+        /// <summary>Widens a Live sweep's per-run options for focus recovery: adds <paramref name="recoverySteps"/> extra
+        /// offset steps PER SIDE (widening the sweep RANGE, not refining it — <see cref="AutoFocusEngineOptions.AutoFocusStepSize"/>
+        /// is deliberately untouched) and scales ONLY the per-run <see cref="AutoFocusEngineOptions.AutoFocusTimeout"/>
+        /// override by the point-count ratio so the longer sweep (the fixed sweep enforces a hard timeout) doesn't time
+        /// out. Never touches the persisted profile offset or timeout seconds. A no-op at <paramref name="recoverySteps"/>
+        /// &lt;= 0 (or null options), so the Live path stays byte-identical when recovery is off. Internal + static so the
+        /// widening is directly unit-testable.</summary>
+        internal static void ApplyFocusRecovery(AutoFocusEngineOptions options, int recoverySteps) {
+            if (options == null || recoverySteps <= 0) {
+                return; // N<=0 keeps the Live path byte-identical
+            }
+            var oldOffset = options.AutoFocusInitialOffsetSteps;
+            var oldPoints = 2 * oldOffset + 1;
+            var newOffset = oldOffset + recoverySteps;
+            var newPoints = 2 * newOffset + 1;
+            options.AutoFocusInitialOffsetSteps = newOffset;             // widen range (do NOT touch AutoFocusStepSize — recovery widens, not refines)
+            if (oldPoints > 0 && newPoints > oldPoints) {                // scale ONLY the per-run timeout override (fixed sweep enforces AutoFocusTimeout)
+                var oldTicks = options.AutoFocusTimeout.Ticks;
+                options.AutoFocusTimeout = TimeSpan.FromTicks((long)(oldTicks * (double)newPoints / oldPoints));
+            }
+        }
+
+        /// <summary>Routes a sweep progress report to the capture readouts. The engine tags two streams: the frame
+        /// context (focuser position + frame count, driving the frame bar) and the per-exposure countdown (elapsed /
+        /// total seconds, driving the exposure bar). Any other report is NINA's own status, which goes to NINA's status
+        /// bar rather than here, so it is ignored. Internal so the routing is directly unit-testable.</summary>
+        internal void HandleCaptureProgress(ApplicationStatus status) {
+            if (status == null) {
+                return;
+            }
+            if (status.Source == AutoFocusEngine.LiveSweepProgressSource) {
+                CaptureContextText = status.Status;
+                if (status.MaxProgress > 0) {
+                    SetProgress("Capturing frames", (int)status.Progress, status.MaxProgress);
+                }
+            } else if (status.Source == AutoFocusEngine.LiveSweepExposureSource) {
+                ExposureProgressCurrent = status.Progress;
+                ExposureProgressMax = status.MaxProgress;
+                var remaining = Math.Max(0, status.MaxProgress - status.Progress);
+                CaptureExposureText = $"Exposing, {remaining:0}s remaining";
             }
         }
 
@@ -1603,23 +2139,36 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
         /// </summary>
         private async Task<bool> SeedFitIsUsableAsync(IReadOnlyList<LoadedRun> runs, CancellationToken token) {
             const int MinPositionsForFit = 3;
-            // Evaluate the seed on every run WITH determinate "Analyzing frames" progress. This first pass also builds
-            // each frame's expensive early-detection context (the long initial wait), so reporting it here is what
-            // makes the bar advance instead of sitting on a static count; the optimizer then reuses the warmed contexts.
-            var results = await AnalyzeWithProgressAsync(runs, r => r.Baseline, token).ConfigureAwait(true);
+            // Which params to gate on. Replay checks the user's CURRENT settings (Baseline) — the run only exists
+            // because those settings could already focus. A LIVE sweep is the opposite case: the current settings may
+            // detect nothing (that is why the user is here), so gate on the SEED (default) params the optimizer
+            // actually starts its search from — a sweep whose defaults find stars is worth optimizing even when the
+            // current settings can't build a curve. Either way this first pass also warms each frame's expensive
+            // early-detection context, which the optimizer then reuses.
+            Func<LoadedRun, StarDetectorParams> guardParams = r => r.Baseline;
+            if (SourceMode == SourceMode.Live) {
+                guardParams = r => r.Seed;
+            }
+
+            var results = await AnalyzeWithProgressAsync(runs, guardParams, token).ConfigureAwait(true);
             var anyUsable = false;
             foreach (var eval in results) {
-                if (double.IsFinite(eval.Metrics.SigmaFocus) && eval.PooledPointCount >= MinPositionsForFit) {
+                // Gate on the NON-recovery positions: with recovery frames the raw PooledPointCount is trivially >= 3, so
+                // a starless-near-focus run could pass on recovery positions alone. RecoveryStepsPerSide == 0 =>
+                // NonRecoveryPooledPointCount == PooledPointCount, so Replay/N=0 behavior is unchanged.
+                if (double.IsFinite(eval.Metrics.SigmaFocus) && eval.NonRecoveryPooledPointCount >= MinPositionsForFit) {
                     anyUsable = true;
                     break;
                 }
             }
 
             if (!anyUsable) {
-                ErrorMessage =
-                    "The selected auto-focus run(s) do not produce a usable focus curve at the current settings: " +
-                    "too few focuser positions yielded detectable stars to fit a curve. Pick a run with stars across " +
-                    "most frames, or re-acquire with a longer exposure before optimizing.";
+                ErrorMessage = SourceMode == SourceMode.Live
+                    ? "The captured sweep does not produce a usable focus curve even at the default detection settings: " +
+                      "too few focuser positions yielded detectable stars to fit a curve. Increase the exposure and run the sweep again."
+                    : "The selected auto-focus run(s) do not produce a usable focus curve at the current settings: " +
+                      "too few focuser positions yielded detectable stars to fit a curve. Pick a run with stars across " +
+                      "most frames, or re-acquire with a longer exposure before optimizing.";
                 CurrentStep = WizardStep.SelectSource;
                 return false;
             }
@@ -1698,11 +2247,14 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             // seed's early morph-close runs and CreateCuratedSet includes the defocus axes iff the user enabled it
             // (the default Seed carries master=OFF, so without this the donut feature would never be searched when
             // not starting from current settings).
-            seed.DefocusAwareDonutDetection = starDetectionOptions.DefocusAwareDonutDetection;
+            // Read once, from the SAME set the baseline came from (the target filter while per-filter is on), so the
+            // seed, the budget, and runs[0].Baseline can never disagree about whether this run is hunting donuts.
+            var donutMaster = EffectiveDetectionOptions.DefocusAwareDonutDetection;
+            seed.DefocusAwareDonutDetection = donutMaster;
             // Donut recovery widens the curated search space (the defocus axes are added only when the master is
             // on), so it needs more iterations to converge: use the larger budget when enabled, else the standard
             // one. Re-applied each call so toggling the donut master between builds takes effect.
-            optimizerSettings.MaxEvaluations = starDetectionOptions.DefocusAwareDonutDetection ? DonutMaxEvaluations : standardMaxEvaluations;
+            optimizerSettings.MaxEvaluations = donutMaster ? DonutMaxEvaluations : standardMaxEvaluations;
             var variables = variablesOverride ?? OptimizerVariable.CreateCuratedSet(seed);
             var evaluator = RunEvaluationData.CreateEvaluator(runs.Select(r => r.Data).ToList());
 
@@ -1750,6 +2302,39 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
         /// settings (baseline) and best, averaged across runs), and the recommended step size from the representative (first) run's best
         /// fit, clamped to the focuser's max increment when known.
         /// </summary>
+        /// <summary>
+        /// Splits an evaluation's pooled scatter points into the NON-recovery (core) subset and the far-from-focus
+        /// RECOVERY subset, so the chart can draw the recovery points as a visually-distinct hollow overlay while the
+        /// main series draws only the core. A point is a recovery point iff its focuser position (X, rounded) is one of
+        /// the DISTINCT positions flagged as recovery in <see cref="RunEvaluationMetrics.FrameIsRecovery"/>.
+        ///
+        /// <para>When recovery is OFF (<c>FrameIsRecovery</c> null) — or no position is flagged, or the recovery
+        /// positions were excluded from <c>eval.Points</c> upstream (the un-weighted-fit case) — this returns
+        /// <c>(points, empty)</c>, so <c>CorePoints</c> is content-identical to <c>Points</c> and the overlay is empty:
+        /// rendering is byte-identical to before this feature. <c>core ∪ recovery == points</c> with no duplication.</para>
+        /// </summary>
+        internal static (IReadOnlyList<ScatterErrorPoint> core, IReadOnlyList<ScatterErrorPoint> recovery)
+            PartitionRecoveryPoints(RunEvaluationResult eval) {
+            var points = eval.Points;
+            var metrics = eval.Metrics;
+            if (points == null) return (System.Array.Empty<ScatterErrorPoint>(), System.Array.Empty<ScatterErrorPoint>());
+            if (metrics?.FrameIsRecovery == null || metrics.FrameFocuserPositions == null) {
+                return (points, System.Array.Empty<ScatterErrorPoint>());   // recovery off ⇒ all core, none recovery
+            }
+            var recoverySet = new HashSet<int>();
+            var flags = metrics.FrameIsRecovery;
+            var positions = metrics.FrameFocuserPositions;
+            var n = System.Math.Min(flags.Count, positions.Count);
+            for (var i = 0; i < n; i++) { if (flags[i]) recoverySet.Add(positions[i]); }
+            if (recoverySet.Count == 0) return (points, System.Array.Empty<ScatterErrorPoint>());
+            var core = new List<ScatterErrorPoint>();
+            var recovery = new List<ScatterErrorPoint>();
+            foreach (var p in points) {
+                if (recoverySet.Contains((int)System.Math.Round(p.X))) recovery.Add(p); else core.Add(p);
+            }
+            return (core, recovery);
+        }
+
         private async Task<(OptimizationSummary Summary, OptimizationCurve CurrentCurve, OptimizationCurve OptimizedCurve)>
             BuildSummaryAsync(IReadOnlyList<LoadedRun> runs, OptimizationResult res, CancellationToken token) {
             // The displayed "before" is the user's CURRENT settings (Baseline), NOT the optimizer's default seed.
@@ -1783,13 +2368,17 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
                 if (double.IsFinite(bestEval.Metrics.SigmaFocus)) { bestSigmaSum += bestEval.Metrics.SigmaFocus; bestSigmaCount++; }
                 if (i == 0) {
                     representativeBestFit = bestEval.BestFit;
+                    var (baselineCore, baselineRecovery) = PartitionRecoveryPoints(baselineEval);
+                    var (bestCore, bestRecovery) = PartitionRecoveryPoints(bestEval);
                     currentCurveLocal = new OptimizationCurve {
                         Label = "Current", Points = baselineEval.Points, Fit = baselineEval.BestFit,
+                        CorePoints = baselineCore, RecoveryPoints = baselineRecovery,
                         FrameStarCounts = baselineEval.Metrics.FrameStarCounts,
                         FrameFocuserPositions = baselineEval.Metrics.FrameFocuserPositions
                     };
                     optimizedCurveLocal = new OptimizationCurve {
                         Label = "Optimized", Points = bestEval.Points, Fit = bestEval.BestFit,
+                        CorePoints = bestCore, RecoveryPoints = bestRecovery,
                         FrameStarCounts = bestEval.Metrics.FrameStarCounts,
                         FrameFocuserPositions = bestEval.Metrics.FrameFocuserPositions
                     };
@@ -1856,12 +2445,21 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
         /// applying (it never mutates options) — though it still flushes labels, since those are user work product,
         /// not a settings mutation. Reachable from Summary AND Review.
         /// </summary>
-        /// <summary>Accept is enabled only on the finished Summary view, when the VM is idle, and when a non-Current
-        /// variant (something there is actually to apply) is selected. This keeps Accept disabled while the Start /
-        /// SelectSource view or a run-in-progress is showing, and in review-only (Current selected).</summary>
-        private bool CanAccept() =>
-            !IsBusy && IsSummary && selectedVariant != OptimizationVariant.Current
-            && SelectedResult != null && SelectedSummary != null;
+        /// <summary>Accept is enabled on the finished Summary view when the VM is idle and there is something to apply.
+        /// A non-Current variant always has its optimized detector settings to apply. The Current variant keeps the
+        /// detector settings untouched, so it can be accepted only to write the recommended auto-focus settings — for
+        /// a live sweep, the exposure you chose — i.e. when the AF-settings toggle is on and something actually changed.
+        /// This lets a live run whose optimizer could not beat the current detector still apply its exposure without
+        /// being forced to switch to the Optimized variant.</summary>
+        private bool CanAccept() {
+            if (IsBusy || !IsSummary || SelectedResult == null || SelectedSummary == null) {
+                return false;
+            }
+            if (selectedVariant != OptimizationVariant.Current) {
+                return true;
+            }
+            return ApplyRecommendedStepSize && CanApplyRecommendedStepSize;
+        }
 
         private void Accept() {
             PersistReviewLabels();
@@ -1881,24 +2479,43 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
                 return;
             }
 
-            // Build the snapshot via the shared params->DTO mapping (the single source of truth shared with the
-            // headless harness) so the in-app and offline paths can never drift. CreatedAtUtc is stamped inside.
-            // Record the displayed (vs current-settings) before/after J in the snapshot + log, so the persisted record
-            // matches the improvement the user saw. summary.SeedJ is the current-settings baseline J; summary.BestJ is
-            // the optimizer's best (== result.BestJ).
-            var dto = OptimizedStarDetectionSettings.FromParams(
-                result.BestParams, summary.RunCount, summary.SeedJ, summary.BestJ,
-                summary.RecommendedStepSize, summary.RecommendedOffsetSteps);
+            // A non-Current variant applies its optimized detector settings. The Current variant keeps the current
+            // detector settings untouched (the optimizer did not beat them) and only writes the recommended auto-focus
+            // settings below. Build the snapshot via the shared params->DTO mapping (the single source of truth shared
+            // with the headless harness) so the in-app and offline paths can never drift.
+            if (selectedVariant != OptimizationVariant.Current) {
+                var dto = OptimizedStarDetectionSettings.FromParams(
+                    result.BestParams, summary.RunCount, summary.SeedJ, summary.BestJ,
+                    summary.RecommendedStepSize, summary.RecommendedOffsetSteps);
 
-            starDetectionOptions.ApplyOptimizedSettings(dto);
-            Logger.Info($"Applied optimized star-detection settings (J {summary.SeedJ:F3} -> {summary.BestJ:F3}, {summary.RunCount} run(s))");
+                if (IsPerFilterEnabled && applyOptimizedToFilter != null) {
+                    // Per-filter: write the result into the TARGET filter's settings set (production routes
+                    // through the edit binder, so the options page lands on the filter just optimized).
+                    applyOptimizedToFilter(TargetFilterName, dto);
+                    Logger.Info($"Applied optimized star-detection settings to filter '{TargetFilterName}' (J {summary.SeedJ:F3} -> {summary.BestJ:F3}, {summary.RunCount} run(s))");
+                } else {
+                    starDetectionOptions.ApplyOptimizedSettings(dto);
+                    Logger.Info($"Applied optimized star-detection settings (J {summary.SeedJ:F3} -> {summary.BestJ:F3}, {summary.RunCount} run(s))");
+                }
+            } else {
+                Logger.Info("Keeping current star-detection settings (the optimizer did not beat them); applying the recommended auto-focus settings only.");
+            }
 
+            // The single "Apply these auto-focus settings" toggle writes the recommended step size / offset, and for a
+            // Live sweep the exposure it captured with too (the user may have lengthened it to make focus work, so it
+            // belongs with the other AF settings). Only write a positive exposure: a non-positive value was never
+            // actually used (the sweep fell back to the profile/filter exposure), so writing it would corrupt the profile.
             if (ApplyRecommendedStepSize) {
                 var focuserSettings = profileService?.ActiveProfile?.FocuserSettings;
                 if (focuserSettings != null) {
                     focuserSettings.AutoFocusStepSize = summary.RecommendedStepSize;
                     focuserSettings.AutoFocusInitialOffsetSteps = summary.RecommendedOffsetSteps;
                     Logger.Info($"Applied recommended AF step size {summary.RecommendedStepSize}, offset steps {summary.RecommendedOffsetSteps}");
+
+                    if (lastRunWasLive && capturedLiveExposureSeconds > 0) {
+                        focuserSettings.AutoFocusExposureTime = capturedLiveExposureSeconds;
+                        Logger.Info($"Applied AF exposure time {capturedLiveExposureSeconds}s to the active profile");
+                    }
                 }
             }
         }
@@ -2001,7 +2618,7 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
                 if (ReviewVM != null) {
                     ReviewVM.PropertyChanged -= OnReviewLabelsChanged;
                 }
-                ReviewVM = new StarReviewVM(reviews, labelsByRun, labelsDir ?? string.Empty, starDetectionOptions.MeasurementAverage);
+                ReviewVM = new StarReviewVM(reviews, labelsByRun, labelsDir ?? string.Empty, EffectiveDetectionOptions.MeasurementAverage);
                 // Surface label edits live: the "Optimize with feedback" button enables as soon as the user labels
                 // anything (the StarReviewVM raises CountsLabel on every add/remove).
                 ReviewVM.PropertyChanged += OnReviewLabelsChanged;
@@ -2167,7 +2784,10 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
                     var frameLabels = LabelConverter.ToFrameLabels(runLabels);
                     var loadProgress = new Progress<RunLoadProgress>(rp =>
                         SetProgress("Loading frames", rp.Current, rp.Total));
-                    var loaded = await loader.LoadSavedRunAsync(folder, region, frameLabels, loadProgress, token).ConfigureAwait(true);
+                    // CRITICAL: load + stamp through the single choke-point (LoadRunStampedAsync) so the feedback/second
+                    // optimize pass reuses the SAME recovery snapshot the first pass used — otherwise it loses the tag and
+                    // its runs hard-floor on star-count gates, making its J disagree with pass 1.
+                    var loaded = await LoadRunStampedAsync(folder, frameLabels, loadProgress, token).ConfigureAwait(true);
                     reloaded.Add(loaded);
                 }
 
@@ -2294,8 +2914,10 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
                     var folder = reoptimizeRunFolders[i];
                     var loadProgress = new Progress<RunLoadProgress>(rp =>
                         SetProgress("Loading frames", rp.Current, rp.Total));
-                    // No labels for a plain continue (byte-identical to the no-label load).
-                    var loaded = await loader.LoadSavedRunAsync(folder, region, null, loadProgress, token).ConfigureAwait(true);
+                    // No labels for a plain continue (byte-identical to the no-label load); load + stamp through the single
+                    // choke-point (LoadRunStampedAsync) so a continued round keeps the recovery tag and its J stays
+                    // comparable with the prior round. 0 for Replay/N=0 => inert.
+                    var loaded = await LoadRunStampedAsync(folder, null, loadProgress, token).ConfigureAwait(true);
                     reloaded.Add(loaded);
                 }
 
@@ -2475,10 +3097,6 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             runStopwatch.Stop();
             cts?.Dispose();
             cts = null;
-            // Closing the window mid-run does not cancel the in-flight auto-focus, so sever the engine → chart →
-            // wizard subscription explicitly; the run finishes on its own and plots nowhere.
-            liveChart?.Detach();
-            liveChart = null;
         }
 
         private void Back() {
@@ -2498,6 +3116,18 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             }
         }
 
+        /// <summary>Live confirmation panel: pick the folder the sweep saves to, and persist it back to the AF options
+        /// so the choice sticks across launches. Reuses the same injected folder picker as the replay browser.</summary>
+        private void BrowseSaveFolder() {
+            var picked = folderPicker();
+            if (!string.IsNullOrWhiteSpace(picked)) {
+                SaveFolderPath = picked;
+                if (autoFocusOptions != null) {
+                    autoFocusOptions.SavePath = picked;
+                }
+            }
+        }
+
         private void ResizeSourcePaths() {
             while (SourcePaths.Count < runCount) {
                 SourcePaths.Add(null);
@@ -2505,6 +3135,34 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             while (SourcePaths.Count > runCount) {
                 SourcePaths.RemoveAt(SourcePaths.Count - 1);
             }
+        }
+
+        /// <summary>The filter the live sweep will expose through, for display: the designated AF filter when
+        /// filter-wheel offsets are enabled, otherwise the filter currently loaded in the wheel. Null when unknown.</summary>
+        private static string ResolveSweepFilterName(IProfileService profileService, IFilterWheelMediator filterWheelMediator) {
+            var focuserSettings = profileService?.ActiveProfile?.FocuserSettings;
+            if (focuserSettings != null && focuserSettings.UseFilterWheelOffsets) {
+                var af = profileService.ActiveProfile.FilterWheelSettings?.FilterWheelFilters?.FirstOrDefault(f => f.AutoFocusFilter);
+                if (af != null) {
+                    return af.Name;
+                }
+            }
+            return filterWheelMediator?.GetInfo()?.SelectedFilter?.Name;
+        }
+
+        /// <summary>The gain the live sweep will expose with, for display: the designated AF filter's gain when
+        /// offsets are enabled and it sets one, otherwise the connected camera's current gain. Null when the camera
+        /// isn't connected (the engine has no gain override — see AutoFocusEngine.TakeExposure).</summary>
+        private static int? ResolveSweepGain(IProfileService profileService, IFilterWheelMediator filterWheelMediator, ICameraMediator cameraMediator) {
+            var focuserSettings = profileService?.ActiveProfile?.FocuserSettings;
+            if (focuserSettings != null && focuserSettings.UseFilterWheelOffsets) {
+                var af = profileService.ActiveProfile.FilterWheelSettings?.FilterWheelFilters?.FirstOrDefault(f => f.AutoFocusFilter);
+                if (af != null && af.AutoFocusGain > -1) {
+                    return af.AutoFocusGain;
+                }
+            }
+            var cameraInfo = cameraMediator?.GetInfo();
+            return (cameraInfo != null && cameraInfo.Connected) ? cameraInfo.Gain : (int?)null;
         }
 
         /// <summary>The production folder picker (WinForms), mirroring InspectorVM's replay picker.</summary>

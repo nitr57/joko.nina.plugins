@@ -3,14 +3,13 @@
 The Star Detection Optimization Wizard does not chase "more stars" or "lower HFR" directly. It maximizes a
 single composite score \(J \in [0, 1]\) that captures what actually matters for autofocus: **how repeatable
 the best-focus position is**, backed up by a healthy star count and a clean curve fit. Every candidate set of
-detection settings is reduced to this one number, the search keeps whatever scores highest, and the result is
-guaranteed never to be worse than your current settings. Only strictly-improving moves are accepted above the
-seed, and the wizard additionally refuses to return anything that scores below your current settings (see
-[Search algorithm](search-algorithm.md#three-guarantees)).
+detection settings is reduced to this one number, and the search keeps whatever scores highest. Only
+strictly-improving moves are accepted above the seed, and the wizard refuses to return anything that scores
+below your current settings (see [Search algorithm](search-algorithm.md#three-guarantees)).
 
-This page documents the exact objective: every sub-score, every constant, and how they combine. The values
-here are taken directly from `OptimizationObjective.cs` (`ObjectiveConstants`); they are tunable in code but
-fixed for a given build.
+This page documents the sub-scores that make up the per-run objective and how they combine. The values here are
+taken directly from `OptimizationObjective.cs` (`ObjectiveConstants`); they are tunable in code but fixed for a
+given build.
 
 !!! note "Why focus repeatability, not sharpness"
     The wizard scores a whole autofocus sweep, not a single frame. A detection setting that makes one frame
@@ -49,8 +48,8 @@ multiplicative penalties default to exactly 1.0 (no effect) and only bite in spe
 their own sections below.
 
 !!! note "The aberration-inspection objective reweights these"
-    The weights above are the default, autofocus-tuned objective. When you select **"Optimize for
-    aberration inspection"** on the wizard's start page, the optimizer swaps in a star-count-favoring
+    The weights above are the default, autofocus-tuned objective. When you select **Optimize for
+    aberration inspection** on the wizard's start page, the optimizer swaps in a star-count-favoring
     objective (`ObjectiveConstants.ForAberrationInspection`) that recovers far more stars across the
     frame (what a [tilt / curvature model](../overview/tilt-aberration-inspector.md) needs), while a
     fit guard tied to your current settings' \(\sigma_{\text{focus}}\) keeps the focus curve usable.
@@ -160,11 +159,6 @@ across the frame is worth a minor rise in \(\sigma_{\text{focus}}\)), but at one
 cannot override the dominant focus term. When a run has no accepted-star positions to score, the term drops out of
 both the numerator and the denominator, so \(J_{\text{run}}\) is unchanged.
 
-!!! note "Coverage and aberration inspection"
-    This term reinforces what the **Optimize for aberration inspection** objective already favors: stars spread
-    across the sensor are exactly what a [tilt / curvature model](../overview/tilt-aberration-inspector.md) needs.
-    Under the default autofocus objective it stays a gentle nudge.
-
 ## \(S_{\text{label}}\) — recall and precision (weight 0.25, only with labels)
 
 When you have hand-labeled stars on a frame (via the labeling workflow), the run also earns a label score that
@@ -189,7 +183,7 @@ a sub-score.
 The sub-scores above are combined by a weighted **average**. The defocus-precision term is different: it
 is a **multiplicative** penalty in \([0.5, 1.0]\) applied after the weighted sum. It guards the optional
 defocus-aware gates (which relax distortion/centering to recover bloated donut stars) from being abused to
-flood near-focus frames with junk.
+flood near-focus frames with junk, so the optimizer can safely explore turning them on.
 
 \[
 J_{\text{run}} \;\leftarrow\; J_{\text{run}} \times S_{\text{defocus-precision}}, \qquad
@@ -226,10 +220,6 @@ Two properties make this safe:
 *The penalty stays at 1.0 until the near-focus relaxed fraction exceeds the 0.20 threshold, then decays at
 strength 0.5 down to a floor of 0.5.*
 
-!!! warning "The defocus-aware gates are opt-in"
-    This penalty exists so the optimizer can safely explore turning the gates on (recovering bloated
-    donuts on the extremes) without learning to manufacture spurious near-focus stars.
-
 ## \(S_{\text{hfr-outlier}}\) — the bright-blob penalty
 
 A bright star whose core saturates measures a half-flux radius that reads too large, because its peak clips flat. If
@@ -246,7 +236,7 @@ The accepted-star HFRs from the near-focus frames are pooled, and a star counts 
 HFR clears **both** bars: at least \(4\times\) the robust scatter (median absolute deviation) above the median,
 **and** at least \(1.5\times\) the median. The first bar handles loose frames; the second guards the case where every
 star is nearly identical, so the scatter collapses toward zero. The penalty is then a function of the outlier
-**fraction** \(f\) — outliers over accepted stars in the near-focus pool:
+**fraction** \(f\) (outliers over accepted stars in the near-focus pool):
 
 \[
 S_{\text{hfr-outlier}} = \operatorname{clip}_{[0.5,\,1]}\!\bigl(\,1 - \text{Strength}\cdot\max(0,\; f - \text{Threshold})\,\bigr),

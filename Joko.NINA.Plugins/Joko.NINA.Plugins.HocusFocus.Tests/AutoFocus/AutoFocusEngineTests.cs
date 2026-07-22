@@ -1,5 +1,8 @@
 using NINA.Core.Enum;
 using NINA.Core.Interfaces;
+using NINA.Core.Model;
+using NINA.Core.Model.Equipment;
+using NINA.Core.Utility;
 using NINA.Equipment.Interfaces.Mediator;
 using NINA.Image.ImageAnalysis;
 using NINA.Image.Interfaces;
@@ -38,12 +41,14 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.AutoFocus {
         private static AutoFocusEngine Build(
             IProfileService profileService = null,
             IAutoFocusOptions autoFocusOptions = null,
-            IPluggableBehaviorSelector<IStarDetection> starDetectionSelector = null) {
+            IPluggableBehaviorSelector<IStarDetection> starDetectionSelector = null,
+            IFocuserMediator focuserMediator = null,
+            IFilterWheelMediator filterWheelMediator = null) {
             return new AutoFocusEngine(
                 profileService: profileService ?? Substitute.For<IProfileService>(),
                 cameraMediator: Substitute.For<ICameraMediator>(),
-                filterWheelMediator: Substitute.For<IFilterWheelMediator>(),
-                focuserMediator: Substitute.For<IFocuserMediator>(),
+                filterWheelMediator: filterWheelMediator ?? Substitute.For<IFilterWheelMediator>(),
+                focuserMediator: focuserMediator ?? Substitute.For<IFocuserMediator>(),
                 guiderMediator: Substitute.For<IGuiderMediator>(),
                 imagingMediator: Substitute.For<IImagingMediator>(),
                 imageDataFactory: Substitute.For<IImageDataFactory>(),
@@ -123,6 +128,67 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.AutoFocus {
                 Assert.That(options.ValidateHfrImprovement, Is.True);
                 Assert.That(options.FocuserOffset, Is.EqualTo(10));
             });
+        }
+
+        // ---- Fixed-sweep capture (non-convergent live optimization) --------------------------------------
+        // ComputeSweepPositions is the load-bearing geometry for CaptureFixedSweepAsync: it maps the AF
+        // step-size / offset-steps settings to the exact focuser positions the sweep visits. It must center on
+        // the rough-focus position, be symmetric, descend (single-direction approach for backlash), and always
+        // yield >= 3 distinct positions so the saved run clears the loader's 3-image / 3-position minimum.
+        [Test]
+        public void ComputeSweepPositions_CentersOnInitial_SymmetricDescending() {
+            var positions = AutoFocusEngine.ComputeSweepPositions(initial: 1000, offsetSteps: 3, stepSize: 10);
+            Assert.That(positions, Is.EqualTo(new[] { 1030, 1020, 1010, 1000, 990, 980, 970 }));
+        }
+
+        [TestCase(1, 3)]
+        [TestCase(2, 5)]
+        [TestCase(5, 11)]
+        public void ComputeSweepPositions_ReturnsTwoNPlusOnePoints(int offsetSteps, int expectedCount) {
+            var positions = AutoFocusEngine.ComputeSweepPositions(initial: 5000, offsetSteps: offsetSteps, stepSize: 25);
+            Assert.Multiple(() => {
+                Assert.That(positions, Has.Count.EqualTo(expectedCount));
+                Assert.That(positions[0], Is.EqualTo(5000 + offsetSteps * 25), "first is the high extreme");
+                Assert.That(positions[positions.Count - 1], Is.EqualTo(5000 - offsetSteps * 25), "last is the low extreme");
+                Assert.That(positions, Does.Contain(5000), "the rough-focus center is captured");
+                Assert.That(positions, Is.Ordered.Descending, "descend so every point is approached from the same direction");
+            });
+        }
+
+        [TestCase(0)]
+        [TestCase(-1)]
+        public void ComputeSweepPositions_OffsetStepsBelowOne_Throws(int offsetSteps) {
+            Assert.Throws<ArgumentOutOfRangeException>(() => AutoFocusEngine.ComputeSweepPositions(1000, offsetSteps, 10));
+        }
+
+        [TestCase(0)]
+        [TestCase(-5)]
+        public void ComputeSweepPositions_NonPositiveStepSize_Throws(int stepSize) {
+            Assert.Throws<ArgumentOutOfRangeException>(() => AutoFocusEngine.ComputeSweepPositions(1000, 3, stepSize));
+        }
+
+        // A sweep that can't save is useless: guard before touching the focuser so we don't move the focuser and
+        // discard every frame. This is the engine-side belt to the wizard's UI suspenders.
+        [Test]
+        public async Task CaptureFixedSweepAsync_MissingSavePath_FailsWithoutMovingFocuser() {
+            var focuserMediator = Substitute.For<IFocuserMediator>();
+            var engine = Build(focuserMediator: focuserMediator);
+            var options = new AutoFocusEngineOptions {
+                Save = true,
+                SavePath = "",
+                AutoFocusInitialOffsetSteps = 3,
+                AutoFocusStepSize = 10,
+                AutoFocusTimeout = TimeSpan.FromMinutes(1)
+            };
+
+            var result = await engine.CaptureFixedSweepAsync(options, null, CancellationToken.None, null);
+
+            Assert.Multiple(() => {
+                Assert.That(result, Is.Not.Null);
+                Assert.That(result.Succeeded, Is.False);
+                Assert.That(result.SaveFolder, Is.Null);
+            });
+            _ = focuserMediator.DidNotReceive().MoveFocuser(Arg.Any<int>(), Arg.Any<CancellationToken>());
         }
 
         [Test]
@@ -580,6 +646,67 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.AutoFocus {
                 // Any NaN sub-frame means an analysis error dominated the classification.
                 Assert.That(msg, Does.Contain("analysis errored on 1 of 2"));
             });
+        }
+
+        // --- UseExactImagingFilter (per-filter wizard target sweeps) ---
+        // SetAutofocusFilter substitutes the designated AF filter when UseFilterWheelOffsets is on. The
+        // options-aware overload must skip that substitution — and move the wheel to the requested filter —
+        // when UseExactImagingFilter is set, so a wizard target-filter sweep exposes through EXACTLY the
+        // chosen filter. Default options must preserve the substitution byte-for-byte.
+
+        private static IProfileService ProfileWithAfFilter(out FilterInfo afFilter, out FilterInfo targetFilter) {
+            var profileService = Substitute.For<IProfileService>();
+            afFilter = new FilterInfo("Lum", 0, 0) { AutoFocusFilter = true };
+            targetFilter = new FilterInfo("Ha", 0, 1);
+            profileService.ActiveProfile.FocuserSettings.UseFilterWheelOffsets.Returns(true);
+            profileService.ActiveProfile.FilterWheelSettings.FilterWheelFilters.Returns(
+                new ObserveAllCollection<FilterInfo>(new[] { afFilter, targetFilter }));
+            return profileService;
+        }
+
+        private static IFilterWheelMediator EchoingFilterWheel() {
+            var filterWheelMediator = Substitute.For<IFilterWheelMediator>();
+            filterWheelMediator.ChangeFilter(Arg.Any<FilterInfo>(), Arg.Any<CancellationToken>(), Arg.Any<IProgress<ApplicationStatus>>())
+                .Returns(ci => Task.FromResult(ci.Arg<FilterInfo>()));
+            return filterWheelMediator;
+        }
+
+        [Test]
+        public async Task SetAutofocusFilter_UseExactImagingFilter_MovesToExactFilterAndSkipsAfSubstitution() {
+            var profileService = ProfileWithAfFilter(out var afFilter, out var targetFilter);
+            var filterWheelMediator = EchoingFilterWheel();
+            var engine = Build(profileService, filterWheelMediator: filterWheelMediator);
+            var options = new AutoFocusEngineOptions { UseExactImagingFilter = true };
+
+            var result = await engine.SetAutofocusFilter(options, targetFilter, CancellationToken.None, null);
+
+            Assert.That(result, Is.SameAs(targetFilter), "the exact imaging filter is used, not the designated AF filter");
+            _ = filterWheelMediator.Received(1).ChangeFilter(targetFilter, Arg.Any<CancellationToken>(), Arg.Any<IProgress<ApplicationStatus>>());
+        }
+
+        [Test]
+        public async Task SetAutofocusFilter_DefaultOptions_StillSubstitutesDesignatedAfFilter() {
+            var profileService = ProfileWithAfFilter(out var afFilter, out var targetFilter);
+            var filterWheelMediator = EchoingFilterWheel();
+            var engine = Build(profileService, filterWheelMediator: filterWheelMediator);
+            var options = new AutoFocusEngineOptions(); // UseExactImagingFilter defaults to false
+
+            var result = await engine.SetAutofocusFilter(options, targetFilter, CancellationToken.None, null);
+
+            Assert.That(result, Is.SameAs(afFilter), "default behavior unchanged: the AF filter substitutes the imaging filter");
+            _ = filterWheelMediator.Received(1).ChangeFilter(afFilter, Arg.Any<CancellationToken>(), Arg.Any<IProgress<ApplicationStatus>>());
+        }
+
+        [Test]
+        public async Task SetAutofocusFilter_UseExactImagingFilter_NullImagingFilter_FallsBackToAfSubstitution() {
+            var profileService = ProfileWithAfFilter(out var afFilter, out _);
+            var filterWheelMediator = EchoingFilterWheel();
+            var engine = Build(profileService, filterWheelMediator: filterWheelMediator);
+            var options = new AutoFocusEngineOptions { UseExactImagingFilter = true };
+
+            var result = await engine.SetAutofocusFilter(options, null, CancellationToken.None, null);
+
+            Assert.That(result, Is.SameAs(afFilter), "no exact filter to honor: fall back to the designated AF filter");
         }
 
         private sealed class TempDir : IDisposable {

@@ -73,6 +73,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
         private readonly IProgress<ApplicationStatus> progress;
         private readonly IPluggableBehaviorSelector<IStarDetection> starDetectionSelector;
         private readonly IApplicationDispatcher applicationDispatcher;
+        private readonly IPerFilterStarDetectionStore perFilterStore;
 
         // WindowServiceFactory is not a MEF export (NINA exposes the concrete type), so it is instantiated directly,
         // mirroring InspectorVM / HocusFocusPlugin.
@@ -114,7 +115,8 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             IApplicationStatusMediator applicationStatusMediator,
             IPluggableBehaviorSelector<IStarDetection> starDetectionSelector,
             IAlglibAPI alglibAPI,
-            IApplicationDispatcher applicationDispatcher
+            IApplicationDispatcher applicationDispatcher,
+            IPerFilterStarDetectionStore perFilterStore = null
         ) : base(profileService) {
             this.focuserMediator = focuserMediator;
             this.autoFocusEngineFactory = autoFocusEngineFactory;
@@ -124,6 +126,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             this.autoFocusOptions = autoFocusOptions;
             this.alglibAPI = alglibAPI;
             this.applicationDispatcher = applicationDispatcher;
+            this.perFilterStore = perFilterStore;
 
             FocusPoints = new AsyncObservableCollection<ScatterErrorPoint>();
             PlotFinalFocusPointWithError = new AsyncObservableCollection<ScatterErrorPoint>();
@@ -550,6 +553,12 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             }
         }
 
+        // Cancellation source for the in-flight live AutoFocus run started via StartAutoFocus, linked to the caller's
+        // token (the sequence's or the pane's). CancelAutoFocus() trips it so the sequence-item popup's close (X)
+        // button can stop the run and then close. Null whenever no live run is in flight. The replay path has its own
+        // loadSavedAutoFocusRunCts.
+        private CancellationTokenSource autoFocusRunCts;
+
         public async Task<AutoFocusReport> StartAutoFocus(FilterInfo imagingFilter, CancellationToken token, IProgress<ApplicationStatus> progress) {
             IAutoFocusEngine autoFocusEngine = null;
             try {
@@ -557,6 +566,15 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                     Notification.ShowError("Another AutoFocus is already in progress");
                     return null;
                 }
+                // Per-filter star detection keys settings off the capture-time filter name; without a
+                // connected wheel every exposure would soft-fail, so refuse the run up front.
+                if (perFilterStore?.Enabled == true && filterWheelMediator.GetInfo()?.Connected != true) {
+                    Notification.ShowError("Per-filter star detection requires a connected filter wheel");
+                    return null;
+                }
+                // Link the caller's token so this run is independently cancelable (window-close cancel). Created before
+                // AutoFocusInProgress flips true so a cancel observed off that flag never races a null source.
+                autoFocusRunCts = CancellationTokenSource.CreateLinkedTokenSource(token);
                 AutoFocusInProgress = true;
 
                 autoFocusEngine = autoFocusEngineFactory.Create();
@@ -570,7 +588,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                 var options = autoFocusEngine.GetOptions();
 
                 ApplyFrameReviewOptions(options);
-                var result = await autoFocusEngine.Run(options, imagingFilter, token, progress);
+                var result = await autoFocusEngine.Run(options, imagingFilter, autoFocusRunCts.Token, progress);
                 if (result == null || !result.Succeeded) {
                     return null;
                 }
@@ -593,8 +611,19 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                 // covers cancellation / null-init paths where Completed/Failed never fired, so captured
                 // exposures aren't pinned until the next run. (F22)
                 ReleaseUnsnapshottedReviewFrames();
+                autoFocusRunCts?.Dispose();
+                autoFocusRunCts = null;
                 AutoFocusInProgress = false;
             }
+        }
+
+        /// <summary>
+        /// Cancels the in-flight live AutoFocus run started via <see cref="StartAutoFocus"/>, if any. The sequence-item
+        /// AutoFocus popup's close (X) button calls this so closing the window stops the run rather than orphaning it;
+        /// the window then closes once <see cref="AutoFocusInProgress"/> clears. No-op when no run is in flight.
+        /// </summary>
+        public void CancelAutoFocus() {
+            autoFocusRunCts?.Cancel();
         }
 
         public AutoFocusReport LastReport { get; private set; }

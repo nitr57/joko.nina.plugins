@@ -13,6 +13,7 @@ public class TiltAdapterDevicePresetTests {
             Assert.That(TiltAdapterDevicePreset.Manual.IsManual, Is.True);
             Assert.That(TiltAdapterDevicePreset.Manual.Name, Is.EqualTo("Manual"));
             Assert.That(TiltAdapterDevicePreset.All[0], Is.SameAs(TiltAdapterDevicePreset.Manual));
+            Assert.That(TiltAdapterDevicePreset.Manual.DefaultCalibrationAmount, Is.EqualTo(1.0));
         });
     }
 
@@ -25,6 +26,7 @@ public class TiltAdapterDevicePresetTests {
             Assert.That(preset.AdjustmentType, Is.EqualTo(TiltAdjustmentType.Screws));
             Assert.That(preset.ThreadPitchMicrons, Is.EqualTo(400));
             Assert.That(preset.ScrewRadiusMillimeters, Is.EqualTo(44));
+            Assert.That(preset.DefaultCalibrationAmount, Is.EqualTo(1.0));
         });
     }
 
@@ -38,6 +40,7 @@ public class TiltAdapterDevicePresetTests {
             Assert.That(preset.ThreadPitchMicrons, Is.EqualTo(212));
             Assert.That(preset.StepperStepSizeMicrons, Is.EqualTo(-1));
             Assert.That(preset.ScrewRadiusMillimeters, Is.EqualTo(44));
+            Assert.That(preset.DefaultCalibrationAmount, Is.EqualTo(1.0));
         });
     }
 
@@ -51,6 +54,7 @@ public class TiltAdapterDevicePresetTests {
             Assert.That(preset.ThreadPitchMicrons, Is.EqualTo(212));
             Assert.That(preset.StepperStepSizeMicrons, Is.EqualTo(-1));
             Assert.That(preset.ScrewRadiusMillimeters, Is.EqualTo(50));
+            Assert.That(preset.DefaultCalibrationAmount, Is.EqualTo(1.0));
         });
     }
 
@@ -64,6 +68,7 @@ public class TiltAdapterDevicePresetTests {
             Assert.That(preset.ThreadPitchMicrons, Is.EqualTo(-1));
             Assert.That(preset.StepperStepSizeMicrons, Is.EqualTo(1.8));
             Assert.That(preset.ScrewRadiusMillimeters, Is.EqualTo(55));
+            Assert.That(preset.DefaultCalibrationAmount, Is.EqualTo(150));
         });
     }
 
@@ -77,6 +82,7 @@ public class TiltAdapterDevicePresetTests {
             Assert.That(preset.ThreadPitchMicrons, Is.EqualTo(212));
             Assert.That(preset.StepperStepSizeMicrons, Is.EqualTo(-1));
             Assert.That(preset.ScrewRadiusMillimeters, Is.EqualTo(54));
+            Assert.That(preset.DefaultCalibrationAmount, Is.EqualTo(1.0));
         });
     }
 
@@ -90,6 +96,72 @@ public class TiltAdapterDevicePresetTests {
             Assert.That(preset.ThreadPitchMicrons, Is.EqualTo(-1));
             Assert.That(preset.StepperStepSizeMicrons, Is.EqualTo(1.8));
             Assert.That(preset.ScrewRadiusMillimeters, Is.EqualTo(62.75));
+            Assert.That(preset.DefaultCalibrationAmount, Is.EqualTo(150));
+        });
+    }
+
+    [Test]
+    public void OgmaZTilter3Point_HasDocumentedValues() {
+        var preset = TiltAdapterDevicePreset.ByName("OGMA Z'Tilter - 3-point configuration");
+        Assert.Multiple(() => {
+            Assert.That(preset.IsManual, Is.False);
+            Assert.That(preset.ScrewCount, Is.EqualTo(3));
+            Assert.That(preset.AdjustmentType, Is.EqualTo(TiltAdjustmentType.Screws));
+            Assert.That(preset.ThreadPitchMicrons, Is.EqualTo(450));
+            Assert.That(preset.StepperStepSizeMicrons, Is.EqualTo(-1));
+            Assert.That(preset.ScrewRadiusMillimeters, Is.EqualTo(48.9));
+        });
+    }
+
+    [Test]
+    public void OgmaZTilter4Point_HasDocumentedValues() {
+        var preset = TiltAdapterDevicePreset.ByName("OGMA Z'Tilter - 4-point configuration");
+        Assert.Multiple(() => {
+            Assert.That(preset.IsManual, Is.False);
+            Assert.That(preset.ScrewCount, Is.EqualTo(4));
+            Assert.That(preset.AdjustmentType, Is.EqualTo(TiltAdjustmentType.Screws));
+            Assert.That(preset.ThreadPitchMicrons, Is.EqualTo(450));
+            Assert.That(preset.StepperStepSizeMicrons, Is.EqualTo(-1));
+            Assert.That(preset.ScrewRadiusMillimeters, Is.EqualTo(48.9));
+        });
+    }
+
+    [Test]
+    public void OgmaOTilter_HasDocumentedValues() {
+        var preset = TiltAdapterDevicePreset.ByName("OGMA O'Tilter");
+        Assert.Multiple(() => {
+            Assert.That(preset.IsManual, Is.False);
+            Assert.That(preset.ScrewCount, Is.EqualTo(3));
+            Assert.That(preset.AdjustmentType, Is.EqualTo(TiltAdjustmentType.Screws));
+            Assert.That(preset.ThreadPitchMicrons, Is.EqualTo(450));
+            Assert.That(preset.StepperStepSizeMicrons, Is.EqualTo(-1));
+            Assert.That(preset.ScrewRadiusMillimeters, Is.EqualTo(43.25));
+        });
+    }
+
+    [Test]
+    public void OgmaPlusTilterOagPro3Point_HasDocumentedValues() {
+        var preset = TiltAdapterDevicePreset.ByName("OGMA +Tilter / OAG Pro - 3-point configuration");
+        Assert.Multiple(() => {
+            Assert.That(preset.IsManual, Is.False);
+            Assert.That(preset.ScrewCount, Is.EqualTo(3));
+            Assert.That(preset.AdjustmentType, Is.EqualTo(TiltAdjustmentType.Screws));
+            Assert.That(preset.ThreadPitchMicrons, Is.EqualTo(450));
+            Assert.That(preset.StepperStepSizeMicrons, Is.EqualTo(-1));
+            Assert.That(preset.ScrewRadiusMillimeters, Is.EqualTo(40));
+        });
+    }
+
+    [Test]
+    public void OgmaPlusTilterOagPro4Point_HasDocumentedValues() {
+        var preset = TiltAdapterDevicePreset.ByName("OGMA +Tilter / OAG Pro - 4-point configuration");
+        Assert.Multiple(() => {
+            Assert.That(preset.IsManual, Is.False);
+            Assert.That(preset.ScrewCount, Is.EqualTo(4));
+            Assert.That(preset.AdjustmentType, Is.EqualTo(TiltAdjustmentType.Screws));
+            Assert.That(preset.ThreadPitchMicrons, Is.EqualTo(450));
+            Assert.That(preset.StepperStepSizeMicrons, Is.EqualTo(-1));
+            Assert.That(preset.ScrewRadiusMillimeters, Is.EqualTo(40));
         });
     }
 
@@ -97,5 +169,18 @@ public class TiltAdapterDevicePresetTests {
     public void ByName_UnknownFallsBackToManual() {
         Assert.That(TiltAdapterDevicePreset.ByName("does-not-exist"), Is.SameAs(TiltAdapterDevicePreset.Manual));
         Assert.That(TiltAdapterDevicePreset.ByName(null), Is.SameAs(TiltAdapterDevicePreset.Manual));
+    }
+
+    [Test]
+    public void DefaultCalibrationAmount_Is150ForStepperPresetsAnd1ForEveryOtherPreset() {
+        // 150 steps for both ASG Electronic EAT (stepper-motor) presets; 1 full turn for Manual and
+        // every screw-thread preset. Iterates the live All list so a future preset addition is forced
+        // to make an explicit choice rather than silently inheriting a wrong default.
+        Assert.Multiple(() => {
+            foreach (var preset in TiltAdapterDevicePreset.All) {
+                double expected = preset.AdjustmentType == TiltAdjustmentType.StepperMotors ? 150.0 : 1.0;
+                Assert.That(preset.DefaultCalibrationAmount, Is.EqualTo(expected), $"preset '{preset.Name}'");
+            }
+        });
     }
 }

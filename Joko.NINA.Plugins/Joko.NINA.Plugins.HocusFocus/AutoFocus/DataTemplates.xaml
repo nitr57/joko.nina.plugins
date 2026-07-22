@@ -9,6 +9,7 @@
     xmlns:local="clr-namespace:NINA.Joko.Plugins.HocusFocus.AutoFocus"
     xmlns:afreview="clr-namespace:NINA.Joko.Plugins.HocusFocus.AutoFocus.Review"
     xmlns:replay="clr-namespace:NINA.Joko.Plugins.HocusFocus.AutoFocus.Replay"
+    xmlns:tiltprompt="clr-namespace:NINA.Joko.Plugins.HocusFocus.TiltAdapterDevices.Prompt"
     xmlns:ninactrl="clr-namespace:NINA.CustomControlLibrary;assembly=NINA.CustomControlLibrary"
     xmlns:ns="clr-namespace:NINA.Core.Locale;assembly=NINA.Core"
     xmlns:oxy="clr-namespace:OxyPlot.Wpf;assembly=OxyPlot.Contrib.Wpf"
@@ -104,11 +105,22 @@
         <replay:ReplaySettingsPromptControl />
     </DataTemplate>
 
-    <DataTemplate x:Key="NINA.Joko.Plugins.HocusFocus.AutoFocus.HocusFocusVM_Dockable">
-        <Grid local:InteractiveHostBehavior.HostInteractive="True">
+    <!--  The tilt-device adjustment approval prompt: review/approve the exact motorized tilt-adapter commands before
+          they are sent to the device. Implicit DataType template resolved by the WindowService, same as above.  -->
+    <DataTemplate DataType="{x:Type tiltprompt:TiltDeviceAdjustmentPromptVM}">
+        <tiltprompt:TiltDeviceAdjustmentPromptControl />
+    </DataTemplate>
+
+    <!--  Shared chart + info "core": the AF plot plus the run's info rows (Time / Position / HFR / Temperature /
+          Filter and the fit-quality stats). Hosted BOTH by the imaging-pane template (…_Dockable below, which adds
+          the Replay Saved AF / Review Frames row) and by the sequence-item popup (the implicit by-type template,
+          which shows just this core — those pane-only controls are omitted there). InteractiveHostBehavior lives on
+          the …_Dockable wrapper, NOT here, so only the pane's VM is marked interactive; a sequence-created VM
+          rendered through this core stays non-interactive and never retains frames.  -->
+    <DataTemplate x:Key="NINA.Joko.Plugins.HocusFocus.AutoFocus.HocusFocusVM_Core">
+        <Grid>
             <Grid.RowDefinitions>
                 <RowDefinition MinHeight="150" />
-                <RowDefinition Height="Auto" />
                 <RowDefinition Height="Auto" />
                 <RowDefinition Height="Auto" />
             </Grid.RowDefinitions>
@@ -611,8 +623,28 @@
                     <TextBlock Margin="5,0,0,0" Text="{Binding AutoFocusDuration, Converter={StaticResource TimeSpanToStringConverter}}" />
                 </UniformGrid>
             </StackPanel>
+        </Grid>
+    </DataTemplate>
+
+    <!--  Imaging-pane (dockable) template. NINA's GenericTemplateSelector resolves this by the
+          "<TypeFullName>_Dockable" key, so this — not the shared core — is what the AutoFocus pane renders. It wraps
+          the core and adds the Replay Saved AF / Review Frames + "Keep frames for review" row, which only makes sense
+          for interactive pane runs (auto-focus during an imaging sequence never keeps frames). HostInteractive lives
+          here so only the pane's VM is marked interactive; the sequence popup renders the core template directly.  -->
+    <DataTemplate x:Key="NINA.Joko.Plugins.HocusFocus.AutoFocus.HocusFocusVM_Dockable">
+        <Grid local:InteractiveHostBehavior.HostInteractive="True">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="*" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+            <ContentControl
+                Grid.Row="0"
+                HorizontalContentAlignment="Stretch"
+                VerticalContentAlignment="Stretch"
+                Content="{Binding}"
+                ContentTemplate="{StaticResource NINA.Joko.Plugins.HocusFocus.AutoFocus.HocusFocusVM_Core}" />
             <ninactrl:CancellableButton
-                Grid.Row="3"
+                Grid.Row="1"
                 Height="25"
                 Margin="10,15,0,5"
                 Padding="5,0,5,0"
@@ -625,14 +657,13 @@
                 Command="{Binding LoadSavedAutoFocusRunCommand}"
                 ToolTip="Replays saved AutoFocus images (Save enabled in Hocus Focus -&gt; Auto Focus Options) to produce an auto focus curve using whatever the current star detection and fit settings are" />
             <StackPanel
-                Grid.Row="3"
+                Grid.Row="1"
                 Margin="0,15,10,5"
                 HorizontalAlignment="Right"
                 VerticalAlignment="Bottom"
                 Orientation="Horizontal">
                 <Button
                     Height="25"
-                    Padding="5,0,5,0"
                     VerticalAlignment="Center"
                     Command="{Binding ReviewFramesCommand}"
                     ToolTip="Open the Review Frames window to inspect each frame of the last auto-focus run started from this pane (a live run or a Replay Saved AF) — its detected stars with the Hocus Focus Star Annotator's bounds, per-star text, rejection-reason and ROI boxes, plus per-frame HFR statistics. Enabled after such a run completes with &quot;Keep frames for review&quot; turned on.">
@@ -654,8 +685,27 @@
             </StackPanel>
         </Grid>
     </DataTemplate>
+    <!--  Implicit (by-type) template, used only when a HocusFocusVM is shown on its own — chiefly the "Run
+          Autofocus" sequence item, which NINA hosts in a SizeToContent CustomWindow floored at just 350x300. It
+          renders the shared CORE (chart + info) only: the Replay Saved AF / Review Frames row is deliberately
+          omitted here — those are pane-only controls, and sharing one grid cell they overlapped in the narrow popup.
+          The docked AutoFocus pane resolves the keyed *_Dockable template above instead (via NINA's
+          GenericTemplateSelector), which keeps that row. The Border's minimum size gives the chart a usable popup
+          without constraining the dock; its Padding keeps the chart and info text off the window edge; Stretch makes
+          the core fill it. CancelOnClose makes the window's close (X) cancel an in-progress run and close once it
+          stops (see CancelAutoFocusOnCloseBehavior) — this is the popup-only path, so the dock is unaffected.  -->
     <DataTemplate DataType="{x:Type local:HocusFocusVM}">
-        <ContentControl Content="{Binding}" ContentTemplate="{StaticResource NINA.Joko.Plugins.HocusFocus.AutoFocus.HocusFocusVM_Dockable}" />
+        <Border
+            MinWidth="500"
+            MinHeight="420"
+            Padding="10"
+            local:CancelAutoFocusOnCloseBehavior.CancelOnClose="True">
+            <ContentControl
+                HorizontalContentAlignment="Stretch"
+                VerticalContentAlignment="Stretch"
+                Content="{Binding}"
+                ContentTemplate="{StaticResource NINA.Joko.Plugins.HocusFocus.AutoFocus.HocusFocusVM_Core}" />
+        </Border>
     </DataTemplate>
     <DataTemplate x:Key="NINA.Joko.Plugins.HocusFocus.StarDetection.StarDetectorDockable_Dockable">
         <ContentControl Content="{Binding StarDetectionOptions}" ContentTemplate="{StaticResource HocusFocus_StarDetection_Options}" />
@@ -1139,6 +1189,19 @@
                         <MultiBinding Converter="{StaticResource BooleanAndConverter}">
                             <Binding Mode="OneWay" Path="InspectorOptions.SensorCurveModelEnabled" />
                             <Binding Mode="OneWay" Path="InspectorOptions.ShowSensorModel" />
+                        </MultiBinding>
+                    </FrameworkElement.Tag>
+                </FrameworkElement>
+                <!--  Chart-only gate: like ShowSensorModel, but ALSO false while a sweep is running, so the
+                      Focus Chart shows the 5-curve (Center + 4-corner) view live DURING a sweep and collapses
+                      to the single AF-points curve only after the sweep completes (when the sensor model is
+                      shown). Only the Focus Chart's series/annotations/legend bind to this; every other
+                      sensor-model gate stays on ShowSensorModel.  -->
+                <FrameworkElement x:Name="ShowSingleAfCurve">
+                    <FrameworkElement.Tag>
+                        <MultiBinding Converter="{StaticResource BooleanAndConverter}">
+                            <Binding ElementName="ShowSensorModel" Mode="OneWay" Path="Tag" />
+                            <Binding Converter="{StaticResource HF_InverseBooleanConverter}" Mode="OneWay" Path="IsAnalysisRunning" />
                         </MultiBinding>
                     </FrameworkElement.Tag>
                 </FrameworkElement>
@@ -2144,78 +2207,23 @@
                                     </DataTrigger>
                                 </Style.Triggers>
                             </Style>
-                            <SolidColorBrush x:Key="TopLeftBrush">
-                                <SolidColorBrush.Color>
-                                    <MultiBinding Converter="{StaticResource HF_InterpolateColorConverter}">
-                                        <Binding Path="Color" Source="{StaticResource SecondaryBrush}" />
-                                        <Binding Path="Color" Source="{StaticResource BackgroundBrush}" />
-                                        <Binding>
-                                            <Binding.Source>
-                                                <s:Int32>0</s:Int32>
-                                            </Binding.Source>
-                                        </Binding>
-                                        <Binding>
-                                            <Binding.Source>
-                                                <s:Int32>4</s:Int32>
-                                            </Binding.Source>
-                                        </Binding>
-                                    </MultiBinding>
-                                </SolidColorBrush.Color>
-                            </SolidColorBrush>
-                            <SolidColorBrush x:Key="TopRightBrush">
-                                <SolidColorBrush.Color>
-                                    <MultiBinding Converter="{StaticResource HF_InterpolateColorConverter}">
-                                        <Binding Path="Color" Source="{StaticResource SecondaryBrush}" />
-                                        <Binding Path="Color" Source="{StaticResource BackgroundBrush}" />
-                                        <Binding>
-                                            <Binding.Source>
-                                                <s:Int32>1</s:Int32>
-                                            </Binding.Source>
-                                        </Binding>
-                                        <Binding>
-                                            <Binding.Source>
-                                                <s:Int32>4</s:Int32>
-                                            </Binding.Source>
-                                        </Binding>
-                                    </MultiBinding>
-                                </SolidColorBrush.Color>
-                            </SolidColorBrush>
-                            <SolidColorBrush x:Key="BottomLeftBrush">
-                                <SolidColorBrush.Color>
-                                    <MultiBinding Converter="{StaticResource HF_InterpolateColorConverter}">
-                                        <Binding Path="Color" Source="{StaticResource SecondaryBrush}" />
-                                        <Binding Path="Color" Source="{StaticResource BackgroundBrush}" />
-                                        <Binding>
-                                            <Binding.Source>
-                                                <s:Int32>2</s:Int32>
-                                            </Binding.Source>
-                                        </Binding>
-                                        <Binding>
-                                            <Binding.Source>
-                                                <s:Int32>4</s:Int32>
-                                            </Binding.Source>
-                                        </Binding>
-                                    </MultiBinding>
-                                </SolidColorBrush.Color>
-                            </SolidColorBrush>
-                            <SolidColorBrush x:Key="BottomRightBrush">
-                                <SolidColorBrush.Color>
-                                    <MultiBinding Converter="{StaticResource HF_InterpolateColorConverter}">
-                                        <Binding Path="Color" Source="{StaticResource SecondaryBrush}" />
-                                        <Binding Path="Color" Source="{StaticResource BackgroundBrush}" />
-                                        <Binding>
-                                            <Binding.Source>
-                                                <s:Int32>3</s:Int32>
-                                            </Binding.Source>
-                                        </Binding>
-                                        <Binding>
-                                            <Binding.Source>
-                                                <s:Int32>4</s:Int32>
-                                            </Binding.Source>
-                                        </Binding>
-                                    </MultiBinding>
-                                </SolidColorBrush.Color>
-                            </SolidColorBrush>
+                            <!--
+                                Per-region focus-curve colors. Fixed, high-contrast categorical hues
+                                chosen so the four corner curves stay legible AND mutually distinguishable
+                                on every NINA theme. Validated (data-viz palette check): worst colorblind
+                                separation ΔE 15.9 (> 12 target across protan/deutan/tritan), and each hue
+                                clears 3:1 contrast on both the pure-white (Light/Classic/Seance) and the
+                                near-black (Dark/Navy/Slate/High Contrast) theme surfaces; on the few
+                                mid-grey surfaces (Black Coral/Arsenic) the native chart legend supplies
+                                the identity relief. Previously these were interpolated SecondaryBrush →
+                                BackgroundBrush, which faded the lower regions into the plot background
+                                (Bottom Right ≈ 75% of the way to the background → effectively invisible on
+                                dark themes). Center and AF Points intentionally remain PrimaryBrush.
+                            -->
+                            <SolidColorBrush x:Key="TopLeftBrush" Color="#FF2E7BC4" />
+                            <SolidColorBrush x:Key="TopRightBrush" Color="#FFD2691E" />
+                            <SolidColorBrush x:Key="BottomLeftBrush" Color="#FF1E9E63" />
+                            <SolidColorBrush x:Key="BottomRightBrush" Color="#FFD454A0" />
                         </Grid.Resources>
                         <Grid.RowDefinitions>
                             <RowDefinition Height="Auto" />
@@ -2243,13 +2251,14 @@
                             PlotAreaBorderColor="{Binding Path=Color, Source={StaticResource BorderBrush}}"
                             PlotModel="{Binding AutoFocusChartPlotModel, Mode=OneWayToSource, NotifyOnTargetUpdated=True}"
                             TextColor="{Binding Path=Color, Source={StaticResource PrimaryBrush}}">
-                            <oxy:Plot.Legends>
-                                <oxy:Legend
-                                    LegendOrientation="Vertical"
-                                    LegendPlacement="Inside"
-                                    LegendPosition="RightBottom"
-                                    Visibility="{Binding ElementName=ShowSensorModel, Path=Tag, Converter={StaticResource HF_InverseBooleanConverter}, Mode=OneWay}" />
-                            </oxy:Plot.Legends>
+                            <!--
+                                The built-in OxyPlot legend is intentionally omitted: for hidden series
+                                (WPF Visibility=Collapsed → OxyPlot IsVisible=false) OxyPlot still lists
+                                the entry but draws its label with a hard-coded ~25%-alpha near-black
+                                SeriesInvisibleTextColor that never falls back to the theme text color, so
+                                the phantom rows below the one visible series washed out on dark themes. A
+                                native, theme-aware legend is rendered as a sibling overlay below instead.
+                            -->
                             <oxy:Plot.Axes>
                                 <oxy:LinearAxis
                                     AxislineColor="{Binding Path=Color, Source={StaticResource PrimaryBrush}}"
@@ -2296,7 +2305,7 @@
                                     <oxy:ScatterErrorSeries.Visibility>
                                         <Binding
                                             Converter="{StaticResource BooleanToVisibilityCollapsedConverter}"
-                                            ElementName="ShowSensorModel"
+                                            ElementName="ShowSingleAfCurve"
                                             Mode="OneWay"
                                             Path="Tag" />
                                     </oxy:ScatterErrorSeries.Visibility>
@@ -2318,7 +2327,7 @@
                                     <oxy:ScatterErrorSeries.Visibility>
                                         <Binding
                                             Converter="{StaticResource InverseBooleanToVisibilityCollapsedConverter}"
-                                            ElementName="ShowSensorModel"
+                                            ElementName="ShowSingleAfCurve"
                                             Mode="OneWay"
                                             Path="Tag" />
                                     </oxy:ScatterErrorSeries.Visibility>
@@ -2339,7 +2348,7 @@
                                     <oxy:ScatterErrorSeries.Visibility>
                                         <Binding
                                             Converter="{StaticResource InverseBooleanToVisibilityCollapsedConverter}"
-                                            ElementName="ShowSensorModel"
+                                            ElementName="ShowSingleAfCurve"
                                             Mode="OneWay"
                                             Path="Tag" />
                                     </oxy:ScatterErrorSeries.Visibility>
@@ -2360,7 +2369,7 @@
                                     <oxy:ScatterErrorSeries.Visibility>
                                         <Binding
                                             Converter="{StaticResource InverseBooleanToVisibilityCollapsedConverter}"
-                                            ElementName="ShowSensorModel"
+                                            ElementName="ShowSingleAfCurve"
                                             Mode="OneWay"
                                             Path="Tag" />
                                     </oxy:ScatterErrorSeries.Visibility>
@@ -2381,7 +2390,7 @@
                                     <oxy:ScatterErrorSeries.Visibility>
                                         <Binding
                                             Converter="{StaticResource InverseBooleanToVisibilityCollapsedConverter}"
-                                            ElementName="ShowSensorModel"
+                                            ElementName="ShowSingleAfCurve"
                                             Mode="OneWay"
                                             Path="Tag" />
                                     </oxy:ScatterErrorSeries.Visibility>
@@ -2402,7 +2411,7 @@
                                     <oxy:ScatterErrorSeries.Visibility>
                                         <Binding
                                             Converter="{StaticResource InverseBooleanToVisibilityCollapsedConverter}"
-                                            ElementName="ShowSensorModel"
+                                            ElementName="ShowSingleAfCurve"
                                             Mode="OneWay"
                                             Path="Tag" />
                                     </oxy:ScatterErrorSeries.Visibility>
@@ -2423,7 +2432,7 @@
                                             </Binding>
                                             <Binding Path="RegionCurveFittings[0]" />
                                             <Binding
-                                                ElementName="ShowSensorModel"
+                                                ElementName="ShowSingleAfCurve"
                                                 Mode="OneWay"
                                                 Path="Tag" />
                                         </MultiBinding>
@@ -2455,7 +2464,7 @@
                                             <Binding Path="RegionCurveFittings[1]" />
                                             <Binding
                                                 Converter="{StaticResource HF_InverseBooleanConverter}"
-                                                ElementName="ShowSensorModel"
+                                                ElementName="ShowSingleAfCurve"
                                                 Mode="OneWay"
                                                 Path="Tag" />
                                         </MultiBinding>
@@ -2486,7 +2495,7 @@
                                             <Binding Path="RegionCurveFittings[2]" />
                                             <Binding
                                                 Converter="{StaticResource HF_InverseBooleanConverter}"
-                                                ElementName="ShowSensorModel"
+                                                ElementName="ShowSingleAfCurve"
                                                 Mode="OneWay"
                                                 Path="Tag" />
                                         </MultiBinding>
@@ -2517,7 +2526,7 @@
                                             <Binding Path="RegionCurveFittings[3]" />
                                             <Binding
                                                 Converter="{StaticResource HF_InverseBooleanConverter}"
-                                                ElementName="ShowSensorModel"
+                                                ElementName="ShowSingleAfCurve"
                                                 Mode="OneWay"
                                                 Path="Tag" />
                                         </MultiBinding>
@@ -2548,7 +2557,7 @@
                                             <Binding Path="RegionCurveFittings[4]" />
                                             <Binding
                                                 Converter="{StaticResource HF_InverseBooleanConverter}"
-                                                ElementName="ShowSensorModel"
+                                                ElementName="ShowSingleAfCurve"
                                                 Mode="OneWay"
                                                 Path="Tag" />
                                         </MultiBinding>
@@ -2579,7 +2588,7 @@
                                             <Binding Path="RegionCurveFittings[5]" />
                                             <Binding
                                                 Converter="{StaticResource HF_InverseBooleanConverter}"
-                                                ElementName="ShowSensorModel"
+                                                ElementName="ShowSingleAfCurve"
                                                 Mode="OneWay"
                                                 Path="Tag" />
                                         </MultiBinding>
@@ -2612,7 +2621,7 @@
                                             </Binding>
                                             <Binding Converter="{StaticResource HF_IsNotNegativeToBooleanConverter}" Path="RegionFinalFocusPoints[0].X" />
                                             <Binding
-                                                ElementName="ShowSensorModel"
+                                                ElementName="ShowSingleAfCurve"
                                                 Mode="OneWay"
                                                 Path="Tag" />
                                         </MultiBinding>
@@ -2636,7 +2645,7 @@
                                             <Binding Converter="{StaticResource HF_IsNotNegativeToBooleanConverter}" Path="RegionFinalFocusPoints[1].X" />
                                             <Binding
                                                 Converter="{StaticResource HF_InverseBooleanConverter}"
-                                                ElementName="ShowSensorModel"
+                                                ElementName="ShowSingleAfCurve"
                                                 Mode="OneWay"
                                                 Path="Tag" />
                                         </MultiBinding>
@@ -2662,7 +2671,7 @@
                                             <Binding Converter="{StaticResource HF_IsNotNegativeToBooleanConverter}" Path="RegionFinalFocusPoints[2].X" />
                                             <Binding
                                                 Converter="{StaticResource HF_InverseBooleanConverter}"
-                                                ElementName="ShowSensorModel"
+                                                ElementName="ShowSingleAfCurve"
                                                 Mode="OneWay"
                                                 Path="Tag" />
                                         </MultiBinding>
@@ -2688,7 +2697,7 @@
                                             <Binding Converter="{StaticResource HF_IsNotNegativeToBooleanConverter}" Path="RegionFinalFocusPoints[3].X" />
                                             <Binding
                                                 Converter="{StaticResource HF_InverseBooleanConverter}"
-                                                ElementName="ShowSensorModel"
+                                                ElementName="ShowSingleAfCurve"
                                                 Mode="OneWay"
                                                 Path="Tag" />
                                         </MultiBinding>
@@ -2714,7 +2723,7 @@
                                             <Binding Converter="{StaticResource HF_IsNotNegativeToBooleanConverter}" Path="RegionFinalFocusPoints[4].X" />
                                             <Binding
                                                 Converter="{StaticResource HF_InverseBooleanConverter}"
-                                                ElementName="ShowSensorModel"
+                                                ElementName="ShowSingleAfCurve"
                                                 Mode="OneWay"
                                                 Path="Tag" />
                                         </MultiBinding>
@@ -2740,7 +2749,7 @@
                                             <Binding Converter="{StaticResource HF_IsNotNegativeToBooleanConverter}" Path="RegionFinalFocusPoints[5].X" />
                                             <Binding
                                                 Converter="{StaticResource HF_InverseBooleanConverter}"
-                                                ElementName="ShowSensorModel"
+                                                ElementName="ShowSingleAfCurve"
                                                 Mode="OneWay"
                                                 Path="Tag" />
                                         </MultiBinding>
@@ -2748,6 +2757,54 @@
                                 </oxy:PointAnnotation>
                             </oxy:Plot.Annotations>
                         </controls:OxyPlotExtended>
+                        <!--
+                            Native, theme-aware chart legend (replaces the built-in OxyPlot legend, whose
+                            hidden-series entries washed out on dark themes). Each row is gated by the same
+                            converter as its series, so a collapsed series never leaves a phantom entry:
+                            "AF Points" shows only when the sensor-curve model is active (Tag=true); Center
+                            plus the four corner regions show in the normal per-region view (Tag=false).
+                            Swatch fills reuse the exact series brushes; labels use PrimaryBrush so they
+                            follow the theme (matching the Tilt Adapter Wizard's native diagram). Overlaid
+                            bottom-right (matching the old LegendPosition) and hit-test-invisible so it
+                            never blocks chart pan/zoom.
+                        -->
+                        <Border
+                            Grid.Row="1"
+                            Margin="0,0,14,14"
+                            Padding="6,4"
+                            HorizontalAlignment="Right"
+                            VerticalAlignment="Bottom"
+                            Background="{StaticResource BackgroundBrush}"
+                            BorderBrush="{StaticResource BorderBrush}"
+                            BorderThickness="1"
+                            IsHitTestVisible="False">
+                            <StackPanel Orientation="Vertical">
+                                <StackPanel Margin="0,1" Orientation="Horizontal" Visibility="{Binding ElementName=ShowSingleAfCurve, Path=Tag, Mode=OneWay, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}">
+                                    <Rectangle Width="12" Height="12" Margin="0,0,6,0" VerticalAlignment="Center" Fill="{StaticResource PrimaryBrush}" />
+                                    <TextBlock VerticalAlignment="Center" FontSize="11" Foreground="{StaticResource PrimaryBrush}" Text="AF Points" />
+                                </StackPanel>
+                                <StackPanel Margin="0,1" Orientation="Horizontal" Visibility="{Binding ElementName=ShowSingleAfCurve, Path=Tag, Mode=OneWay, Converter={StaticResource InverseBooleanToVisibilityCollapsedConverter}}">
+                                    <Rectangle Width="12" Height="12" Margin="0,0,6,0" VerticalAlignment="Center" Fill="{StaticResource PrimaryBrush}" />
+                                    <TextBlock VerticalAlignment="Center" FontSize="11" Foreground="{StaticResource PrimaryBrush}" Text="Center" />
+                                </StackPanel>
+                                <StackPanel Margin="0,1" Orientation="Horizontal" Visibility="{Binding ElementName=ShowSingleAfCurve, Path=Tag, Mode=OneWay, Converter={StaticResource InverseBooleanToVisibilityCollapsedConverter}}">
+                                    <Rectangle Width="12" Height="12" Margin="0,0,6,0" VerticalAlignment="Center" Fill="{StaticResource TopLeftBrush}" />
+                                    <TextBlock VerticalAlignment="Center" FontSize="11" Foreground="{StaticResource PrimaryBrush}" Text="Top Left" />
+                                </StackPanel>
+                                <StackPanel Margin="0,1" Orientation="Horizontal" Visibility="{Binding ElementName=ShowSingleAfCurve, Path=Tag, Mode=OneWay, Converter={StaticResource InverseBooleanToVisibilityCollapsedConverter}}">
+                                    <Rectangle Width="12" Height="12" Margin="0,0,6,0" VerticalAlignment="Center" Fill="{StaticResource TopRightBrush}" />
+                                    <TextBlock VerticalAlignment="Center" FontSize="11" Foreground="{StaticResource PrimaryBrush}" Text="Top Right" />
+                                </StackPanel>
+                                <StackPanel Margin="0,1" Orientation="Horizontal" Visibility="{Binding ElementName=ShowSingleAfCurve, Path=Tag, Mode=OneWay, Converter={StaticResource InverseBooleanToVisibilityCollapsedConverter}}">
+                                    <Rectangle Width="12" Height="12" Margin="0,0,6,0" VerticalAlignment="Center" Fill="{StaticResource BottomLeftBrush}" />
+                                    <TextBlock VerticalAlignment="Center" FontSize="11" Foreground="{StaticResource PrimaryBrush}" Text="Bottom Left" />
+                                </StackPanel>
+                                <StackPanel Margin="0,1" Orientation="Horizontal" Visibility="{Binding ElementName=ShowSingleAfCurve, Path=Tag, Mode=OneWay, Converter={StaticResource InverseBooleanToVisibilityCollapsedConverter}}">
+                                    <Rectangle Width="12" Height="12" Margin="0,0,6,0" VerticalAlignment="Center" Fill="{StaticResource BottomRightBrush}" />
+                                    <TextBlock VerticalAlignment="Center" FontSize="11" Foreground="{StaticResource PrimaryBrush}" Text="Bottom Right" />
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
                         <StackPanel
                             Grid.Row="2"
                             HorizontalAlignment="Center"
@@ -2843,7 +2900,7 @@
                                 Margin="5"
                                 FontStyle="Italic">
                                 <TextBlock.Style>
-                                    <Style TargetType="TextBlock">
+                                    <Style BasedOn="{StaticResource StandardTextBlock}" TargetType="TextBlock">
                                         <Setter Property="Visibility" Value="Collapsed" />
                                         <Style.Triggers>
                                             <DataTrigger Binding="{Binding TiltGuidance.HasTiltGuidance}" Value="False">
@@ -2964,6 +3021,25 @@
                                     Visibility="{Binding TiltGuidance.HasFourScrewBackfocus, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
                             </Grid>
 
+                            <!--  Turns/Degrees/Minutes display selector — screw adapters only (steppers always show whole steps)  -->
+                            <StackPanel
+                                Margin="5,8,5,0"
+                                Orientation="Horizontal"
+                                Visibility="{Binding TiltGuidance.ShowAngleUnitSelector, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}">
+                                <TextBlock Margin="0,0,6,0" VerticalAlignment="Center" Text="Display:" />
+                                <ComboBox
+                                    MinWidth="90"
+                                    VerticalAlignment="Center"
+                                    ItemsSource="{Binding Source={util:EnumBindingSource {x:Type hfenum:TiltGuidanceAngleUnit}}}"
+                                    SelectedItem="{Binding TiltGuidanceAngleUnit, Mode=TwoWay}">
+                                    <ComboBox.ItemTemplate>
+                                        <DataTemplate>
+                                            <TextBlock Text="{Binding Converter={StaticResource HF_EnumStaticDescriptionValueConverter}}" />
+                                        </DataTemplate>
+                                    </ComboBox.ItemTemplate>
+                                </ComboBox>
+                            </StackPanel>
+
                             <!--  Precise numeric adjustments, each with its rotation glyph / step sign — shown when adapter hardware is configured  -->
                             <Grid
                                 Margin="5,8,5,0"
@@ -3019,6 +3095,78 @@
                                 Visibility="{Binding TiltGuidance.HasPitchMismatch, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}">
                                 <TextBlock Text="{Binding TiltGuidance.PitchMismatchWarning}" TextWrapping="Wrap" />
                             </Border>
+
+                            <!--  Automatic Adjustment (T14): computes a move plan from this measurement and executes it on the
+                                  connected tilt-adapter device. Only shown while a device is connected; the CRITICAL device-linked
+                                  calibration gate is surfaced as a remediation hint rather than the button when it fails.  -->
+                            <StackPanel
+                                Margin="5,8,5,0"
+                                Visibility="{Binding IsTiltDeviceConnected, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}">
+                                <!--  Current per-motor stepper positions for the connected motorized adapter. 2×2
+                                      layout matches the physical corners; device motor numbering TR=1, TL=2, BR=3,
+                                      BL=4; wizard screw numbers per the device-connected calibration convention.  -->
+                                <TextBlock Margin="0,0,0,2" FontWeight="Bold" Text="Motor positions (steps)" />
+                                <Grid Margin="0,0,0,8" HorizontalAlignment="Left" MinWidth="260">
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                    </Grid.RowDefinitions>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="*" />
+                                    </Grid.ColumnDefinitions>
+                                    <!--  TL = device motor 2, wizard screw 2  -->
+                                    <Border Grid.Row="0" Grid.Column="0" Margin="0,0,2,2" Padding="6,3"
+                                        BorderBrush="{StaticResource BorderBrush}" BorderThickness="1" CornerRadius="3">
+                                        <StackPanel>
+                                            <TextBlock FontWeight="Bold" Text="TL · Motor 2" />
+                                            <TextBlock FontSize="10" Opacity="0.7" Text="Wizard screw 2" />
+                                            <TextBlock Margin="0,2,0,0" Text="{Binding ScrewPositionTopLeftDisplay}" />
+                                        </StackPanel>
+                                    </Border>
+                                    <!--  TR = device motor 1, wizard screw 1  -->
+                                    <Border Grid.Row="0" Grid.Column="1" Margin="2,0,0,2" Padding="6,3"
+                                        BorderBrush="{StaticResource BorderBrush}" BorderThickness="1" CornerRadius="3">
+                                        <StackPanel>
+                                            <TextBlock FontWeight="Bold" Text="TR · Motor 1" />
+                                            <TextBlock FontSize="10" Opacity="0.7" Text="Wizard screw 1" />
+                                            <TextBlock Margin="0,2,0,0" Text="{Binding ScrewPositionTopRightDisplay}" />
+                                        </StackPanel>
+                                    </Border>
+                                    <!--  BL = device motor 4, wizard screw 3  -->
+                                    <Border Grid.Row="1" Grid.Column="0" Margin="0,2,2,0" Padding="6,3"
+                                        BorderBrush="{StaticResource BorderBrush}" BorderThickness="1" CornerRadius="3">
+                                        <StackPanel>
+                                            <TextBlock FontWeight="Bold" Text="BL · Motor 4" />
+                                            <TextBlock FontSize="10" Opacity="0.7" Text="Wizard screw 3" />
+                                            <TextBlock Margin="0,2,0,0" Text="{Binding ScrewPositionBottomLeftDisplay}" />
+                                        </StackPanel>
+                                    </Border>
+                                    <!--  BR = device motor 3, wizard screw 4  -->
+                                    <Border Grid.Row="1" Grid.Column="1" Margin="2,2,0,0" Padding="6,3"
+                                        BorderBrush="{StaticResource BorderBrush}" BorderThickness="1" CornerRadius="3">
+                                        <StackPanel>
+                                            <TextBlock FontWeight="Bold" Text="BR · Motor 3" />
+                                            <TextBlock FontSize="10" Opacity="0.7" Text="Wizard screw 4" />
+                                            <TextBlock Margin="0,2,0,0" Text="{Binding ScrewPositionBottomRightDisplay}" />
+                                        </StackPanel>
+                                    </Border>
+                                </Grid>
+                                <Button
+                                    Height="25"
+                                    HorizontalAlignment="Left"
+                                    Command="{Binding AutomaticAdjustmentCommand}"
+                                    ToolTip="Computes a move plan from this measurement's fitted sensor model, shows an approval dialog listing the exact device commands, and executes it on the connected tilt-adapter device. Disabled until a fresh measurement is available to adjust from, or if the current calibration is not linked to the connected device.">
+                                    <TextBlock Margin="5,0,5,0" Text="Automatic Adjustment" />
+                                </Button>
+                                <TextBlock
+                                    Margin="0,4,0,0"
+                                    FontStyle="Italic"
+                                    TextWrapping="Wrap"
+                                    Foreground="{StaticResource NotificationWarningBrush}"
+                                    Text="{Binding AutomaticAdjustmentRemediationText}"
+                                    Visibility="{Binding AutomaticAdjustmentRemediationVisible, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
+                            </StackPanel>
                         </StackPanel>
                     </StackPanel>
                 </Expander>

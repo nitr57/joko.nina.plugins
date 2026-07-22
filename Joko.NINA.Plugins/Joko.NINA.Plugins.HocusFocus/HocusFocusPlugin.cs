@@ -11,10 +11,16 @@
 #endregion "copyright"
 
 using NINA.Joko.Plugins.HocusFocus.AutoFocus;
+using NINA.Joko.Plugins.HocusFocus.CameraSimulator;
+using NINA.Joko.Plugins.HocusFocus.CameraSimulator.TiltAdapter;
 using NINA.Joko.Plugins.HocusFocus.Properties;
 using NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard;
+using NINA.Joko.Plugins.HocusFocus.TiltAdapterDevices;
+using NINA.Joko.Plugins.HocusFocus.TiltAdapterDevices.AsgEat;
 using NINA.Joko.Plugins.HocusFocus.StarDetection;
 using NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization;
+using NINA.Joko.Plugins.HocusFocus.StarDetection.PerFilter;
+using NINA.Joko.Plugins.HocusFocus.AutoFocus.Replay;
 using NINA.Core.Utility;
 using NINA.Core.Utility.WindowService;
 using NINA.Plugin;
@@ -50,6 +56,7 @@ namespace NINA.Joko.Plugins.HocusFocus {
         // reuse for building its RunEvaluationLoader + detector.
         private readonly IProfileService profileService;
         private readonly ICameraMediator cameraMediator;
+        private readonly IFilterWheelMediator filterWheelMediator;
         private readonly IFocuserMediator focuserMediator;
         private readonly IImagingMediator imagingMediator;
         private readonly IImageDataFactory imageDataFactory;
@@ -84,6 +91,7 @@ namespace NINA.Joko.Plugins.HocusFocus {
             IPluggableBehaviorSelector<IStarAnnotator> starAnnotatorSelector) {
             this.profileService = profileService;
             this.cameraMediator = cameraMediator;
+            this.filterWheelMediator = filterWheelMediator;
             this.focuserMediator = focuserMediator;
             this.imagingMediator = imagingMediator;
             this.imageDataFactory = imageDataFactory;
@@ -109,6 +117,63 @@ namespace NINA.Joko.Plugins.HocusFocus {
             if (TiltAdapterOptions == null) {
                 TiltAdapterOptions = new TiltAdapterOptions(profileService);
             }
+            if (CameraSimulatorOptions == null) {
+                // Takes InspectorOptions: the simulator's FocuserStepSizeMicrons is a pass-through onto the
+                // Inspector's MicronsPerFocuserStep, not a copy. Constructed above, which this relies on — both for
+                // the non-null argument here and for ProfileChanged ordering (see MigrateLegacyFocuserStepSize).
+                CameraSimulatorOptions = new CameraSimulatorOptions(profileService, InspectorOptions);
+            }
+            var thisAssembly = Assembly.GetAssembly(typeof(HocusFocusPlugin));
+            var thisAssemblyFileInfo = new FileInfo(thisAssembly.Location);
+            if (ApplicationDispatcher == null) {
+                // Constructed here rather than further down: PerFilterStarDetectionEditBinder below takes it, to
+                // marshal store-driven snapshot reloads (which a detection thread can trigger) onto the UI thread.
+                ApplicationDispatcher = new ApplicationDispatcher();
+
+                var archFolder = Environment.Is64BitProcess ? "x64" : "x86";
+                var dllPath = Path.Combine(thisAssemblyFileInfo.Directory.FullName, "dll", archFolder);
+                OpenCvSharp.Internal.WindowsLibraryLoader.Instance.AdditionalPaths.Add(dllPath);
+            }
+            if (PerFilterStarDetection == null) {
+                // Constructed after the options singletons: ProfileChanged handlers run in subscription order,
+                // so the store (and the binder below) re-read a new profile only after StarDetectionOptions has
+                // re-read the legacy keys.
+                PerFilterStarDetection = new PerFilterStarDetectionStore(
+                    profileService,
+                    () => StarDetectionSettingsSnapshot.FromOptions(StarDetectionOptions));
+            }
+            if (PerFilterStarDetectionEditBinder == null) {
+                PerFilterStarDetectionEditBinder = new PerFilterEditBinder(
+                    PerFilterStarDetection,
+                    StarDetectionOptions,
+                    profileService,
+                    () => filterWheelMediator.GetInfo()?.SelectedFilter?.Name,
+                    ApplicationDispatcher,
+                    // Connectivity is passed separately from the filter name: the name alone cannot tell a
+                    // disconnected wheel from a connected one mid-move, and the options-page warning needs to say
+                    // different things about those two states.
+                    () => filterWheelMediator.GetInfo()?.Connected == true);
+                // The warning is computed, so it only reaches the UI when something raises PropertyChanged for it.
+                // Held in a static so the registration lives as long as the binder it drives.
+                ActiveFilterWheelWatcher = new ActiveFilterWheelWatcher(
+                    filterWheelMediator, () => PerFilterStarDetectionEditBinder.RefreshActiveFilter());
+            }
+            // Must follow CameraSimulatorOptions: the VM reads it and subscribes to its PropertyChanged.
+            SimTiltAdapterVM = new SimulatedTiltAdapterVM(CameraSimulatorOptions);
+            if (TiltDeviceConnectionService == null) {
+                // The "Simulator" port connects the EAT automation to the camera simulator instead of real
+                // hardware, so the whole calibration/adjustment loop can run with nothing plugged in. A single
+                // shared actuator (created lazily on first Connect) keeps the per-motor counters and injected
+                // aberration coherent across reconnects; the closure runs only at Connect time, by which point
+                // the CameraSimulatorOptions and ApplicationDispatcher statics are both set.
+                SimulatedTiltActuator sharedSimActuator = null;
+                TiltDeviceConnectionService = new TiltDeviceConnectionService(
+                    profileService, TiltAdapterOptions,
+                    simulatedControllerFactory: () => {
+                        sharedSimActuator ??= new SimulatedTiltActuator(CameraSimulatorOptions, ApplicationDispatcher);
+                        return new EatTiltMotionController(new SimulatedEatTransport(sharedSimActuator), TiltAdapterOptions);
+                    });
+            }
             if (AlglibAPI == null) {
                 AlglibAPI = new AlglibAPI();
             }
@@ -128,28 +193,26 @@ namespace NINA.Joko.Plugins.HocusFocus {
                     AlglibAPI);
             }
 
-            var thisAssembly = Assembly.GetAssembly(typeof(HocusFocusPlugin));
-            var thisAssemblyFileInfo = new FileInfo(thisAssembly.Location);
-            if (ApplicationDispatcher == null) {
-                ApplicationDispatcher = new ApplicationDispatcher();
-
-                var archFolder = Environment.Is64BitProcess ? "x64" : "x86";
-                var dllPath = Path.Combine(thisAssemblyFileInfo.Directory.FullName, "dll", archFolder);
-                OpenCvSharp.Internal.WindowsLibraryLoader.Instance.AdditionalPaths.Add(dllPath);
-            }
-
             options.AddImagePattern(fwhmImagePattern);
             options.AddImagePattern(eccentricityImagePattern);
             imageSaveMediator.BeforeFinalizeImageSaved += ImageSaveMediator_BeforeFinalizeImageSaved;
             ResetStarDetectionDefaultsCommand = new RelayCommand(StarDetectionOptions.ResetDefaults);
             ResetStarAnnotatorDefaultsCommand = new RelayCommand(StarAnnotatorOptions.ResetDefaults);
             ResetAutoFocusDefaultsCommand = new RelayCommand(AutoFocusOptions.ResetDefaults);
-//          ChooseIntermediatePathDiagCommand = new RelayCommand(ChooseIntermediatePathDiag);
+            ResetCameraSimulatorDefaultsCommand = new RelayCommand(CameraSimulatorOptions.ResetDefaults);
+//            ChooseIntermediatePathDiagCommand = new RelayCommand(ChooseIntermediatePathDiag);
 //            ChooseSavePathDiagCommand = new RelayCommand(ChooseSavePathDiag);
+            ChooseAstapPathDiagCommand = new RelayCommand(ChooseAstapPathDiag);
             OptimizeStarDetectionCommand = new RelayCommand(OptimizeStarDetection);
             LaunchStarDetectionOptimizer = OptimizeStarDetection;
             ExportStarDetectionSettingsCommand = new RelayCommand(() => StarDetectionSettingsIO.Export(StarDetectionOptions));
             ImportStarDetectionSettingsCommand = new AsyncRelayCommand(() => StarDetectionSettingsIO.ImportAsync(StarDetectionOptions, windowServiceFactory));
+            // No canExecute predicate: CommunityToolkit commands do not requery on CommandManager.RequerySuggested,
+            // and ButtonBase does not requery when CommandParameter changes, so a predicate here would latch the
+            // button disabled forever. The button's enablement is driven reactively by PerFilterEditBinder
+            // .CanCopyFromFilter via an IsEnabled binding instead.
+            CopyStarDetectionFromFilterCommand = new CommunityToolkit.Mvvm.Input.AsyncRelayCommand<string>(CopyStarDetectionFromFilter);
+            LaunchCopyStarDetectionFromFilter = CopyStarDetectionFromFilter;
         }
 
         /// <summary>
@@ -169,13 +232,15 @@ namespace NINA.Joko.Plugins.HocusFocus {
                     profileService,
                     focuserMediator,
                     StarDetectionOptions,
-                    AlglibAPI);
+                    AlglibAPI,
+                    PerFilterStarDetection);
 
             var vm = new StarDetectionOptimizerWizardVM(
                 profileService,
                 imageDataFactory,
                 imagingMediator,
                 cameraMediator,
+                filterWheelMediator,
                 focuserMediator,
                 autoFocusEngine,
                 detection);
@@ -203,6 +268,20 @@ namespace NINA.Joko.Plugins.HocusFocus {
             // is resolved by the implicit DataType DataTemplate for StarDetectionOptimizerWizardVM).
             windowService.ShowDialog(vm, "Optimize Star Detection", ResizeMode.CanResize, WindowStyle.SingleBorderWindow);
         }
+
+        private async Task CopyStarDetectionFromFilter(string sourceFilterName) {
+            try {
+                await StarDetectionSettingsIO.CopyFromFilterAsync(sourceFilterName, PerFilterStarDetection, StarDetectionOptions, windowServiceFactory);
+            } finally {
+                // Reset the "Copy Settings From" dropdown to no selection once the flow finishes (applied or not), so
+                // the Copy button disables again and the next copy is a deliberate re-selection. Shared binder, so
+                // this clears the dropdown on whichever host raised the command.
+                if (PerFilterStarDetectionEditBinder != null) {
+                    PerFilterStarDetectionEditBinder.CopySourceFilterName = null;
+                }
+            }
+        }
+
 /*
         private void ChooseIntermediatePathDiag() {
             using (var dialog = new System.Windows.Forms.FolderBrowserDialog()) {
@@ -224,6 +303,17 @@ namespace NINA.Joko.Plugins.HocusFocus {
             }
         }
 */
+
+        private void ChooseAstapPathDiag() {
+            using (var dialog = new System.Windows.Forms.FolderBrowserDialog()) {
+                dialog.SelectedPath = CameraSimulatorOptions.AstapCatalogPath;
+
+                if (dialog.ShowDialog() == System.Windows.Forms.DialogResult.OK) {
+                    CameraSimulatorOptions.AstapCatalogPath = dialog.SelectedPath;
+                }
+            }
+        }
+
         private Task ImageSaveMediator_BeforeFinalizeImageSaved(object sender, BeforeFinalizeImageSavedEventArgs e) {
             var hfAnalysis = (e.Image?.RawImageData?.StarDetectionAnalysis as HocusFocusStarDetectionAnalysis);
             if (hfAnalysis != null) {
@@ -251,6 +341,35 @@ namespace NINA.Joko.Plugins.HocusFocus {
 
         public static TiltAdapterOptions TiltAdapterOptions { get; private set; }
 
+        public static CameraSimulatorOptions CameraSimulatorOptions { get; private set; }
+
+        public static PerFilterStarDetectionStore PerFilterStarDetection { get; private set; }
+
+        public static PerFilterEditBinder PerFilterStarDetectionEditBinder { get; private set; }
+
+        /// <summary>
+        /// Keeps <see cref="PerFilterEditBinder.ActiveFilterWarning"/> live: the binder cannot observe the filter
+        /// wheel itself (it takes plain delegates, not mediators, so it stays testable without equipment), so this
+        /// consumer re-raises the warning whenever the wheel connects, disconnects, or changes filter.
+        /// </summary>
+        public static ActiveFilterWheelWatcher ActiveFilterWheelWatcher { get; private set; }
+
+        /// <summary>
+        /// Backs the simulated tilt adapter's configuration on the Camera Simulator options page, whose DataContext
+        /// is this plugin. An instance property, unlike the options singletons above: those predate this and are
+        /// static so non-VM code can reach them, whereas nothing but the options page needs this one.
+        /// </summary>
+        /// <remarks>
+        /// The Imaging dockable builds its own <see cref="SimulatedTiltAdapterVM"/> over the same
+        /// <see cref="CameraSimulatorOptions"/> singleton, and each VM subscribes to that singleton's
+        /// PropertyChanged, so the two views stay in lockstep without talking to each other. A second instance is
+        /// therefore the established design here, not duplicated state — the injected plane and the adapter
+        /// geometry live in the options, never in the VM.
+        /// </remarks>
+        public SimulatedTiltAdapterVM SimTiltAdapterVM { get; private set; }
+
+        public static TiltDeviceConnectionService TiltDeviceConnectionService { get; private set; }
+
         public static AutoFocusEngineFactory AutoFocusEngineFactory { get; private set; }
 
         public static ApplicationDispatcher ApplicationDispatcher { get; private set; }
@@ -268,20 +387,41 @@ namespace NINA.Joko.Plugins.HocusFocus {
         /// </summary>
         public static Action LaunchStarDetectionOptimizer { get; private set; }
 
+        /// <summary>
+        /// Shared launcher for the per-filter "Copy Settings From" flow, mirroring
+        /// <see cref="LaunchStarDetectionOptimizer"/>: set by the plugin constructor so the Imaging-pane
+        /// StarDetectionOptionsVM can run the same copy dialog without re-wiring its dependencies. May be null
+        /// when no plugin instance has been constructed (e.g. unit tests).
+        /// </summary>
+        public static Func<string, Task> LaunchCopyStarDetectionFromFilter { get; private set; }
+
+        // Instance wrappers over the per-filter statics: the shared HocusFocus_StarDetection_Options template
+        // binds DataContext-relative paths (PerFilterStore.* / PerFilterEditBinder.*), and a WPF Binding Path
+        // cannot resolve static properties, so both hosts expose the same instance property names.
+        public IPerFilterStarDetectionStore PerFilterStore => PerFilterStarDetection;
+
+        public PerFilterEditBinder PerFilterEditBinder => PerFilterStarDetectionEditBinder;
+
         public ICommand ResetStarDetectionDefaultsCommand { get; private set; }
 
         public ICommand ResetStarAnnotatorDefaultsCommand { get; private set; }
 
         public ICommand ResetAutoFocusDefaultsCommand { get; private set; }
 
+        public ICommand ResetCameraSimulatorDefaultsCommand { get; private set; }
+
         public ICommand ChooseIntermediatePathDiagCommand { get; private set; }
 
         public ICommand ChooseSavePathDiagCommand { get; private set; }
+
+        public ICommand ChooseAstapPathDiagCommand { get; private set; }
 
         public ICommand OptimizeStarDetectionCommand { get; private set; }
 
         public ICommand ExportStarDetectionSettingsCommand { get; private set; }
 
         public ICommand ImportStarDetectionSettingsCommand { get; private set; }
+
+        public ICommand CopyStarDetectionFromFilterCommand { get; private set; }
     }
 }

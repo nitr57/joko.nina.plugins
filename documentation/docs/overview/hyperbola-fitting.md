@@ -1,4 +1,4 @@
-# Hyperbolic Focus-Curve Fitting
+# Hyperbolic Curve Fitting
 
 A focus sweep produces a set of `(focuser position, HFR)` points that trace a V: HFR is large when the
 star is defocused and drops to a minimum at best focus. Hocus Focus fits a hyperbola to that V, reads
@@ -54,7 +54,7 @@ of focus.
 ## Why real curves are often asymmetric
 
 Inside and outside focus a star defocuses differently, from spherical aberration, the optical train,
-and the atmosphere, and at the defocused extremes stars get dimmer and scarcer so HFR is noisier on
+and the atmosphere. At the defocused extremes stars also get dimmer and scarcer, so HFR is noisier on
 one side. The result is one wing steeper than the other. Forcing a symmetric curve onto an asymmetric
 V pulls the fitted minimum toward the shallower side, biasing the best-focus estimate.
 

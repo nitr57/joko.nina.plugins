@@ -13,9 +13,9 @@ A naive "threshold and count blobs" detector is fooled by the things real astrop
 and galaxy gradients, hot pixels, sensor noise, saturated cores, diffraction spikes, close double stars, and
 heavily defocused donuts. Hocus Focus addresses these head-on:
 
-- **Large-scale structure is removed before detection** with an à-trous B3-spline wavelet (a multi-scale
-  smoothing that separates star-sized structure from large-scale background) residual, so nebulosity and
-  sky gradients do not drown faint stars or create spurious blobs.
+- **Large-scale structure is removed before detection** by subtracting an à-trous B3-spline wavelet
+  residual, the coarse large-scale content that a multi-scale smoothing separates from star-sized
+  structure, so nebulosity and sky gradients do not drown faint stars or create spurious blobs.
 - **The background is modeled as a tilted plane per star**, not a single number, so a one-sided gradient
   under a star no longer biases its centroid, flux, or HFR.
 - **Contamination is detected even under a background gradient**, so a neighboring star bleeding into one side of the
@@ -58,7 +58,7 @@ An optional Gaussian blur (radius configurable) suppresses pixel-to-pixel noise 
 the floor and the structure step is cleaner. It can be applied to the image actually measured, to the
 structure-detection copy only, or to neither. Blurring trades a little positional precision for sensitivity,
 so it helps most on noisy, short, or high-gain subs and can hurt on already-clean, well-sampled frames. See
-[Pre-processing](../settings/preprocessing.md).
+[Preprocessing](../settings/preprocessing.md).
 
 ### 4. Wavelet structure detection (remove large-scale structures)
 
@@ -90,15 +90,16 @@ T = \text{median} + k_\sigma \cdot \sigma_{\text{noise}}
 Raising \( k_\sigma \) demands a stronger signal to count as a star (fewer, more reliable detections);
 lowering it admits fainter structure (more stars, more risk of noise). By default this threshold is computed
 *per region* rather than once for the whole frame (locally adaptive binarization), so the same multiplier stays
-fair across a vignetted or gradient-heavy frame. See [Pre-processing](../settings/preprocessing.md), and
-[Adaptive Binarization](../settings/adaptive-binarization.md) for why the default multiplier is 2.
+fair across a vignetted or gradient-heavy frame. See [Preprocessing](../settings/preprocessing.md), and
+[Adaptive Binarization](../settings/adaptive-binarization.md) for how the local surface keeps a single
+multiplier fair everywhere.
 
 ### 6. Optional dilation
 
 A morphological dilation (ellipse element, configurable size and iteration count) can grow the binarized
 foreground slightly. This boosts small structures and bridges narrow gaps so a single star is not split into
-fragments. By default it can be left off; it is most useful when stars are barely resolved. See
-[Structure Detection](../settings/structure-detection.md).
+fragments. Dilation is off by default (**Structure Dilation Iterations** is 0) and is most useful when stars
+are barely resolved. See [Structure Detection](../settings/structure-detection.md).
 
 ### 7. Connected-component candidate boxes
 
@@ -129,7 +130,7 @@ For each candidate the detector measures, in order:
 does not require fitting a model.*
 
 The pixel sampling step controls the HFR grid: a finer step samples undersampled stars more faithfully at
-some cost in speed. See [Pre-processing](../settings/preprocessing.md) and
+some cost in speed. See [Preprocessing](../settings/preprocessing.md) and
 [PSF Modeling](../settings/psf-modeling.md) for the optional model fit (step 10).
 
 ### 9. Acceptance gates
@@ -201,8 +202,8 @@ the median and MAD, then discards stars outside
 \]
 
 before averaging the rest. PSF-derived sigma, FWHM, and eccentricity are likewise aggregated by median and
-MAD across the stars that fitted successfully. The result is one clean HFR (and shape) value per frame: the
-signal autofocus and the inspector consume.
+MAD across the stars that fitted successfully. The result is one clean HFR (and shape) value per frame,
+the signal that autofocus and the inspector consume.
 
 ![Star field with accepted stars in green and rejected in pink, with HFR labels](../assets/figures/annotation-overlay.png){ width=620 }
 

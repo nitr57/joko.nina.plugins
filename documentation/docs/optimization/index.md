@@ -7,14 +7,14 @@ them well for a given optical train, camera, and sky is expert work, and the pay
 therefore a more repeatable best-focus position. Left to guesswork, the defaults are rarely the best
 choice for your rig.
 
-The **Star Detection Optimization Wizard** automates that tuning. It replays one of your saved
-autofocus runs and searches for the detection settings that make the resulting stars trace the
-cleanest, most repeatable focus V-curve. Because the wizard scores settings by the *quality of the
-focus curve they produce* (not by any single hand-picked metric), it optimizes the whole detection
-pipeline end-to-end against the outcome you actually care about.
+The **Star Detection Optimization Wizard** automates that tuning. It searches for the detection
+settings that make your stars trace the cleanest, most repeatable focus V-curve, working from a set of
+autofocus frames: either a run you saved earlier or one it captures live. Because the wizard scores
+settings by the *quality of the focus curve they produce* (not by any single hand-picked metric), it
+optimizes the whole detection pipeline against focus repeatability rather than a proxy for it.
 
-The wizard launches from the top of the Star Detection options page. Its optimized settings are
-stored **separately** from your presets and are activated by a single Simple-Mode toggle ("Use
+The wizard launches from the top of the **Star Detector** tab. Its optimized settings are
+stored **separately** from your presets and are activated by a single Simple-mode toggle ("Use
 Optimized Settings") that only appears once a run has succeeded. Nothing is overwritten until you
 confirm, and the toggle is fully reversible.
 
@@ -26,7 +26,7 @@ reproducible and the optimizer can be exercised without launching NINA.
 
 ![The optimization wizard start page with the saved-run source picker, mode, and objective toggles](../assets/screenshots/optimizer-wizard-start.png){ width=620 }
 
-*The wizard's start page: choose a saved auto-focus run and the optimization objectives.*
+*The wizard's start page: choose a saved autofocus run and the optimization objectives.*
 
 The high-level loop has three steps:
 
@@ -47,7 +47,7 @@ The high-level loop has three steps:
 
 ![The optimization wizard summary with the focus curve, focus precision, stars per frame, and recommended step size](../assets/screenshots/optimizer-wizard-summary.png){ width=620 }
 
-*The summary shows the resulting focus curve, focus precision, and a recommended auto-focus step size.*
+*The summary shows the resulting focus curve, focus precision, and a recommended autofocus step size.*
 
 Optionally, you can label a handful of hard frames (missed stars, false positives) to add a
 **recall/precision** term to the score (recall = the fraction of real stars recovered; precision = the
@@ -69,6 +69,64 @@ fraction of accepted detections that are real). This term is decisive for dim or
 *The search begins at the seed (the default settings, or your current settings if you choose) and walks
 the parameter space one coordinate move at a time, accepting only moves that improve the score and
 refining its step size as it homes in on a maximum.*
+
+## Saved and live sources
+
+The **Source** dropdown on the start page sets where the wizard gets its frames.
+
+**Saved Auto-Focus** replays a run you saved earlier. (Autofocus saves its frames when **Save** is
+enabled in the Hocus Focus auto-focus options.) Point the wizard at the run's folder and it re-detects
+those frames with every candidate setting. Use it when you already have a run that focused well and want
+to improve your detection settings.
+
+**Live Auto-Focus** captures a fresh set of frames now and optimizes those. Use it when your current
+settings cannot build a focus curve yet, so you have no usable saved run to replay. That is common with
+faint narrowband stars, heavily defocused donuts, or a new filter. A normal autofocus would fail here
+for the same reason detection is failing, so the wizard instead sweeps the focuser across a fixed range
+and saves every frame, whether or not it finds stars. It then searches those frames for settings that do
+build a clean curve.
+
+A live run goes like this:
+
+1. **Reach rough focus manually.** A Bahtinov mask or a careful manual pass is fine. The sweep centers
+   on the current focuser position, so it has to start near focus.
+2. Choose **Live Auto-Focus**, set the **Exposure**, and choose the folder to **Save captured frames
+   to**. The camera and focuser must be connected, and **Start** stays disabled until you pick a save
+   folder. The panel also shows the step size, number of points, binning, filter, and gain the sweep
+   will use; these come from your profile's auto-focus settings.
+3. Press **Start** and confirm the telescope is roughly focused when prompted. The wizard moves the
+   focuser out and steps back across the range set by your profile's auto-focus step size and offset
+   steps, saves a frame at each point, then returns the focuser to where it started. The sweep does not
+   try to converge, so it captures a full set of frames even when the current settings detect nothing.
+4. From there the run behaves like a replay: the frames are optimized and the summary appears.
+
+!!! tip "Make the exposure long enough for the wings of the sweep"
+    The optimizer needs stars all the way out to the defocused ends of the sweep, so pick an exposure
+    long enough to keep them visible there. Narrowband filters often need a longer exposure to start.
+    Once a live run succeeds, shorten the exposure and run it again to find how far you can push it (see
+    the [Quick Start](../quick-start.md) narrowband section).
+
+On the summary, a live run adds an **Exposure** row beside the recommended step size, and the **Apply
+these auto-focus settings to my profile when I click Accept** checkbox covers it: turn it on to adopt
+the sweep exposure as your auto-focus exposure time, so you focus with the exposure you optimized
+against.
+
+## Optimizing one filter
+
+With [per-filter star detection](../settings/index.md#per-filter-star-detection) enabled, the start
+page adds a **Target filter** dropdown for both sources, defaulting to the filter currently in the
+wheel. The whole run is about that one filter: the baseline and the **"Start from my current
+settings"** seed come from its settings set, the filter and gain readouts on the start page show the
+target filter (not the profile's designated autofocus filter), and **Accept** writes the winning
+settings into the target filter's set. The Star Detector options switch to the filter you just
+optimized, so what you see there afterward is what the run produced.
+
+A target filter must be selected before the run can start. A live run additionally requires the
+filter wheel connected: **Start** moves the wheel to the target filter and sweeps on exactly that
+filter, using its per-filter autofocus binning, gain, and offset. Exposure is still whatever you set
+on this page. The usual switch to the profile's designated autofocus filter is skipped, and the
+wheel stays on the target when the sweep finishes. A replay needs no equipment, so you can work
+through your saved runs and optimize each filter in turn without connecting anything.
 
 ## How a candidate is scored
 
@@ -114,7 +172,7 @@ This section documents every moving part of the optimizer:
 !!! tip "When the wizard helps most"
 
     Run it when you have switched cameras, scopes, or filters; when autofocus has felt unreliable; or
-    when you have never tuned star detection beyond the Simple-Mode presets. The wizard optimizes
+    when you have never tuned star detection beyond the Simple-mode presets. The wizard optimizes
     against one saved run at a time, which keeps its recommendation interpretable, so the more
     representative that run is of how you actually autofocus (same camera, scope, filter, and
     exposure), the better the result. If you have several saved runs, pick the cleanest, most typical

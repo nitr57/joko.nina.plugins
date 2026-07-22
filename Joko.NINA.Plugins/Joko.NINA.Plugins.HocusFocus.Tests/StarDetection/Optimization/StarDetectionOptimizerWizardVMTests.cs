@@ -10,6 +10,9 @@
 
 #endregion "copyright"
 
+using NINA.Core.Model;
+using NINA.Core.Model.Equipment;
+using NINA.Joko.Plugins.HocusFocus.AutoFocus;
 using NINA.Joko.Plugins.HocusFocus.Interfaces;
 using NINA.Joko.Plugins.HocusFocus.StarDetection;
 using NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization;
@@ -20,6 +23,7 @@ using NINA.WPF.Base.ViewModel.AutoFocus;
 using NSubstitute;
 using NSubstitute.Core;
 using NUnit.Framework;
+using OxyPlot.Series;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -117,6 +121,29 @@ public class StarDetectionOptimizerWizardVMTests {
         return new LoadedRun { Data = data, Seed = seed, AfOptions = afOptions };
     }
 
+    // A run where detection finds stars ONLY at low Sensitivity: the optimizer SEED (2) yields a clean hyperbola,
+    // but the displayed BASELINE / current settings (8) are effectively blind (no stars, so no curve). This isolates
+    // which params the seed guard evaluates — the Live sweep must gate on the seed, not the failing current settings.
+    private static LoadedRun SeedGoodBaselineBlindRun(string id = "splitguard") {
+        Func<object, StarDetectorParams, CancellationToken, Task<FrameDetectionResult>> detect = (image, p, token) => {
+            var pos = (int)image;
+            var blind = p.Sensitivity >= 5.0;
+            return Task.FromResult(new FrameDetectionResult {
+                AverageHFR = blind ? 0.0 : Hfr(pos),
+                HFRStdDev = 0.05,
+                StarCount = blind ? 0 : 15,
+                StarCenters = Array.Empty<(double X, double Y)>()
+            });
+        };
+        var data = new RunEvaluationData(id, NineFrames(), detect, NewAlglib(), DefaultFitConfig());
+        return new LoadedRun {
+            Data = data,
+            Seed = new StarDetectorParams { Sensitivity = 2, StarClippingMultiplier = 2.0 },
+            Baseline = new StarDetectorParams { Sensitivity = 8, StarClippingMultiplier = 2.0 },
+            AfOptions = new AutoFocusEngineOptions { AutoFocusStepSize = DefaultStepSize, AutoFocusInitialOffsetSteps = 4 }
+        };
+    }
+
     private static IRunEvaluationLoader LoaderReturning(params LoadedRun[] runs) {
         var loader = Substitute.For<IRunEvaluationLoader>();
         var queue = new Queue<LoadedRun>(runs);
@@ -127,6 +154,9 @@ public class StarDetectionOptimizerWizardVMTests {
             .Returns(_ => Task.FromResult(queue.Count > 0 ? queue.Dequeue() : runs[runs.Length - 1]));
         // The progress-bearing overload is the one the VM actually calls (acquire + re-load); feed it the same queue.
         loader.LoadSavedRunAsync(Arg.Any<string>(), Arg.Any<StarDetectionRegion>(), Arg.Any<IReadOnlyList<FrameLabels>>(), Arg.Any<IProgress<RunLoadProgress>>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult(queue.Count > 0 ? queue.Dequeue() : runs[runs.Length - 1]));
+        // The baseline-override overload is the one the VM calls once per-filter routing lands; same queue.
+        loader.LoadSavedRunAsync(Arg.Any<string>(), Arg.Any<StarDetectionRegion>(), Arg.Any<IReadOnlyList<FrameLabels>>(), Arg.Any<IProgress<RunLoadProgress>>(), Arg.Any<IStarDetectionOptions>(), Arg.Any<CancellationToken>())
             .Returns(_ => Task.FromResult(queue.Count > 0 ? queue.Dequeue() : runs[runs.Length - 1]));
         return loader;
     }
@@ -145,6 +175,11 @@ public class StarDetectionOptimizerWizardVMTests {
         public int LabelOverloadCalls { get; private set; }
         public int NoLabelCalls { get; private set; }
 
+        // Every LoadedRun this fake manufactures, in creation order. The VM's load-and-stamp choke-point mutates the
+        // SAME RunEvaluationData instance AFTER the loader returns it, so RecoveryStepsPerSide read here (post-flow)
+        // reflects the stamp — letting a test assert reload paths preserve the recovery tag.
+        public List<LoadedRun> ProducedRuns { get; } = new List<LoadedRun>();
+
         public RecordingLoader(double optSensitivity = 10.0, int seedSensitivity = 2) {
             this.optSensitivity = optSensitivity;
             this.seedSensitivity = seedSensitivity;
@@ -156,11 +191,13 @@ public class StarDetectionOptimizerWizardVMTests {
 
         private LoadedRun Make(string folder, IReadOnlyList<FrameLabels> labels) {
             var data = new RunEvaluationData(RunIdFor(folder), NineFrames(), OptimizableDetect(optSensitivity), NewAlglib(), DefaultFitConfig(), labels);
-            return new LoadedRun {
+            var run = new LoadedRun {
                 Data = data,
                 Seed = new StarDetectorParams { Sensitivity = seedSensitivity, StarClippingMultiplier = 2.0 },
                 AfOptions = new AutoFocusEngineOptions { AutoFocusStepSize = DefaultStepSize, AutoFocusInitialOffsetSteps = 4 }
             };
+            ProducedRuns.Add(run);
+            return run;
         }
 
         public Task<LoadedRun> LoadSavedRunAsync(string attemptFolderPath, StarDetectionRegion region, CancellationToken token) =>
@@ -180,6 +217,14 @@ public class StarDetectionOptimizerWizardVMTests {
             }
             return Task.FromResult(Make(attemptFolderPath, labels));
         }
+
+        public Task<LoadedRun> LoadSavedRunAsync(string attemptFolderPath, StarDetectionRegion region, IReadOnlyList<FrameLabels> labels, IProgress<RunLoadProgress> progress, IStarDetectionOptions baselineOptionsOverride, CancellationToken token) {
+            // Record the override alongside the folder so the fake stays lossless if a test ever asserts on it.
+            BaselineOverridesByFolder[attemptFolderPath] = baselineOptionsOverride;
+            return LoadSavedRunAsync(attemptFolderPath, region, labels, progress, token);
+        }
+
+        public Dictionary<string, IStarDetectionOptions> BaselineOverridesByFolder { get; } = new Dictionary<string, IStarDetectionOptions>();
     }
 
     private static StarDetectionOptimizerWizardVM NewVM(
@@ -190,7 +235,19 @@ public class StarDetectionOptimizerWizardVMTests {
         Func<bool> isCameraConnected = null,
         Func<bool> isFocuserConnected = null,
         IAutoFocusEngine autoFocusEngine = null,
-        OptimizerSettings optimizerSettings = null) {
+        OptimizerSettings optimizerSettings = null,
+        IAutoFocusOptions autoFocusOptions = null,
+        Func<bool> confirmRoughFocus = null,
+        Func<string> currentFilterName = null,
+        Func<int?> currentGain = null,
+        Func<bool> perFilterEnabled = null,
+        Func<bool> isFilterWheelConnected = null,
+        Func<IReadOnlyList<string>> getFilterNames = null,
+        Func<string> getCurrentFilterName = null,
+        Func<string, FilterInfo> resolveFilterByName = null,
+        Func<string, IStarDetectionOptions> getFilterDetectionOptions = null,
+        Action<string, OptimizedStarDetectionSettings> applyOptimizedToFilter = null,
+        Action<string, bool> setFilterDonutDetection = null) {
         options ??= Substitute.For<IStarDetectionOptions>();
         profileService ??= Substitute.For<IProfileService>();
         return new StarDetectionOptimizerWizardVM(
@@ -203,7 +260,19 @@ public class StarDetectionOptimizerWizardVMTests {
             optimizerSettings: optimizerSettings ?? new OptimizerSettings { MaxEvaluations = 200, CoarseGridLevels = 4, StepFloorFraction = 0.125 },
             frameReviewBuilder: frameReviewBuilder,
             isCameraConnected: isCameraConnected,
-            isFocuserConnected: isFocuserConnected);
+            isFocuserConnected: isFocuserConnected,
+            autoFocusOptions: autoFocusOptions,
+            confirmRoughFocus: confirmRoughFocus,
+            currentFilterName: currentFilterName,
+            currentGain: currentGain,
+            perFilterEnabled: perFilterEnabled,
+            isFilterWheelConnected: isFilterWheelConnected,
+            getFilterNames: getFilterNames,
+            getCurrentFilterName: getCurrentFilterName,
+            resolveFilterByName: resolveFilterByName,
+            getFilterDetectionOptions: getFilterDetectionOptions,
+            applyOptimizedToFilter: applyOptimizedToFilter,
+            setFilterDonutDetection: setFilterDonutDetection);
     }
 
     // An HONEST fake review builder: it maps EACH supplied descriptor to one FrameReview (so the ReviewVM's queue
@@ -533,7 +602,7 @@ public class StarDetectionOptimizerWizardVMTests {
         Assert.Multiple(() => {
             Assert.That(vm.CurrentStep, Is.EqualTo(WizardStep.Summary));
             Assert.That(vm.Summary.RunCount, Is.EqualTo(2));
-            loader.Received(2).LoadSavedRunAsync(Arg.Any<string>(), Arg.Any<StarDetectionRegion>(), Arg.Any<IReadOnlyList<FrameLabels>>(), Arg.Any<IProgress<RunLoadProgress>>(), Arg.Any<CancellationToken>());
+            loader.Received(2).LoadSavedRunAsync(Arg.Any<string>(), Arg.Any<StarDetectionRegion>(), Arg.Any<IReadOnlyList<FrameLabels>>(), Arg.Any<IProgress<RunLoadProgress>>(), Arg.Any<IStarDetectionOptions>(), Arg.Any<CancellationToken>());
         });
     }
 
@@ -1197,11 +1266,35 @@ public class StarDetectionOptimizerWizardVMTests {
     }
 
     [Test]
-    public void CanStart_LiveMode_EnabledEvenWithoutPaths() {
+    public void CanStart_Live_DisabledUntilSaveFolderSet() {
         var vm = NewVM(LoaderReturning(GoodRun()));
         vm.SourcePaths[0] = null;
         vm.SourceMode = SourceMode.Live;
-        Assert.That(vm.StartCommand.CanExecute(null), Is.True, "Live needs no source paths");
+        Assert.That(vm.StartCommand.CanExecute(null), Is.False, "Live needs a save folder");
+
+        vm.SaveFolderPath = @"C:\live";
+        Assert.That(vm.StartCommand.CanExecute(null), Is.True, "a save folder is chosen");
+
+        vm.SaveFolderPath = "  ";
+        Assert.That(vm.StartCommand.CanExecute(null), Is.False, "clearing the folder disables Start again");
+    }
+
+    [Test]
+    public async Task Start_Live_RoughFocusDeclined_DoesNotSweepAndStaysIdle() {
+        var swept = false;
+        var engine = LiveEngine(_ => { swept = true; return new AutoFocusResult { Succeeded = true, SaveFolder = @"C:\live\attempt" }; });
+        // confirmRoughFocus returns false: the user declined the "is it in focus?" dialog.
+        var vm = NewVM(LoaderReturning(GoodRun()), isCameraConnected: () => true, isFocuserConnected: () => true, autoFocusEngine: engine, confirmRoughFocus: () => false);
+        vm.SourceMode = SourceMode.Live;
+        vm.SaveFolderPath = @"C:\live";
+
+        await vm.StartAsync(CancellationToken.None);
+
+        Assert.Multiple(() => {
+            Assert.That(swept, Is.False, "declining rough-focus must not move the focuser or capture");
+            Assert.That(vm.CurrentStep, Is.EqualTo(WizardStep.SelectSource));
+            Assert.That(vm.ErrorMessage, Is.Null, "declining is a user choice, not an error");
+        });
     }
 
     [Test]
@@ -1247,50 +1340,50 @@ public class StarDetectionOptimizerWizardVMTests {
         });
     }
 
-    // ---- Live auto-focus chart -------------------------------------------------------------------------
+    // ---- Live sweep (fixed-sweep capture) ----------------------------------------------------------------
     //
     // A bare Substitute.For<IAutoFocusEngine>() returns null from GetOptions(), which RunLiveAttemptAsync
-    // dereferences (options.Save) — so every test that actually reaches the live run must stub it, along with
-    // Run(...) returning a SaveFolder the fake loader will accept. The connection probes are stubbed connected
-    // so the pre-flight check passes, and UseCurrentSettings skips the optimization pass we are not testing.
-    private static IAutoFocusEngine LiveEngine(Func<CallInfo, AutoFocusResult> onRun) {
+    // dereferences (options.Save) — so every test that reaches the live sweep must stub it, along with
+    // CaptureFixedSweepAsync(...) returning a SaveFolder the fake loader will accept. The connection probes are
+    // stubbed connected so the pre-flight check passes.
+    private static IAutoFocusEngine LiveEngine(Func<CallInfo, AutoFocusResult> onSweep) {
         var engine = Substitute.For<IAutoFocusEngine>();
         engine.GetOptions().Returns(_ => new AutoFocusEngineOptions());
-        engine.Run(default, default, default, default).ReturnsForAnyArgs(ci => Task.FromResult(onRun(ci)));
+        engine.CaptureFixedSweepAsync(default, default, default, default).ReturnsForAnyArgs(ci => Task.FromResult(onSweep(ci)));
         return engine;
     }
 
+    // Live source, confirmed + save folder set so Start passes the new gating. UseCurrentSettings skips the
+    // optimization pass the chart tests don't exercise.
     private static StarDetectionOptimizerWizardVM NewLiveVM(IAutoFocusEngine engine) {
         var vm = NewVM(LoaderReturning(GoodRun()), isCameraConnected: () => true, isFocuserConnected: () => true, autoFocusEngine: engine);
         vm.SourceMode = SourceMode.Live;
         vm.OptimizeMode = WizardOptimizeMode.UseCurrentSettings;
+        vm.SaveFolderPath = @"C:\live";
         return vm;
     }
 
     [Test]
-    public async Task ReplayMode_NeverShowsTheLiveChart() {
+    public async Task Replay_NeverEntersCapturingState() {
         var vm = NewVM(LoaderReturning(GoodRun()));
-        var everShown = false;
-        vm.PropertyChanged += (_, e) => { if (e.PropertyName == nameof(vm.ShowLiveChart) && vm.ShowLiveChart) { everShown = true; } };
+        var everCapturing = false;
+        vm.PropertyChanged += (_, e) => { if (e.PropertyName == nameof(vm.IsCapturing) && vm.IsCapturing) { everCapturing = true; } };
         vm.SourcePaths[0] = @"C:\run1";
 
         await vm.StartAsync(CancellationToken.None);
 
         Assert.Multiple(() => {
-            Assert.That(everShown, Is.False, "a replay has no live run to chart");
-            Assert.That(vm.ShowLiveChart, Is.False);
-            Assert.That(vm.LiveChart, Is.Null);
+            Assert.That(everCapturing, Is.False, "a replay captures nothing");
+            Assert.That(vm.IsCapturing, Is.False);
         });
     }
 
     [Test]
-    public async Task LiveMode_ShowsChartDuringTheRunAndTearsItDownAfter() {
+    public async Task Live_IsCapturingDuringTheSweepAndClearsAfter() {
         StarDetectionOptimizerWizardVM vm = null;
-        var shownDuringRun = false;
-        var chartDuringRun = (LiveAutoFocusChartVM)null;
+        var capturingDuringRun = false;
         var engine = LiveEngine(_ => {
-            shownDuringRun = vm.ShowLiveChart;
-            chartDuringRun = vm.LiveChart;
+            capturingDuringRun = vm.IsCapturing;
             return new AutoFocusResult { Succeeded = true, SaveFolder = @"C:\live\attempt" };
         });
         vm = NewLiveVM(engine);
@@ -1298,39 +1391,22 @@ public class StarDetectionOptimizerWizardVMTests {
         await vm.StartAsync(CancellationToken.None);
 
         Assert.Multiple(() => {
-            Assert.That(shownDuringRun, Is.True, "the chart is up while the auto-focus is in flight");
-            Assert.That(chartDuringRun, Is.Not.Null);
-            Assert.That(vm.ShowLiveChart, Is.False, "and is gone once the run ends");
-            Assert.That(vm.LiveChart, Is.Null);
+            Assert.That(capturingDuringRun, Is.True, "IsCapturing is set while the sweep runs");
+            Assert.That(vm.IsCapturing, Is.False, "and cleared once the sweep ends");
         });
     }
 
     [Test]
-    public async Task LiveMode_ChartIsDetachedWhenTheRunThrows() {
+    public async Task Live_FailedSweep_ClearsCapturingState() {
         StarDetectionOptimizerWizardVM vm = null;
-        var chartDuringRun = (LiveAutoFocusChartVM)null;
-        var engine = LiveEngine(_ => {
-            chartDuringRun = vm.LiveChart;
-            throw new InvalidOperationException("focuser exploded");
-        });
+        var engine = LiveEngine(_ => throw new InvalidOperationException("focuser exploded"));
         vm = NewLiveVM(engine);
 
         await vm.StartAsync(CancellationToken.None);
 
-        // The failed run leaves no chart behind, and the engine no longer feeds the one it had.
-        engine.MeasurementPointCompleted += Raise.EventWith(new AutoFocusMeasurementPointCompletedEventArgs {
-            RegionIndex = 0,
-            FocuserPosition = 10000,
-            Measurement = new MeasureAndError { Measure = 1.5, Stdev = 0.1 },
-            Fittings = new AutoFocusFitting(),
-            RejectedPoints = Array.Empty<AutoFocusRegionPoint>()
-        });
-
         Assert.Multiple(() => {
             Assert.That(vm.ErrorMessage, Does.Contain("focuser exploded"));
-            Assert.That(vm.LiveChart, Is.Null);
-            Assert.That(vm.ShowLiveChart, Is.False);
-            Assert.That(chartDuringRun.FocusPoints, Is.Empty, "the detached chart receives nothing further");
+            Assert.That(vm.IsCapturing, Is.False);
         });
     }
 
@@ -1342,6 +1418,981 @@ public class StarDetectionOptimizerWizardVMTests {
         Assert.That(vm.IsReplay, Is.False, "Live mode hides the runs/browse inputs");
         vm.SourceMode = SourceMode.Replay;
         Assert.That(vm.IsReplay, Is.True);
+    }
+
+    [Test]
+    public void IsLive_TracksSourceMode() {
+        var vm = NewVM(LoaderReturning(GoodRun()));
+        Assert.That(vm.IsLive, Is.False, "default source is Saved Auto-Focus (Replay)");
+        vm.SourceMode = SourceMode.Live;
+        Assert.That(vm.IsLive, Is.True, "Live mode shows the confirmation panel");
+    }
+
+    // ---- Focus recovery (Task C): session-only knob, widened Live sweep, run tagging --------------------
+
+    [Test]
+    public void FocusRecoverySteps_DefaultsToOne_AndClampsNegativeToZero() {
+        var vm = NewVM(LoaderReturning(GoodRun()));
+        Assert.That(vm.FocusRecoverySteps, Is.EqualTo(1), "focus recovery defaults to 1");
+        vm.FocusRecoverySteps = -3;
+        Assert.That(vm.FocusRecoverySteps, Is.EqualTo(0), "a negative value clamps to 0");
+        vm.FocusRecoverySteps = 4;
+        Assert.That(vm.FocusRecoverySteps, Is.EqualTo(4), "a positive value is kept");
+    }
+
+    [Test]
+    public void FocusRecoverySteps_Live_WidensSweepReadouts_Replay_LeavesThemUnchanged() {
+        var profileService = Substitute.For<IProfileService>();
+        var focuserSettings = Substitute.For<IFocuserSettings>();
+        focuserSettings.AutoFocusInitialOffsetSteps.Returns(4);
+        focuserSettings.AutoFocusNumberOfFramesPerPoint.Returns(1);
+        profileService.ActiveProfile.FocuserSettings.Returns(focuserSettings);
+        var vm = NewVM(LoaderReturning(GoodRun()), profileService: profileService);
+
+        // Live mode: recovery widens the effective sweep readouts, and editing it raises change notifications.
+        vm.SourceMode = SourceMode.Live;
+        Assert.That(vm.SweepEffectiveOffsetSteps, Is.EqualTo(4 + 1), "the default recovery=1 already widens the Live sweep");
+
+        var raised = new List<string>();
+        vm.PropertyChanged += (_, e) => raised.Add(e.PropertyName);
+        vm.FocusRecoverySteps = 3;
+
+        Assert.Multiple(() => {
+            Assert.That(vm.SweepEffectiveOffsetSteps, Is.EqualTo(4 + 3), "profile offset (4) + recovery (3)");
+            Assert.That(vm.SweepPointCount, Is.EqualTo(2 * (4 + 3) + 1), "point count follows the widened offset");
+            Assert.That(vm.SweepEstimatedFrames, Is.EqualTo((2 * (4 + 3) + 1) * 1), "estimated frames follow the widened point count");
+            Assert.That(raised, Does.Contain(nameof(vm.FocusRecoverySteps)));
+            Assert.That(raised, Does.Contain(nameof(vm.SweepEffectiveOffsetSteps)));
+            Assert.That(raised, Does.Contain(nameof(vm.SweepPointCount)));
+            Assert.That(raised, Does.Contain(nameof(vm.SweepEstimatedFrames)));
+        });
+
+        // Replay mode: the SAME edit leaves the readouts unchanged (recovery adds 0 off the Live path).
+        vm.SourceMode = SourceMode.Replay;
+        var effBefore = vm.SweepEffectiveOffsetSteps;
+        var pointsBefore = vm.SweepPointCount;
+        var framesBefore = vm.SweepEstimatedFrames;
+        vm.FocusRecoverySteps = 6;
+        Assert.Multiple(() => {
+            Assert.That(vm.SweepEffectiveOffsetSteps, Is.EqualTo(4), "Replay ignores recovery: effective offset == profile offset");
+            Assert.That(vm.SweepEffectiveOffsetSteps, Is.EqualTo(effBefore));
+            Assert.That(vm.SweepPointCount, Is.EqualTo(pointsBefore), "Replay point count is unchanged by recovery");
+            Assert.That(vm.SweepEstimatedFrames, Is.EqualTo(framesBefore), "Replay estimated frames are unchanged by recovery");
+        });
+    }
+
+    [Test]
+    public async Task Start_LiveSweep_PassesWidenedOffsetToEngine() {
+        const int P = 3;   // profile offset the engine's GetOptions reports
+        const int N = 2;   // recovery steps per side
+        var baseTimeout = TimeSpan.FromSeconds(300);
+        AutoFocusEngineOptions captured = null;
+        var engine = Substitute.For<IAutoFocusEngine>();
+        engine.GetOptions().Returns(_ => new AutoFocusEngineOptions {
+            AutoFocusInitialOffsetSteps = P,
+            AutoFocusStepSize = DefaultStepSize,
+            AutoFocusTimeout = baseTimeout
+        });
+        engine.CaptureFixedSweepAsync(default, default, default, default).ReturnsForAnyArgs(ci => {
+            captured = ci.ArgAt<AutoFocusEngineOptions>(0);
+            return Task.FromResult(new AutoFocusResult { Succeeded = true, SaveFolder = @"C:\live\attempt" });
+        });
+        var vm = NewVM(LoaderReturning(GoodRun()), isCameraConnected: () => true, isFocuserConnected: () => true, autoFocusEngine: engine);
+        vm.SourceMode = SourceMode.Live;
+        vm.OptimizeMode = WizardOptimizeMode.UseCurrentSettings;
+        vm.SaveFolderPath = @"C:\live";
+        vm.FocusRecoverySteps = N;
+
+        await vm.StartAsync(CancellationToken.None);
+
+        Assert.That(captured, Is.Not.Null, "the widened options were handed to the engine's fixed sweep");
+        var oldPoints = 2 * P + 1;
+        var newPoints = 2 * (P + N) + 1;
+        Assert.Multiple(() => {
+            Assert.That(vm.ErrorMessage, Is.Null.Or.Empty, "the widened Live run completes cleanly");
+            Assert.That(captured.AutoFocusInitialOffsetSteps, Is.EqualTo(P + N), "offset widened by N recovery steps");
+            Assert.That(captured.AutoFocusStepSize, Is.EqualTo(DefaultStepSize), "step size is untouched (recovery widens, not refines)");
+            Assert.That(captured.AutoFocusTimeout.Ticks,
+                Is.EqualTo((long)(baseTimeout.Ticks * (double)newPoints / oldPoints)),
+                "timeout scaled by the point-count ratio (2(P+N)+1)/(2P+1)");
+        });
+    }
+
+    [Test]
+    public void ApplyFocusRecovery_WidensOffsetAndScalesTimeout_NeverStepSize() {
+        var options = new AutoFocusEngineOptions {
+            AutoFocusInitialOffsetSteps = 5,
+            AutoFocusStepSize = 100,
+            AutoFocusTimeout = TimeSpan.FromSeconds(600)
+        };
+        StarDetectionOptimizerWizardVM.ApplyFocusRecovery(options, 2);
+        var oldPoints = 2 * 5 + 1;   // 11
+        var newPoints = 2 * 7 + 1;   // 15
+        Assert.Multiple(() => {
+            Assert.That(options.AutoFocusInitialOffsetSteps, Is.EqualTo(7), "offset bumped by N");
+            Assert.That(options.AutoFocusStepSize, Is.EqualTo(100), "step size never changes");
+            Assert.That(options.AutoFocusTimeout.Ticks,
+                Is.EqualTo((long)(TimeSpan.FromSeconds(600).Ticks * (double)newPoints / oldPoints)),
+                "timeout scaled by the point-count ratio");
+        });
+    }
+
+    [Test]
+    public void ApplyFocusRecovery_NonPositiveSteps_IsCompleteNoOp() {
+        foreach (var n in new[] { 0, -1, -5 }) {
+            var options = new AutoFocusEngineOptions {
+                AutoFocusInitialOffsetSteps = 5,
+                AutoFocusStepSize = 100,
+                AutoFocusTimeout = TimeSpan.FromSeconds(600)
+            };
+            StarDetectionOptimizerWizardVM.ApplyFocusRecovery(options, n);
+            Assert.Multiple(() => {
+                Assert.That(options.AutoFocusInitialOffsetSteps, Is.EqualTo(5), $"offset unchanged at N={n}");
+                Assert.That(options.AutoFocusStepSize, Is.EqualTo(100), $"step size unchanged at N={n}");
+                Assert.That(options.AutoFocusTimeout, Is.EqualTo(TimeSpan.FromSeconds(600)), $"timeout unchanged at N={n}");
+            });
+        }
+    }
+
+    [Test]
+    public async Task Start_Live_StampsRecoverySnapshotOntoLoadedRun() {
+        // The loaded run's RunEvaluationData must carry the snapshotted recovery steps so the evaluator tags the outer
+        // frames. The fake loader hands back the same LoadedRun instance we hold, and RecoveryStepsPerSide survives the
+        // post-run Dispose (it is a plain int), so we can read the stamp after Start completes.
+        var run = GoodRun();
+        var engine = LiveEngine(_ => new AutoFocusResult { Succeeded = true, SaveFolder = @"C:\live\attempt" });
+        var vm = NewVM(LoaderReturning(run), isCameraConnected: () => true, isFocuserConnected: () => true, autoFocusEngine: engine);
+        vm.SourceMode = SourceMode.Live;
+        vm.OptimizeMode = WizardOptimizeMode.UseCurrentSettings;
+        vm.SaveFolderPath = @"C:\live";
+        vm.FocusRecoverySteps = 2;
+
+        await vm.StartAsync(CancellationToken.None);
+
+        Assert.Multiple(() => {
+            Assert.That(vm.ErrorMessage, Is.Null.Or.Empty);
+            Assert.That(run.Data.RecoveryStepsPerSide, Is.EqualTo(2), "a Live start stamps the recovery snapshot onto the loaded run");
+        });
+    }
+
+    [Test]
+    public async Task Start_Replay_LeavesRecoverySnapshotAtZero() {
+        // Recovery must be inert for Replay: even with the box set, a Replay start stamps 0 so the run is untagged.
+        var run = GoodRun();
+        var vm = NewVM(LoaderReturning(run));
+        vm.FocusRecoverySteps = 5; // Replay must ignore this
+        vm.SourcePaths[0] = @"C:\run1";
+
+        await vm.StartAsync(CancellationToken.None);
+
+        Assert.Multiple(() => {
+            Assert.That(vm.CurrentStep, Is.EqualTo(WizardStep.Summary));
+            Assert.That(run.Data.RecoveryStepsPerSide, Is.EqualTo(0), "a Replay start leaves recovery inert regardless of the box value");
+        });
+    }
+
+    // Reload-survival regression: the load-and-stamp choke-point must keep the recovery tag on EVERY reload path
+    // (re-optimize AND continue). A future change that drops the stamp from a reload path must fail these. The
+    // RecordingLoader manufactures a fresh run per load and records them, so we can inspect the runs the RELOAD
+    // produced (after the originating Start's runs) and assert their stamped RecoveryStepsPerSide.
+
+    [Test]
+    public async Task ReOptimize_Live_ReloadedRunKeepsRecoveryTag() {
+        var loader = new RecordingLoader();
+        var engine = LiveEngine(_ => new AutoFocusResult { Succeeded = true, SaveFolder = @"C:\live\attempt" });
+        var vm = NewVM(loader, isCameraConnected: () => true, isFocuserConnected: () => true, autoFocusEngine: engine,
+            frameReviewBuilder: new FakeReviewBuilder().Build);
+        vm.SourceMode = SourceMode.Live;
+        vm.SaveFolderPath = @"C:\live";
+        vm.FocusRecoverySteps = 2;
+
+        await vm.StartAsync(CancellationToken.None);
+        await vm.ReviewCommand.ExecuteAsync(null);
+        vm.ReviewVM.AddMissedBox(150.0, 175.0, 18.0, 18.0);
+        vm.BackToSummaryCommand.Execute(null);
+        Assert.That(vm.ReOptimizeCommand.CanExecute(null), Is.True, "precondition: labeled + idle => re-optimize enabled");
+
+        var producedBeforeReload = loader.ProducedRuns.Count;
+        await vm.ReOptimizeCommand.ExecuteAsync(null);
+
+        var reloaded = loader.ProducedRuns.Skip(producedBeforeReload).ToList();
+        Assert.Multiple(() => {
+            Assert.That(vm.CurrentStep, Is.EqualTo(WizardStep.Summary));
+            Assert.That(reloaded, Is.Not.Empty, "the re-optimize path re-loaded at least one run");
+            Assert.That(reloaded.All(r => r.Data.RecoveryStepsPerSide == 2), Is.True,
+                "the re-optimize reload preserved the recovery tag (snapshot N=2)");
+        });
+    }
+
+    [Test]
+    public async Task Continue_Live_ReloadedRunKeepsRecoveryTag() {
+        var loader = new RecordingLoader();
+        var engine = LiveEngine(_ => new AutoFocusResult { Succeeded = true, SaveFolder = @"C:\live\attempt" });
+        var vm = NewVM(loader, isCameraConnected: () => true, isFocuserConnected: () => true, autoFocusEngine: engine,
+            frameReviewBuilder: new FakeReviewBuilder().Build);
+        vm.SourceMode = SourceMode.Live;
+        vm.SaveFolderPath = @"C:\live";
+        vm.FocusRecoverySteps = 2;
+
+        await vm.StartAsync(CancellationToken.None);
+        Assert.That(vm.CanContinueOptimization, Is.True, "precondition: an optimize pass ran so continue is available");
+
+        var producedBeforeReload = loader.ProducedRuns.Count;
+        await vm.ContinueOptimizationCommand.ExecuteAsync(null);
+
+        var reloaded = loader.ProducedRuns.Skip(producedBeforeReload).ToList();
+        Assert.Multiple(() => {
+            Assert.That(vm.CurrentStep, Is.EqualTo(WizardStep.Summary));
+            Assert.That(reloaded, Is.Not.Empty, "the continue path re-loaded at least one run");
+            Assert.That(reloaded.All(r => r.Data.RecoveryStepsPerSide == 2), Is.True,
+                "the continue reload preserved the recovery tag (snapshot N=2)");
+        });
+    }
+
+    [Test]
+    public async Task ReOptimize_Replay_ReloadedRunStaysUntagged() {
+        // The mirror case: a Replay reload must stay inert (0) even with the recovery box set, because the snapshot
+        // was taken as 0 at a Replay Start — so the tag never leaks onto a replay's re-optimize pass.
+        var loader = new RecordingLoader();
+        var vm = NewVM(loader, frameReviewBuilder: new FakeReviewBuilder().Build);
+        vm.FocusRecoverySteps = 5; // Replay must ignore this
+        vm.SourcePaths[0] = @"C:\reopt-run";
+
+        await vm.StartAsync(CancellationToken.None);
+        await vm.ReviewCommand.ExecuteAsync(null);
+        vm.ReviewVM.AddMissedBox(150.0, 175.0, 18.0, 18.0);
+        vm.BackToSummaryCommand.Execute(null);
+
+        var producedBeforeReload = loader.ProducedRuns.Count;
+        await vm.ReOptimizeCommand.ExecuteAsync(null);
+
+        var reloaded = loader.ProducedRuns.Skip(producedBeforeReload).ToList();
+        Assert.Multiple(() => {
+            Assert.That(reloaded, Is.Not.Empty, "the re-optimize path re-loaded at least one run");
+            Assert.That(reloaded.All(r => r.Data.RecoveryStepsPerSide == 0), Is.True,
+                "a Replay reload stays untagged regardless of the box value");
+        });
+    }
+
+    // ---- Per-filter star detection: target filter state + Start validation -----------------------------
+
+    [Test]
+    public void TargetFilterName_DefaultsToCurrentWheelFilter_WhenPerFilterEnabled() {
+        var vm = NewVM(LoaderReturning(GoodRun()),
+            perFilterEnabled: () => true,
+            getFilterNames: () => new[] { "Lum", "Ha", "OIII" },
+            getCurrentFilterName: () => "Ha");
+        Assert.Multiple(() => {
+            Assert.That(vm.IsPerFilterEnabled, Is.True);
+            Assert.That(vm.TargetFilterName, Is.EqualTo("Ha"));
+            Assert.That(vm.AvailableFilterNames, Is.EqualTo(new[] { "Lum", "Ha", "OIII" }));
+        });
+    }
+
+    [Test]
+    public void TargetFilterName_DefaultsToFirstProfileFilter_WhenWheelFilterUnknown() {
+        var vm = NewVM(LoaderReturning(GoodRun()),
+            perFilterEnabled: () => true,
+            getFilterNames: () => new[] { "Lum", "Ha" },
+            getCurrentFilterName: () => null);
+        Assert.That(vm.TargetFilterName, Is.EqualTo("Lum"));
+    }
+
+    [Test]
+    public void IsPerFilterEnabled_False_ByDefault() {
+        var vm = NewVM(LoaderReturning(GoodRun()));
+        Assert.Multiple(() => {
+            Assert.That(vm.IsPerFilterEnabled, Is.False);
+            Assert.That(vm.TargetFilterName, Is.Null, "feature off: no target filter is seeded");
+        });
+    }
+
+    [Test]
+    public async Task Start_PerFilterOn_NoTargetFilter_SetsErrorAndDoesNotLoad() {
+        var loader = LoaderReturning(GoodRun());
+        var vm = NewVM(loader, perFilterEnabled: () => true, getFilterNames: () => Array.Empty<string>());
+        vm.SourcePaths[0] = @"C:\run1";
+
+        await vm.StartAsync(CancellationToken.None);
+
+        Assert.Multiple(() => {
+            Assert.That(vm.ErrorMessage, Is.EqualTo("Select a target filter."));
+            Assert.That(vm.CurrentStep, Is.Not.EqualTo(WizardStep.Summary));
+            loader.DidNotReceiveWithAnyArgs().LoadSavedRunAsync(default, default, default);
+        });
+    }
+
+    [Test]
+    public async Task Start_PerFilterOn_Live_FilterWheelDisconnected_SetsError() {
+        var vm = NewVM(LoaderReturning(GoodRun()),
+            isCameraConnected: () => true, isFocuserConnected: () => true,
+            perFilterEnabled: () => true,
+            isFilterWheelConnected: () => false,
+            getFilterNames: () => new[] { "Ha" });
+        vm.SourceMode = SourceMode.Live;
+        vm.SaveFolderPath = @"C:\live";
+
+        await vm.StartAsync(CancellationToken.None);
+
+        Assert.Multiple(() => {
+            Assert.That(vm.ErrorMessage, Is.EqualTo("Connect a filter wheel before running a live optimization."));
+            Assert.That(vm.CurrentStep, Is.Not.EqualTo(WizardStep.Summary));
+        });
+    }
+
+    [Test]
+    public async Task Start_PerFilterOn_Live_TargetFilterNotInProfile_SetsErrorAndDoesNotCapture() {
+        // The wheel reports a filter name the profile doesn't have: the sweep could not select it, so Start must
+        // refuse rather than capture through some other filter and attribute the result to the target.
+        var engine = LiveEngine(_ => new AutoFocusResult { Succeeded = true, SaveFolder = @"C:\live\attempt" });
+        var vm = NewVM(LoaderReturning(GoodRun()),
+            isCameraConnected: () => true, isFocuserConnected: () => true, autoFocusEngine: engine,
+            perFilterEnabled: () => true, isFilterWheelConnected: () => true,
+            getFilterNames: () => new[] { "Ha" }, getCurrentFilterName: () => "Ha",
+            resolveFilterByName: _ => null);
+        vm.SourceMode = SourceMode.Live;
+        vm.SaveFolderPath = @"C:\live";
+
+        await vm.StartAsync(CancellationToken.None);
+
+        Assert.Multiple(() => {
+            Assert.That(vm.ErrorMessage, Does.Contain("Ha").And.Contain("not found in the profile"));
+            Assert.That(vm.CurrentStep, Is.Not.EqualTo(WizardStep.Summary));
+        });
+        _ = engine.DidNotReceiveWithAnyArgs().CaptureFixedSweepAsync(default, default, default, default);
+    }
+
+    [Test]
+    public void SweepFilterName_FlagsTargetFilterMissingFromProfile() {
+        var vm = NewVM(LoaderReturning(GoodRun()),
+            perFilterEnabled: () => true,
+            getFilterNames: () => new[] { "Ha" }, getCurrentFilterName: () => "Ha",
+            resolveFilterByName: _ => null);
+        Assert.That(vm.SweepFilterName, Is.EqualTo("Ha (not in profile)"));
+    }
+
+    [Test]
+    public async Task Start_PerFilterOn_Replay_DoesNotRequireFilterWheel() {
+        // Replay needs no equipment: the wheel-connected gate applies to Live only.
+        var vm = NewVM(LoaderReturning(GoodRun()),
+            perFilterEnabled: () => true,
+            isFilterWheelConnected: () => false,
+            getFilterNames: () => new[] { "Ha" });
+        vm.SourcePaths[0] = @"C:\run1";
+
+        await vm.StartAsync(CancellationToken.None);
+
+        Assert.That(vm.CurrentStep, Is.EqualTo(WizardStep.Summary));
+    }
+
+    [Test]
+    public void SweepReadouts_ReflectTargetFilter_WhenPerFilterEnabled() {
+        var target = new FilterInfo("Ha", 0, 1) { AutoFocusGain = 200 };
+        var vm = NewVM(LoaderReturning(GoodRun()),
+            currentFilterName: () => "Lum", currentGain: () => 100,
+            perFilterEnabled: () => true,
+            getFilterNames: () => new[] { "Lum", "Ha" },
+            getCurrentFilterName: () => "Ha",
+            resolveFilterByName: name => name == "Ha" ? target : null);
+        Assert.Multiple(() => {
+            Assert.That(vm.SweepFilterName, Is.EqualTo("Ha"), "the target filter name, not the AF/current filter");
+            Assert.That(vm.SweepGain, Is.EqualTo("200"), "the target filter's per-filter AF gain");
+        });
+    }
+
+    [Test]
+    public void SweepReadouts_FallBackToProviders_WhenPerFilterOff() {
+        var vm = NewVM(LoaderReturning(GoodRun()), currentFilterName: () => "Lum", currentGain: () => 100);
+        Assert.Multiple(() => {
+            Assert.That(vm.SweepFilterName, Is.EqualTo("Lum"));
+            Assert.That(vm.SweepGain, Is.EqualTo("100"));
+        });
+    }
+
+    [Test]
+    public void SummaryFilter_ShowsTargetFilter_WhenPerFilterEnabled() {
+        var vm = NewVM(LoaderReturning(GoodRun()),
+            perFilterEnabled: () => true,
+            getFilterNames: () => new[] { "Lum", "Ha" },
+            getCurrentFilterName: () => "Ha");
+        Assert.Multiple(() => {
+            Assert.That(vm.HasSummaryFilter, Is.True);
+            Assert.That(vm.SummaryFilterName, Is.EqualTo("Ha"));
+        });
+    }
+
+    [Test]
+    public void SummaryFilter_Hidden_WhenPerFilterDisabled() {
+        var vm = NewVM(LoaderReturning(GoodRun()));
+        vm.TargetFilterName = "Ha"; // even if somehow set, per-filter off means no filter to name
+        Assert.Multiple(() => {
+            Assert.That(vm.HasSummaryFilter, Is.False);
+            Assert.That(vm.SummaryFilterName, Is.Null);
+        });
+    }
+
+    [Test]
+    public void TargetFilterName_Set_RaisesPropertyChanged_ForSummaryFilterReadouts() {
+        var vm = NewVM(LoaderReturning(GoodRun()),
+            perFilterEnabled: () => true,
+            getFilterNames: () => new[] { "Lum", "Ha" },
+            getCurrentFilterName: () => "Lum");
+        var raised = new List<string>();
+        vm.PropertyChanged += (_, e) => raised.Add(e.PropertyName);
+
+        vm.TargetFilterName = "Ha";
+
+        Assert.Multiple(() => {
+            Assert.That(raised, Does.Contain(nameof(vm.SummaryFilterName)));
+            Assert.That(raised, Does.Contain(nameof(vm.HasSummaryFilter)));
+        });
+    }
+
+    // ---- Per-filter star detection: capture / baseline / Accept routing --------------------------------
+
+    [Test]
+    public async Task Start_PerFilterLive_PassesTargetFilterWithUseExactImagingFilter() {
+        var target = new FilterInfo("Ha", 0, 1);
+        FilterInfo capturedFilter = null;
+        AutoFocusEngineOptions capturedOptions = null;
+        var engine = LiveEngine(ci => {
+            capturedOptions = ci.ArgAt<AutoFocusEngineOptions>(0);
+            capturedFilter = ci.ArgAt<FilterInfo>(1);
+            return new AutoFocusResult { Succeeded = true, SaveFolder = @"C:\live\attempt" };
+        });
+        var vm = NewVM(LoaderReturning(GoodRun()),
+            isCameraConnected: () => true, isFocuserConnected: () => true, autoFocusEngine: engine,
+            perFilterEnabled: () => true, isFilterWheelConnected: () => true,
+            getFilterNames: () => new[] { "Lum", "Ha" }, getCurrentFilterName: () => "Ha",
+            resolveFilterByName: name => name == "Ha" ? target : null);
+        vm.SourceMode = SourceMode.Live;
+        vm.OptimizeMode = WizardOptimizeMode.UseCurrentSettings;
+        vm.SaveFolderPath = @"C:\live";
+
+        await vm.StartAsync(CancellationToken.None);
+
+        Assert.Multiple(() => {
+            Assert.That(capturedFilter, Is.SameAs(target), "the sweep exposes through the resolved target filter");
+            Assert.That(capturedOptions.UseExactImagingFilter, Is.True, "the AF-filter substitution is suppressed");
+        });
+    }
+
+    [Test]
+    public async Task Start_Live_PerFilterOff_KeepsNullFilterAndDefaultEngineOptions() {
+        var capturedFilter = new FilterInfo("sentinel", 0, 0);
+        AutoFocusEngineOptions capturedOptions = null;
+        var engine = LiveEngine(ci => {
+            capturedOptions = ci.ArgAt<AutoFocusEngineOptions>(0);
+            capturedFilter = ci.ArgAt<FilterInfo>(1);
+            return new AutoFocusResult { Succeeded = true, SaveFolder = @"C:\live\attempt" };
+        });
+        var vm = NewLiveVM(engine);
+
+        await vm.StartAsync(CancellationToken.None);
+
+        Assert.Multiple(() => {
+            Assert.That(capturedFilter, Is.Null, "feature off: no imaging filter is passed (existing behavior)");
+            Assert.That(capturedOptions.UseExactImagingFilter, Is.False);
+        });
+    }
+
+    [Test]
+    public async Task Start_PerFilterOn_ThreadsTargetFilterOptionsIntoLoaderBaseline() {
+        var filterOptions = Substitute.For<IStarDetectionOptions>();
+        var loader = LoaderReturning(GoodRun());
+        var vm = NewVM(loader,
+            perFilterEnabled: () => true,
+            getFilterNames: () => new[] { "Ha" }, getCurrentFilterName: () => "Ha",
+            getFilterDetectionOptions: name => name == "Ha" ? filterOptions : null);
+        vm.SourcePaths[0] = @"C:\run1";
+
+        await vm.StartAsync(CancellationToken.None);
+
+        await loader.Received(1).LoadSavedRunAsync(
+            @"C:\run1", Arg.Any<StarDetectionRegion>(), Arg.Any<IReadOnlyList<FrameLabels>>(),
+            Arg.Any<IProgress<RunLoadProgress>>(), filterOptions, Arg.Any<CancellationToken>());
+    }
+
+    [Test]
+    public async Task Start_PerFilterOff_PassesNullBaselineOverrideToLoader() {
+        var loader = LoaderReturning(GoodRun());
+        var vm = NewVM(loader);
+        vm.SourcePaths[0] = @"C:\run1";
+
+        await vm.StartAsync(CancellationToken.None);
+
+        await loader.Received(1).LoadSavedRunAsync(
+            @"C:\run1", Arg.Any<StarDetectionRegion>(), Arg.Any<IReadOnlyList<FrameLabels>>(),
+            Arg.Any<IProgress<RunLoadProgress>>(), (IStarDetectionOptions)null, Arg.Any<CancellationToken>());
+    }
+
+    [Test]
+    public async Task Accept_PerFilterOn_RoutesThroughApplyOptimizedToFilter() {
+        var options = Substitute.For<IStarDetectionOptions>();
+        string appliedFilter = null;
+        OptimizedStarDetectionSettings appliedDto = null;
+        var vm = NewVM(LoaderReturning(GoodRun()), options,
+            perFilterEnabled: () => true,
+            getFilterNames: () => new[] { "Ha" }, getCurrentFilterName: () => "Ha",
+            applyOptimizedToFilter: (name, dto) => { appliedFilter = name; appliedDto = dto; });
+        vm.SourcePaths[0] = @"C:\run1";
+        await vm.StartAsync(CancellationToken.None);
+
+        vm.AcceptCommand.Execute(null);
+
+        Assert.Multiple(() => {
+            Assert.That(appliedFilter, Is.EqualTo("Ha"), "the DTO lands in the TARGET filter's settings set");
+            Assert.That(appliedDto, Is.Not.Null);
+            Assert.That(appliedDto.BrightnessSensitivity, Is.EqualTo(vm.Result.BestParams.Sensitivity).Within(1e-9));
+        });
+        options.DidNotReceiveWithAnyArgs().ApplyOptimizedSettings(default);
+    }
+
+    // The donut master is a per-filter setting like every other detection knob. The wizard start page's checkbox and
+    // the optimizer's seed/budget must therefore read the TARGET filter's stored set — NOT the options-page edit
+    // buffer, which belongs to whichever filter happens to be selected on the Star Detection options page and is
+    // routinely a different filter (that is the whole point of the target picker).
+
+    [Test]
+    public void DefocusAwareDonutDetection_PerFilterOn_ReadsTheTargetFilter_NotTheEditBuffer() {
+        var buffer = Substitute.For<IStarDetectionOptions>();   // the options page is editing "Lum"
+        buffer.DefocusAwareDonutDetection.Returns(false);
+        var haOptions = Substitute.For<IStarDetectionOptions>();
+        haOptions.DefocusAwareDonutDetection.Returns(true);
+        var vm = NewVM(LoaderReturning(GoodRun()), buffer,
+            perFilterEnabled: () => true,
+            getFilterNames: () => new[] { "Lum", "Ha" }, getCurrentFilterName: () => "Ha",
+            getFilterDetectionOptions: name => name == "Ha" ? haOptions : buffer);
+
+        Assert.Multiple(() => {
+            Assert.That(vm.TargetFilterName, Is.EqualTo("Ha"));
+            Assert.That(vm.DefocusAwareDonutDetection, Is.True, "the wizard's donut master reflects the TARGET filter");
+        });
+    }
+
+    [Test]
+    public void DefocusAwareDonutDetection_PerFilterOn_WritesTheTargetFilter_NotTheEditBuffer() {
+        var buffer = Substitute.For<IStarDetectionOptions>();
+        buffer.DefocusAwareDonutDetection.Returns(false);
+        var haOptions = Substitute.For<IStarDetectionOptions>();
+        haOptions.DefocusAwareDonutDetection.Returns(false);
+        var writes = new List<(string Filter, bool Value)>();
+        var vm = NewVM(LoaderReturning(GoodRun()), buffer,
+            perFilterEnabled: () => true,
+            getFilterNames: () => new[] { "Lum", "Ha" }, getCurrentFilterName: () => "Ha",
+            getFilterDetectionOptions: name => name == "Ha" ? haOptions : buffer,
+            setFilterDonutDetection: (name, value) => writes.Add((name, value)));
+
+        vm.DefocusAwareDonutDetection = true;
+
+        Assert.That(writes, Is.EqualTo(new[] { ("Ha", true) }), "the donut master persists into the TARGET filter's set");
+        // The options-page buffer belongs to a different filter; ticking the wizard's checkbox must not touch it.
+        buffer.DidNotReceiveWithAnyArgs().DefocusAwareDonutDetection = default;
+    }
+
+    [Test]
+    public void DefocusAwareDonutDetection_PerFilterOff_StillWritesTheOptionsSingletonDirectly() {
+        var options = Substitute.For<IStarDetectionOptions>();
+        options.DefocusAwareDonutDetection.Returns(false);
+        var writes = new List<(string Filter, bool Value)>();
+        var vm = NewVM(LoaderReturning(GoodRun()), options,
+            setFilterDonutDetection: (name, value) => writes.Add((name, value)));
+
+        vm.DefocusAwareDonutDetection = true;
+
+        Assert.Multiple(() => {
+            Assert.That(writes, Is.Empty, "with the feature off there is no filter to route to");
+            Assert.That(vm.IsPerFilterEnabled, Is.False);
+        });
+        options.Received().DefocusAwareDonutDetection = true;
+    }
+
+    [Test]
+    public async Task Start_PerFilterOn_SeedDonutMasterAndBudgetFollowTheTargetFilter_WhenTheBufferHasItOff() {
+        var buffer = Substitute.For<IStarDetectionOptions>();
+        buffer.DefocusAwareDonutDetection.Returns(false);
+        var haOptions = Substitute.For<IStarDetectionOptions>();
+        haOptions.DefocusAwareDonutDetection.Returns(true);
+        var run = GoodRun();
+        var settings = new OptimizerSettings { MaxEvaluations = 12, CoarseGridLevels = 2, StepFloorFraction = 0.125 };
+        var vm = NewVM(LoaderReturning(run), buffer,
+            optimizerSettings: settings,
+            perFilterEnabled: () => true,
+            getFilterNames: () => new[] { "Lum", "Ha" }, getCurrentFilterName: () => "Ha",
+            getFilterDetectionOptions: name => name == "Ha" ? haOptions : buffer);
+        vm.SourcePaths[0] = @"C:\run1";
+
+        await vm.StartAsync(CancellationToken.None);
+
+        Assert.Multiple(() => {
+            Assert.That(run.Seed.DefocusAwareDonutDetection, Is.True,
+                "the seed's donut master is stamped from the target filter, so CreateCuratedSet unlocks the defocus axes");
+            Assert.That(settings.MaxEvaluations, Is.EqualTo(400),
+                "and the wider donut search space gets the larger evaluation budget");
+        });
+    }
+
+    [Test]
+    public async Task Start_PerFilterOn_TargetFilterDonutOff_KeepsStandardBudget_EvenWhenTheBufferHasItOn() {
+        var buffer = Substitute.For<IStarDetectionOptions>();
+        buffer.DefocusAwareDonutDetection.Returns(true);   // the edited filter wants donuts; the target does not
+        var haOptions = Substitute.For<IStarDetectionOptions>();
+        haOptions.DefocusAwareDonutDetection.Returns(false);
+        var run = GoodRun();
+        var settings = new OptimizerSettings { MaxEvaluations = 12, CoarseGridLevels = 2, StepFloorFraction = 0.125 };
+        var vm = NewVM(LoaderReturning(run), buffer,
+            optimizerSettings: settings,
+            perFilterEnabled: () => true,
+            getFilterNames: () => new[] { "Lum", "Ha" }, getCurrentFilterName: () => "Ha",
+            getFilterDetectionOptions: name => name == "Ha" ? haOptions : buffer);
+        vm.SourcePaths[0] = @"C:\run1";
+
+        await vm.StartAsync(CancellationToken.None);
+
+        Assert.Multiple(() => {
+            Assert.That(run.Seed.DefocusAwareDonutDetection, Is.False);
+            Assert.That(settings.MaxEvaluations, Is.EqualTo(12), "the edited filter's donut master must not widen this run's search");
+        });
+    }
+
+    [Test]
+    public async Task Start_PerFilterOff_SeedDonutMasterAndBudgetStillComeFromTheOptionsSingleton() {
+        var options = Substitute.For<IStarDetectionOptions>();
+        options.DefocusAwareDonutDetection.Returns(true);
+        var run = GoodRun();
+        var settings = new OptimizerSettings { MaxEvaluations = 12, CoarseGridLevels = 2, StepFloorFraction = 0.125 };
+        var vm = NewVM(LoaderReturning(run), options, optimizerSettings: settings);
+        vm.SourcePaths[0] = @"C:\run1";
+
+        await vm.StartAsync(CancellationToken.None);
+
+        Assert.Multiple(() => {
+            Assert.That(run.Seed.DefocusAwareDonutDetection, Is.True);
+            Assert.That(settings.MaxEvaluations, Is.EqualTo(400));
+        });
+    }
+
+    [Test]
+    public void SweepFilterAndGain_ReflectInjectedProviders() {
+        var vm = NewVM(LoaderReturning(GoodRun()), currentFilterName: () => "Ha", currentGain: () => 139);
+        Assert.Multiple(() => {
+            Assert.That(vm.SweepFilterName, Is.EqualTo("Ha"));
+            Assert.That(vm.SweepGain, Is.EqualTo("139"));
+        });
+    }
+
+    [Test]
+    public void SweepFilterAndGain_Unavailable_WhenProvidersReturnNothing() {
+        var vm = NewVM(LoaderReturning(GoodRun()), currentFilterName: () => null, currentGain: () => (int?)null);
+        Assert.Multiple(() => {
+            Assert.That(vm.SweepFilterName, Is.EqualTo("Unavailable"));
+            Assert.That(vm.SweepGain, Is.EqualTo("Unavailable"));
+        });
+    }
+
+    [Test]
+    public void HandleCaptureProgress_ContextReport_SetsContextTextAndFrameBar() {
+        var vm = NewVM(LoaderReturning(GoodRun()));
+        vm.HandleCaptureProgress(new ApplicationStatus {
+            Source = AutoFocusEngine.LiveSweepProgressSource,
+            Status = "Capturing frame 3 of 9 at focuser position 12345",
+            Progress = 2,
+            MaxProgress = 9
+        });
+        Assert.Multiple(() => {
+            Assert.That(vm.CaptureContextText, Is.EqualTo("Capturing frame 3 of 9 at focuser position 12345"));
+            Assert.That(vm.ProgressCurrent, Is.EqualTo(2));
+            Assert.That(vm.ProgressTotal, Is.EqualTo(9));
+        });
+    }
+
+    [Test]
+    public void HandleCaptureProgress_UntaggedReport_Ignored() {
+        // NINA's own camera reports go to its status bar, not to the wizard (ImagingVM drops the IProgress we pass),
+        // so an untagged report must not touch either readout.
+        var vm = NewVM(LoaderReturning(GoodRun()));
+        vm.HandleCaptureProgress(new ApplicationStatus { Source = "Camera", Status = "Exposing", Progress = 2, MaxProgress = 5 });
+        Assert.Multiple(() => {
+            Assert.That(vm.CaptureExposureText, Is.Null);
+            Assert.That(vm.CaptureContextText, Is.Null);
+            Assert.That(vm.HasExposureProgress, Is.False);
+        });
+    }
+
+    [Test]
+    public void HandleCaptureProgress_ExposureCountdown_DrivesExposureBarAndRemaining() {
+        var vm = NewVM(LoaderReturning(GoodRun()));
+        vm.HandleCaptureProgress(new ApplicationStatus {
+            Source = AutoFocusEngine.LiveSweepExposureSource,
+            Progress = 2,
+            MaxProgress = 5
+        });
+        Assert.Multiple(() => {
+            Assert.That(vm.ExposureProgressCurrent, Is.EqualTo(2));
+            Assert.That(vm.ExposureProgressMax, Is.EqualTo(5));
+            Assert.That(vm.HasExposureProgress, Is.True);
+            Assert.That(vm.CaptureExposureText, Is.EqualTo("Exposing, 3s remaining"));
+        });
+    }
+
+    [Test]
+    public async Task Start_Live_MissingSaveFolder_SetsErrorAndDoesNotSweep() {
+        var swept = false;
+        var engine = LiveEngine(_ => { swept = true; return new AutoFocusResult { Succeeded = true, SaveFolder = @"C:\live\attempt" }; });
+        var vm = NewVM(LoaderReturning(GoodRun()), isCameraConnected: () => true, isFocuserConnected: () => true, autoFocusEngine: engine);
+        vm.SourceMode = SourceMode.Live;
+        // No SaveFolderPath chosen.
+
+        await vm.StartAsync(CancellationToken.None);
+
+        Assert.Multiple(() => {
+            Assert.That(vm.ErrorMessage, Does.Contain("save").IgnoreCase);
+            Assert.That(swept, Is.False, "the sweep must not run without a save folder");
+            Assert.That(vm.CurrentStep, Is.Not.EqualTo(WizardStep.Summary));
+        });
+    }
+
+    [Test]
+    public async Task Live_FailedSweep_WithFolder_SurfacesCleanErrorAndDoesNotOptimize() {
+        // A failed/partial sweep can still return a (possibly empty) SaveFolder. The wizard must treat "not
+        // succeeded" as no capture and surface a clean message, not hand a broken folder to the loader.
+        var engine = LiveEngine(_ => new AutoFocusResult { Succeeded = false, SaveFolder = @"C:\live\attempt" });
+        var vm = NewLiveVM(engine);
+
+        await vm.StartAsync(CancellationToken.None);
+
+        Assert.Multiple(() => {
+            Assert.That(vm.CurrentStep, Is.EqualTo(WizardStep.SelectSource));
+            Assert.That(vm.ErrorMessage, Does.Contain("did not produce"));
+        });
+    }
+
+    [Test]
+    public async Task Apply_Live_NonPositiveExposure_DoesNotWriteProfileExposure() {
+        // A non-positive exposure is never actually used by the sweep (it falls back to the profile/filter exposure),
+        // so Accept must not write it back and corrupt the profile's AF exposure.
+        var options = Substitute.For<IStarDetectionOptions>();
+        var profileService = Substitute.For<IProfileService>();
+        var focuserSettings = Substitute.For<IFocuserSettings>();
+        profileService.ActiveProfile.FocuserSettings.Returns(focuserSettings);
+
+        var engine = LiveEngine(_ => new AutoFocusResult { Succeeded = true, SaveFolder = @"C:\live\attempt" });
+        var vm = NewVM(LoaderReturning(GoodRun()), options, profileService, isCameraConnected: () => true, isFocuserConnected: () => true, autoFocusEngine: engine);
+        vm.SourceMode = SourceMode.Live;
+        vm.SaveFolderPath = @"C:\live";
+        vm.LiveExposureSeconds = 0.0;
+
+        await vm.StartAsync(CancellationToken.None);
+        Assert.That(vm.CurrentStep, Is.EqualTo(WizardStep.Summary));
+
+        vm.AcceptCommand.Execute(null);
+
+        focuserSettings.DidNotReceiveWithAnyArgs().AutoFocusExposureTime = default;
+    }
+
+    [Test]
+    public async Task Live_PassesChosenExposureAndSaveFolderToTheSweep() {
+        AutoFocusEngineOptions captured = null;
+        var engine = LiveEngine(ci => {
+            captured = ci.Arg<AutoFocusEngineOptions>();
+            return new AutoFocusResult { Succeeded = true, SaveFolder = @"C:\live\attempt" };
+        });
+        var vm = NewLiveVM(engine);
+        vm.SaveFolderPath = @"D:\sweeps";
+        vm.LiveExposureSeconds = 7.5;
+
+        await vm.StartAsync(CancellationToken.None);
+
+        Assert.That(captured, Is.Not.Null, "the sweep must be invoked");
+        Assert.Multiple(() => {
+            Assert.That(captured.Save, Is.True);
+            Assert.That(captured.SavePath, Is.EqualTo(@"D:\sweeps"));
+            Assert.That(captured.OverrideAutoFocusExposureTime, Is.EqualTo(TimeSpan.FromSeconds(7.5)));
+        });
+    }
+
+    [Test]
+    public void BrowseSaveFolder_SetsSaveFolderPathAndPersistsToOptions() {
+        var afOptions = Substitute.For<IAutoFocusOptions>();
+        var vm = NewVM(LoaderReturning(GoodRun()), autoFocusOptions: afOptions);
+
+        vm.BrowseSaveFolderCommand.Execute(null);
+
+        Assert.That(vm.SaveFolderPath, Is.EqualTo(@"C:\fake\attempt"), "the picked folder is shown");
+        afOptions.Received(1).SavePath = @"C:\fake\attempt";
+    }
+
+    [Test]
+    public async Task SeedGuard_LiveMode_GatesOnSeed_ProceedsWhenDefaultsFindStars() {
+        // Current settings (Baseline) are blind on this run, but the seed (defaults) find stars — a Live sweep must
+        // still be optimizable, because gating on the seed is the whole point of the live path.
+        var engine = LiveEngine(_ => new AutoFocusResult { Succeeded = true, SaveFolder = @"C:\live\attempt" });
+        var vm = NewVM(LoaderReturning(SeedGoodBaselineBlindRun()), isCameraConnected: () => true, isFocuserConnected: () => true, autoFocusEngine: engine);
+        vm.SourceMode = SourceMode.Live;
+        vm.SaveFolderPath = @"C:\live";
+
+        await vm.StartAsync(CancellationToken.None);
+
+        Assert.Multiple(() => {
+            Assert.That(vm.ErrorMessage, Is.Null, "the seed finds stars, so the sweep is optimizable");
+            Assert.That(vm.CurrentStep, Is.EqualTo(WizardStep.Summary));
+        });
+    }
+
+    [Test]
+    public async Task SeedGuard_ReplayMode_GatesOnBaseline_AbortsWhenCurrentSettingsAreBlind() {
+        // The same run under Replay gates on the CURRENT settings (Baseline), which are blind here — so Replay
+        // correctly refuses (its premise is that a saved run already focused at the current settings).
+        var vm = NewVM(LoaderReturning(SeedGoodBaselineBlindRun()));
+        vm.SourcePaths[0] = @"C:\run1";
+
+        await vm.StartAsync(CancellationToken.None);
+
+        Assert.Multiple(() => {
+            Assert.That(vm.CurrentStep, Is.EqualTo(WizardStep.SelectSource));
+            Assert.That(vm.ErrorMessage, Does.Contain("usable focus curve"));
+        });
+    }
+
+    [Test]
+    public async Task Apply_Live_WritesProfileExposureWithAfSettings() {
+        // The single "apply auto-focus settings" toggle (on by default) writes the sweep exposure too.
+        var options = Substitute.For<IStarDetectionOptions>();
+        var profileService = Substitute.For<IProfileService>();
+        var focuserSettings = Substitute.For<IFocuserSettings>();
+        profileService.ActiveProfile.FocuserSettings.Returns(focuserSettings);
+
+        var engine = LiveEngine(_ => new AutoFocusResult { Succeeded = true, SaveFolder = @"C:\live\attempt" });
+        var vm = NewVM(LoaderReturning(GoodRun()), options, profileService, isCameraConnected: () => true, isFocuserConnected: () => true, autoFocusEngine: engine);
+        vm.SourceMode = SourceMode.Live;
+        vm.SaveFolderPath = @"C:\live";
+        vm.LiveExposureSeconds = 9.0;
+
+        await vm.StartAsync(CancellationToken.None);
+        Assert.That(vm.CurrentStep, Is.EqualTo(WizardStep.Summary), "the live sweep should reach the summary");
+
+        vm.AcceptCommand.Execute(null);
+
+        focuserSettings.Received(1).AutoFocusExposureTime = 9.0;
+    }
+
+    [Test]
+    public async Task Apply_Live_ExposureNotWrittenWhenAfSettingsToggleOff() {
+        var options = Substitute.For<IStarDetectionOptions>();
+        var profileService = Substitute.For<IProfileService>();
+        var focuserSettings = Substitute.For<IFocuserSettings>();
+        profileService.ActiveProfile.FocuserSettings.Returns(focuserSettings);
+
+        var engine = LiveEngine(_ => new AutoFocusResult { Succeeded = true, SaveFolder = @"C:\live\attempt" });
+        var vm = NewVM(LoaderReturning(GoodRun()), options, profileService, isCameraConnected: () => true, isFocuserConnected: () => true, autoFocusEngine: engine);
+        vm.SourceMode = SourceMode.Live;
+        vm.SaveFolderPath = @"C:\live";
+        vm.LiveExposureSeconds = 9.0;
+
+        await vm.StartAsync(CancellationToken.None);
+        vm.ApplyRecommendedStepSize = false; // declining the combined toggle skips the exposure too
+
+        vm.AcceptCommand.Execute(null);
+
+        focuserSettings.DidNotReceiveWithAnyArgs().AutoFocusExposureTime = default;
+    }
+
+    [Test]
+    public async Task Apply_Replay_DoesNotWriteProfileExposure() {
+        var options = Substitute.For<IStarDetectionOptions>();
+        var profileService = Substitute.For<IProfileService>();
+        var focuserSettings = Substitute.For<IFocuserSettings>();
+        profileService.ActiveProfile.FocuserSettings.Returns(focuserSettings);
+
+        var vm = NewVM(LoaderReturning(GoodRun()), options, profileService);
+        vm.SourcePaths[0] = @"C:\run1";
+        await vm.StartAsync(CancellationToken.None);
+
+        vm.AcceptCommand.Execute(null);
+
+        Assert.That(vm.CanApplyExposureTime, Is.False, "Replay never chose a sweep exposure, so no exposure row/write-back");
+        focuserSettings.DidNotReceiveWithAnyArgs().AutoFocusExposureTime = default;
+    }
+
+    [Test]
+    public async Task SweepExposureChangeText_ShowsBeforeAfterAndUnchanged() {
+        var profileService = Substitute.For<IProfileService>();
+        var focuserSettings = Substitute.For<IFocuserSettings>();
+        focuserSettings.AutoFocusExposureTime.Returns(5.0);
+        profileService.ActiveProfile.FocuserSettings.Returns(focuserSettings);
+
+        var engine = LiveEngine(_ => new AutoFocusResult { Succeeded = true, SaveFolder = @"C:\live\attempt" });
+        var vm = NewVM(LoaderReturning(GoodRun()), profileService: profileService, isCameraConnected: () => true, isFocuserConnected: () => true, autoFocusEngine: engine);
+        vm.SourceMode = SourceMode.Live;
+        vm.SaveFolderPath = @"C:\live";
+        vm.LiveExposureSeconds = 12.0;
+
+        await vm.StartAsync(CancellationToken.None);
+
+        Assert.Multiple(() => {
+            Assert.That(vm.CanApplyExposureTime, Is.True, "the exposure row shows for a live run");
+            Assert.That(vm.SweepExposureChangeText, Is.EqualTo("5 s → 12 s"));
+        });
+    }
+
+    [Test]
+    public async Task Accept_LiveCurrentVariant_AppliesExposureButKeepsDetectorSettings() {
+        // When the optimizer can't beat the current detector settings the summary defaults to Current. A live run must
+        // still be able to accept just the recommended auto-focus settings (the chosen exposure) without switching to
+        // Optimized (which would swap in detector settings that were no better).
+        var options = Substitute.For<IStarDetectionOptions>();
+        var profileService = Substitute.For<IProfileService>();
+        var focuserSettings = Substitute.For<IFocuserSettings>();
+        profileService.ActiveProfile.FocuserSettings.Returns(focuserSettings);
+
+        var engine = LiveEngine(_ => new AutoFocusResult { Succeeded = true, SaveFolder = @"C:\live\attempt" });
+        var vm = NewVM(LoaderReturning(GoodRun()), options, profileService, isCameraConnected: () => true, isFocuserConnected: () => true, autoFocusEngine: engine);
+        vm.SourceMode = SourceMode.Live;
+        vm.SaveFolderPath = @"C:\live";
+        vm.LiveExposureSeconds = 9.0;
+
+        await vm.StartAsync(CancellationToken.None);
+        vm.SelectedVariant = OptimizationVariant.Current; // keep current detector settings
+
+        Assert.That(vm.AcceptCommand.CanExecute(null), Is.True, "Current can be accepted to apply the exposure");
+        vm.AcceptCommand.Execute(null);
+
+        Assert.Multiple(() => {
+            options.DidNotReceiveWithAnyArgs().ApplyOptimizedSettings(default); // detector settings untouched
+            focuserSettings.Received(1).AutoFocusExposureTime = 9.0;            // the chosen exposure is applied
+        });
+    }
+
+    [Test]
+    public async Task Accept_ReplayCurrentVariant_StaysDisabled() {
+        // Replay's Current variant has nothing to apply (no chosen exposure, step size unchanged), so Accept stays off.
+        var vm = NewVM(LoaderReturning(GoodRun()));
+        vm.SourcePaths[0] = @"C:\run1";
+        await vm.StartAsync(CancellationToken.None);
+
+        vm.SelectedVariant = OptimizationVariant.Current;
+
+        Assert.That(vm.AcceptCommand.CanExecute(null), Is.False);
+    }
+
+    [Test]
+    public async Task CanAccept_LiveCurrentVariant_FollowsApplyAfSettingsToggle() {
+        var engine = LiveEngine(_ => new AutoFocusResult { Succeeded = true, SaveFolder = @"C:\live\attempt" });
+        var profileService = Substitute.For<IProfileService>();
+        var focuserSettings = Substitute.For<IFocuserSettings>();
+        profileService.ActiveProfile.FocuserSettings.Returns(focuserSettings);
+        var vm = NewVM(LoaderReturning(GoodRun()), profileService: profileService, isCameraConnected: () => true, isFocuserConnected: () => true, autoFocusEngine: engine);
+        vm.SourceMode = SourceMode.Live;
+        vm.SaveFolderPath = @"C:\live";
+        vm.LiveExposureSeconds = 9.0;
+
+        await vm.StartAsync(CancellationToken.None);
+        vm.SelectedVariant = OptimizationVariant.Current;
+
+        vm.ApplyRecommendedStepSize = true;
+        Assert.That(vm.AcceptCommand.CanExecute(null), Is.True);
+        vm.ApplyRecommendedStepSize = false;
+        Assert.That(vm.AcceptCommand.CanExecute(null), Is.False, "nothing to apply when the AF-settings toggle is off");
     }
 
     [Test]
@@ -1601,6 +2652,88 @@ public class StarDetectionOptimizerWizardVMTests {
         // Toggling away from Feedback hides the comparison.
         vm.SelectedVariant = OptimizationVariant.Optimized;
         Assert.That(vm.HasStarCountChanges, Is.False, "the comparison only shows on the feedback variant");
+    }
+
+    // ---- Recovery-point partitioning (chart's hollow-marker overlay) -----------------------------------
+
+    private static ScatterErrorPoint Sep(double x, double y = 2.0) => new ScatterErrorPoint(x, y, 0, 0.1);
+
+    [Test]
+    public void PartitionRecoveryPoints_RecoveryOff_AllCore_NoRecovery() {
+        // FrameIsRecovery == null (the baseline / feature-off case) ⇒ every point is core, the overlay is empty.
+        var points = new List<ScatterErrorPoint> { Sep(100), Sep(200), Sep(300) };
+        var eval = new RunEvaluationResult {
+            Points = points,
+            Metrics = new RunEvaluationMetrics {
+                FrameIsRecovery = null,
+                FrameFocuserPositions = new[] { 100, 200, 300 }
+            }
+        };
+
+        var (core, recovery) = StarDetectionOptimizerWizardVM.PartitionRecoveryPoints(eval);
+
+        Assert.Multiple(() => {
+            Assert.That(recovery, Is.Empty, "no recovery data ⇒ empty overlay");
+            Assert.That(core.Select(p => p.X), Is.EquivalentTo(points.Select(p => p.X)), "all points are core");
+            Assert.That(core.Count, Is.EqualTo(points.Count));
+        });
+    }
+
+    [Test]
+    public void PartitionRecoveryPoints_SplitsByRecoveryPosition_PartitionIsExactAndDisjoint() {
+        // Positions 100 and 500 are the far-from-focus recovery extremes; 200/300/400 are core. Two frames share
+        // position 100 (both flagged) to prove distinct-position handling doesn't duplicate the single pooled point.
+        var points = new List<ScatterErrorPoint> { Sep(100), Sep(200), Sep(300), Sep(400), Sep(500) };
+        var eval = new RunEvaluationResult {
+            Points = points,
+            Metrics = new RunEvaluationMetrics {
+                FrameFocuserPositions = new[] { 100, 100, 200, 300, 400, 500 },
+                FrameIsRecovery = new[] { true, true, false, false, false, true }
+            }
+        };
+
+        var (core, recovery) = StarDetectionOptimizerWizardVM.PartitionRecoveryPoints(eval);
+
+        Assert.Multiple(() => {
+            Assert.That(recovery.Select(p => p.X), Is.EquivalentTo(new[] { 100.0, 500.0 }), "recovery positions ⇒ overlay");
+            Assert.That(core.Select(p => p.X), Is.EquivalentTo(new[] { 200.0, 300.0, 400.0 }), "the rest ⇒ main series");
+            // core ∪ recovery == points, with no duplication.
+            Assert.That(core.Count + recovery.Count, Is.EqualTo(points.Count));
+            Assert.That(core.Concat(recovery).Select(p => p.X), Is.EquivalentTo(points.Select(p => p.X)));
+        });
+    }
+
+    [Test]
+    public void PartitionRecoveryPoints_RecoveryPositionAbsentFromPoints_EmptyRecovery() {
+        // Un-weighted-fit case: a recovery position is flagged in the metrics but was EXCLUDED from eval.Points
+        // upstream. It therefore matches no point ⇒ the overlay is empty and every present point is core.
+        var points = new List<ScatterErrorPoint> { Sep(200), Sep(300), Sep(400) };
+        var eval = new RunEvaluationResult {
+            Points = points,
+            Metrics = new RunEvaluationMetrics {
+                FrameFocuserPositions = new[] { 100, 200, 300, 400, 500 },
+                FrameIsRecovery = new[] { true, false, false, false, true } // 100 & 500 flagged but not in Points
+            }
+        };
+
+        var (core, recovery) = StarDetectionOptimizerWizardVM.PartitionRecoveryPoints(eval);
+
+        Assert.Multiple(() => {
+            Assert.That(recovery, Is.Empty, "flagged recovery positions absent from Points ⇒ nothing to overlay");
+            Assert.That(core.Select(p => p.X), Is.EquivalentTo(points.Select(p => p.X)), "all present points are core");
+        });
+    }
+
+    [Test]
+    public void OptimizationCurve_HasRecoveryPoints_TrueOnlyWhenNonEmpty() {
+        var none = new OptimizationCurve { RecoveryPoints = null };
+        var empty = new OptimizationCurve { RecoveryPoints = System.Array.Empty<ScatterErrorPoint>() };
+        var some = new OptimizationCurve { RecoveryPoints = new[] { Sep(100) } };
+        Assert.Multiple(() => {
+            Assert.That(none.HasRecoveryPoints, Is.False, "null ⇒ no overlay/caption");
+            Assert.That(empty.HasRecoveryPoints, Is.False, "empty ⇒ no overlay/caption");
+            Assert.That(some.HasRecoveryPoints, Is.True, "non-empty ⇒ overlay/caption shown");
+        });
     }
 
 }

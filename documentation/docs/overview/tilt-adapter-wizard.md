@@ -4,7 +4,9 @@ A measured tilt plane tells you which corners need to move and by how much, but 
 the sensor along that screw's own axis. To convert the [Tilt & Aberration
 Inspector](tilt-aberration-inspector.md) measurement into a concrete instruction (*"turn this screw
 clockwise ¼ turn"*), the wizard must know where each screw sits relative to the sensor and how far a
-turn moves it. That mapping is established once by the **Tilt Adapter Wizard**.
+turn moves it. That mapping is established once by the **Tilt Adapter Wizard**. (To practice the
+measure-and-correct loop before working on real hardware, see the
+[Camera Simulator](camera-simulator.md#rehearse-a-tilt-calibration-in-the-daytime).)
 
 ![The Tilt Adapter Guidance table giving the direction and number of turns for each screw](../assets/screenshots/inspector-tilt-guidance.png){ width=620 }
 
@@ -46,12 +48,14 @@ The wizard establishes the screw-to-tilt mapping empirically. The default run is
 a known amount of motion, worded as clockwise/counter-clockwise (tighten/loosen) turns for screws
 (e.g., "Turn screw 1 CLOCKWISE exactly 1 full turn") and as signed +/− steps for stepper adapters;
 every step ends with a measurement. From the change in the tilt vector \((\Delta A, \Delta B)\) it
-computes each screw's angle.
+computes each screw's angle. With a connected [motorized
+adapter](motorized-tilt-adapter.md#hands-off-calibration), the wizard sends these moves itself
+instead of prompting for them.
 
 The four-step run does not measure which way a clockwise turn moves the adapter. That direction
-comes from the adapter direction setting in the wizard's **Measurement** section, labeled **Turning
-screws clockwise moves the adapter** (or **Applying + steps moves the adapter** for steppers):
-either **Toward the camera — outward** (the default) or **Toward the objective — inward**. Until it
+comes from the adapter direction setting in the wizard's **Measurement** section, labeled **Screw ⟳
+moves adapter** (or **+ steps move adapter** for steppers):
+either **Toward the camera** (outward, the default) or **Toward the objective** (inward). Until it
 is measured, guidance marks the direction "(assumed)". To measure it, turn on **Measure direction**:
 this adds two steps (an all-screws-clockwise move plus a return to baseline) that determine the sign
 of the effect (`ScrewInwardCurvatureSign`) from the curvature change, and the saved calibration then
@@ -62,18 +66,17 @@ flags inconsistent repeats so you can re-run.
 
 *The Measurement section configures each calibration sweep and sets which way a clockwise turn moves the adapter.*
 
-!!! tip "Each calibration step runs a full inspector sweep"
-    A calibration measurement is a full sensor-model sweep, so it runs the same alignment and
-    focus-centering steps as a standalone Detailed Analysis. **Center Focuser First** (off by
-    default) re-centers the focuser at best focus before each step's sweep, so the measurement is not
-    skewed toward one side of focus. **Signal Amplification** gives each step more, finer-spaced
-    focus points for a steadier per-star fit. Both are editable in the wizard's **Measurement**
-    section (they are the same settings as the [Inspector
-    options](tilt-aberration-inspector.md#inspector-options)), which also shows a live estimate of the
-    images each sweep captures and the total for the whole calibration. For a heavily-defocused frame
-    that would otherwise fail to register, the frame aligner escalates its search rather than dropping
-    the frame from that step's model. These help most on faint fields or in poor seeing. Raising
-    **Measurements to average** above 1 averages independent repeats on top of them.
+A calibration measurement is a full sensor-model sweep, so it runs the same alignment and
+focus-centering steps as a standalone Detailed Analysis. **Center Focuser First** (off by default)
+re-centers the focuser at best focus before each step's sweep, so the measurement is not skewed
+toward one side of focus. **Signal Amplification** gives each step more, finer-spaced focus points
+for a steadier per-star fit. Both settings help most on faint fields or in poor seeing, and both are
+editable in the wizard's **Measurement** section (they are the same settings as the [Inspector
+options](tilt-aberration-inspector.md#inspector-options)), which also shows a live estimate of the
+images each sweep captures and the total for the whole calibration. Heavily-defocused frames that
+would otherwise fail to register are not dropped from a step's model: the frame aligner escalates
+its search instead (see [cross-frame
+registration](sensor-model.md#from-stars-to-data-points)).
 
 !!! note "Set Focuser Step Size for the best guidance"
     Per its tooltip, *Focuser Step Size* is "how much the focuser moves per step, in microns.
@@ -113,7 +116,7 @@ adapter direction setting, so guidance stays marked "(assumed)" until a **Measur
 verifies it. The entered angle is interpreted with the adapter direction setting in effect when you
 click **Apply**; if you change that setting later, click **Apply** again. If guidance moves the
 tilt the wrong way after a manual entry, the numbering direction is flipped: switch it and Apply
-again. A wrong adapter direction setting inverts guidance the same way — correct that setting and
+again. A wrong adapter direction setting inverts guidance the same way; correct that setting and
 click **Apply** again.
 
 ## Hardware model and device presets
@@ -141,10 +144,17 @@ built-in presets are:
 | ASG Electronic EAT - 90mm | Stepper Motors | 4 | — | 1.8 | 55 |
 | ASG Photon Cage - ZWO 461 | Screws | 4 | 212 | — | 54 |
 | ASG Electronic EAT - ZWO 461 | Stepper Motors | 4 | — | 1.8 | 62.75 |
+| OGMA Z'Tilter - 3-point configuration | Screws | 3 | 450 | — | 48.9 |
+| OGMA Z'Tilter - 4-point configuration | Screws | 4 | 450 | — | 48.9 |
+| OGMA O'Tilter | Screws | 3 | 450 | — | 43.25 |
+| OGMA +Tilter / OAG Pro - 3-point configuration | Screws | 3 | 450 | — | 40 |
+| OGMA +Tilter / OAG Pro - 4-point configuration | Screws | 4 | 450 | — | 40 |
 
 The ASG Photon Cage adjusters are 120 TPI, which is 211.7 µm per full turn (the manufacturer rounds
 this to ~212). For the motorized EAT units the Screw Radius column is the radius of the motors from
-the sensor center.
+the sensor center. The two **ASG Electronic EAT** presets are motorized: the wizard can connect to
+the adapter over a serial port, run the calibration hands-off, and let the inspector apply
+corrections automatically. See [Motorized Tilt Adapter](motorized-tilt-adapter.md).
 
 **Not in the list?** Pick the **"Manual"** entry. It leaves every hardware field editable, so you can
 enter your adapter's adjustment type, screw count, thread pitch (or stepper step size), and screw
