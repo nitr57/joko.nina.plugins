@@ -83,7 +83,7 @@ All tooltips below are quoted verbatim from the plugin UI.
 | **Reduced χ² Rejection Threshold** | 5.0 | 0–1000 (0 disables) | "Upper bound on the hyperbolic fit's reduced χ² (χ² per degree of freedom) above which the run is rejected, when the rejection criterion is set to Reduced χ². … Treat this threshold as a coarse sanity bound rather than a calibrated statistical test. Set to 0 to disable. Meaningful only with weighted fits." |
 | **R² Rejection Threshold** | from NINA | 0–1 | "The minimum R² (coefficient of determination) below which an auto-focus run is rejected, when the rejection criterion is set to R². This is NINA's own R² threshold from the Focuser settings; editing it here changes that same profile setting. R² closer to 1 indicates a better fit to the measured focus curve." |
 | **Max Outlier Rejections** | 1 | ≥ 0 | "Controls the maximum number of points that can be rejected as outliers during Auto Focus curve fitting." |
-| **Outlier Rejection Confidence** | 0.90 | > 0.5, < 1.0 | "Confidence level for a two-tailed Grubbs statistical test of outliers to use during Auto Focus curve fitting. 0.90 is a reasonable default." |
+| **Outlier Rejection Confidence** (entered as a percentage) | 0.95 | > 0.5, < 1.0 | "Confidence level for a two-tailed Grubbs statistical test of outliers to use during Auto Focus curve fitting. 95% is a reasonable default. Must be above 50% and below 100%." |
 | **Save** | Off | — | "Saves details about every Auto Focus run, including a copy of the image, the star detection results, and the stretched annotated image" |
 | **Save Path** | (empty) | folder | "The folder to save Auto Focus runs" |
 | **Focuser Offset** | 0 | any | "Advanced Only! Moves the focuser this fixed amount at the end of an AutoFocus" |
@@ -92,6 +92,25 @@ All tooltips below are quoted verbatim from the plugin UI.
     - Leave **Weighted Hyperbolic Fit** on and **Hyperbolic Fit Model** set to **Hybrid (Best Fit)**. Those are the defaults, and they let each run pick its most reliable model and discount noisy points; only the reduced-\(\chi^2\) gate depends on the weighting being enabled.
     - Set **Max Concurrency** to a non-zero cap only if frame processing is starving memory or CPU on a slow machine; leave it at 0 (no limit) otherwise.
     - Set a non-zero **Focuser Offset** only for a measured, repeatable focus bias in your train. It is an advanced-only fixed nudge applied after the calculated position.
+
+## Binning during autofocus
+
+Two separate settings decide how many pixels an autofocus frame is measured on.
+
+**NINA's Auto Focus Binning** (Options → Focuser, and per filter in the filter wheel settings) changes the
+capture: the camera returns a smaller frame with larger pixels. Set it to the binning you image at, so focus
+is found for the frames you actually shoot. Hocus Focus reads it back from the frame's metadata to compute
+pixel scale.
+
+**Hocus Focus Detection Binning** (Star Detector tab, default **1x1**) does not touch the capture. It
+resamples the frame for star detection only, to bring star sizes into the range the detector is tuned for,
+and every HFR it reports comes back in the captured frame's pixels. It never changes itself: a line under the
+setting recommends a factor from your last measured in-focus HFR, and you choose. See
+[Detection Binning](../settings/detection-binning.md).
+
+The two multiply. If you raise Detection Binning while Auto Focus Binning is above 1x1, Hocus Focus explains
+the difference and offers to set the NINA setting back to 1x1. The recommendation already accounts for camera
+binning, so it backs off on its own when the camera is already binning.
 
 ## How it uses the star detector
 
