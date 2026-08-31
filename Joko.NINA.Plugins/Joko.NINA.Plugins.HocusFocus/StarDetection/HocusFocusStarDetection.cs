@@ -224,8 +224,23 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection {
 
         public bool StarContaminationSuspected { get; set; }
 
+        /// <summary>
+        /// INFORMATIONAL ONLY, carried straight through from <see cref="Star.MeasuredSensitivity"/> by
+        /// <see cref="ToDetectedStar"/> — the exact scalar the Sensitivity gate compared this star against.
+        /// NaN for any star not produced by that projection (e.g. hand-built in tests), and — in production, not
+        /// just tests — for any star reloaded from a PRE-this-change saved detection cache: this type round-trips
+        /// through <c>StarDetectionResultCacheSerializer</c> to <c>&lt;image&gt;_star_detection_result.json</c>, and
+        /// <c>AutoFocusEngine.TryLoadValidCachedDetection</c> (AutoFocus/AutoFocusEngine.cs, ~:1166 the deserialize
+        /// call, ~:1178 the version check) accepts any cache file whose <c>DetectorVersion</c> matches the current
+        /// <c>StarDetector.StarDetectorVersion</c> — which this change deliberately did NOT bump (no detection
+        /// output changed), so an old cache file written before this field existed still passes that check and
+        /// reloads with this property defaulting to NaN. This is the lossy boundary the optimizer's path goes
+        /// through (<c>DetectedStar</c> has no such field), so it must be re-declared here rather than inherited.
+        /// </summary>
+        public double MeasuredSensitivity { get; set; } = double.NaN;
+
         public override string ToString() {
-            return $"{{{nameof(PSF)}={PSF}, {nameof(HFR)}={HFR.ToString()}, {nameof(Position)}={Position.ToString()}, {nameof(AverageBrightness)}={AverageBrightness.ToString()}, {nameof(MaxBrightness)}={MaxBrightness.ToString()}, {nameof(Background)}={Background.ToString()}, {nameof(BoundingBox)}={BoundingBox.ToString()}, {nameof(StarContaminationSuspected)}={StarContaminationSuspected.ToString()}}}";
+            return $"{{{nameof(PSF)}={PSF}, {nameof(HFR)}={HFR.ToString()}, {nameof(Position)}={Position.ToString()}, {nameof(AverageBrightness)}={AverageBrightness.ToString()}, {nameof(MaxBrightness)}={MaxBrightness.ToString()}, {nameof(Background)}={Background.ToString()}, {nameof(BoundingBox)}={BoundingBox.ToString()}, {nameof(StarContaminationSuspected)}={StarContaminationSuspected.ToString()}, {nameof(MeasuredSensitivity)}={MeasuredSensitivity.ToString()}}}";
         }
     }
 
@@ -392,13 +407,16 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection {
         }
 
         /// <summary>
-        /// The "fully-default" detector params — the analogue of <see cref="BuildStarDetectorParams"/> for an
-        /// options object at <c>StarDetectionOptions.ResetDefaults()</c>. Every option-derived field is at its
-        /// documented default. Used as the Optimization Wizard's seed so the search starts from a clean,
-        /// reproducible point regardless of the user's current settings. Image-dependent fields (PixelScale,
-        /// Region) and the auto-focus overrides are layered on by <see cref="GetDefaultStarDetectorParams"/>.
-        /// The literals here are kept in lockstep with ResetDefaults by
-        /// StarDetectionOptionsTests.BuildDefaultStarDetectorParams_MatchesResetDefaultsBuild.
+        /// The "fully-default" detector params — the analogue of <see cref="BuildStarDetectorParams"/> for a
+        /// freshly constructed <c>StarDetectionOptions</c> over a blank accessor. Used as the Optimization
+        /// Wizard's seed so the search starts from a clean, reproducible point regardless of the user's current
+        /// settings. Image-dependent fields (PixelScale, Region) and the auto-focus overrides are layered on by
+        /// <see cref="GetDefaultStarDetectorParams"/>. The literals here are kept in lockstep with what a
+        /// construction produces by
+        /// StarDetectionOptionsTests.BuildDefaultStarDetectorParams_MatchesConstructedOptionsBuild — which
+        /// carries exactly one named exception, <c>NoiseReductionRadius</c> (F70): the literal below is the
+        /// Typical preset's PRE-compensation base, while a constructed object holds that base plus the +1
+        /// hotpixel compensation of <c>StarDetectionOptions.DerivePresetSettings</c>.
         /// </summary>
         internal static StarDetectorParams BuildDefaultStarDetectorParams() {
             return new StarDetectorParams() {
@@ -424,7 +442,7 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection {
                 DefocusDistortionMinFactor = 0.25,
                 DefocusCenteringToleranceFactor = 2.0,
                 // Donut master + knobs at their ResetDefaults values (master OFF ⇒ inert). Kept in lockstep with
-                // StarDetectionOptions.ResetDefaults by BuildDefaultStarDetectorParams_MatchesResetDefaultsBuild.
+                // StarDetectionOptions.ResetDefaults by BuildDefaultStarDetectorParams_MatchesConstructedOptionsBuild.
                 DefocusAwareDonutDetection = false,
                 DonutMorphCloseSize = 5,
                 LocallyAdaptiveBinarization = true,   // default ON (AF-bank validated)
@@ -451,7 +469,7 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection {
                 PSFPixelIntegration = false,
                 MaxStarEvaluationParallelism = 0,
                 // Matches StarDetectionOptions.ResetDefaults (Median); kept in lockstep by
-                // BuildDefaultStarDetectorParams_MatchesResetDefaultsBuild.
+                // BuildDefaultStarDetectorParams_MatchesConstructedOptionsBuild.
                 MeasurementAverage = MeasurementAverageEnum.Median
             };
         }
@@ -813,7 +831,8 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection {
                 Background = star.Background,
                 BoundingBox = star.StarBoundingBox.ToDrawingRectangle(),
                 PSF = star.PSF,
-                StarContaminationSuspected = star.StarContaminationSuspected
+                StarContaminationSuspected = star.StarContaminationSuspected,
+                MeasuredSensitivity = star.MeasuredSensitivity
             };
         }
 

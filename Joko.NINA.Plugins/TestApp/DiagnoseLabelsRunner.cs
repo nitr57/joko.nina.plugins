@@ -137,11 +137,11 @@ namespace TestApp {
             }
             Line($"Profile: {activeProfile.Name} ({activeProfile.Id})");
 
-            var guid = PluginOptionsAccessor.GetAssemblyGuid(typeof(StarDetectionOptions));
-            if (guid == null) {
-                throw new InvalidOperationException("Could not resolve the HocusFocus plugin assembly GUID");
-            }
-            var accessor = new PluginOptionsAccessor(profileService, guid.Value);
+            // Detector settings come from the harness's LOCAL settings file, not the NINA profile: a
+            // profile-sourced value is mutable machine state nothing records, and the ACTIVE profile can
+            // even be a different telescope between runs. See HarnessSettingsStore.
+            var harnessSettings = HarnessSettingsStore.Resolve(args, profileService, activeProfile);
+            var accessor = harnessSettings.Accessor;
             var starDetectionOptions = new StarDetectionOptions(profileService, accessor);
 
             var discovered = DiscoverRuns(runsDir);
@@ -286,13 +286,15 @@ namespace TestApp {
                         continue;
                     }
 
-                    // Fresh detection of this frame (Detect mutates its input; clone the loaded Mat). Uses the rich
-                    // per-rejected-candidate records (gate + measured value), so the counter-only gates are attributed.
+                    // Fresh detection of this frame from the IRenderedImage, so the label attribution is made against
+                    // the SAME image the live app detects on (the CFA hotpixel filter + debayer run inside Detect at
+                    // these params). Uses the rich per-rejected-candidate records (gate + measured value), so the
+                    // counter-only gates are attributed.
                     List<Star> accepted;
                     IReadOnlyList<RejectedCandidateRecord> rejectedRecords;
-                    using (var mat = DiagnosticUtil.LoadFloatMat(framePath, profileService).GetAwaiter().GetResult())
-                    using (var clone = mat.Clone()) {
-                        var result = detector.Detect(clone, detectionParams, null, CancellationToken.None).GetAwaiter().GetResult();
+                    {
+                        var rendered = DiagnosticUtil.LoadRenderedImage(framePath, profileService).GetAwaiter().GetResult();
+                        var result = detector.Detect(rendered, detectionParams, null, CancellationToken.None).GetAwaiter().GetResult();
                         accepted = result.DetectedStars ?? new List<Star>();
                         rejectedRecords = result.RejectedCandidates ?? new List<RejectedCandidateRecord>();
                     }
@@ -409,7 +411,7 @@ namespace TestApp {
             Console.Error.WriteLine("  --defocus-min-factor <0..1> (with --defocus-distortion) override the floor multiplier on MaxDistortion (default 0.25).");
             Console.Error.WriteLine("  --defocus-center-factor <>=1> (with --defocus-centering) override the max multiplier on StarCenterTolerance (default 2.0).");
             Console.Error.WriteLine("  --defocus-structure         (opt-in test switch) flips DefocusAwareStructure ON (EARLY-stage: coarser large-structure removal so donut/defocused stars form candidates).");
-            Console.Error.WriteLine("  --structure-boost <0..6>    (with --defocus-structure) extra wavelet layers for large-structure removal (default 2; 0 ⇒ bit-identical control).");
+            Console.Error.WriteLine("  --structure-boost <0..6>    (with --defocus-structure) extra wavelet layers for large-structure removal (default 2; 0 => bit-identical control).");
             Console.Error.WriteLine("  --structure-layers <n>      (diagnostic) override nominal StructureLayers (e.g. 4 for the factory baseline), independent of the profile.");
         }
 

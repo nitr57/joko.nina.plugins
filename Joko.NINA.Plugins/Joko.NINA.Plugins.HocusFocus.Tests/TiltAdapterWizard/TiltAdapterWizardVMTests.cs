@@ -1,4 +1,4 @@
-using CommunityToolkit.Mvvm.Input;
+﻿using CommunityToolkit.Mvvm.Input;
 using NINA.Core.Interfaces;
 using NINA.Core.Utility.SerialCommunication;
 using NINA.Equipment.Equipment.MyCamera;
@@ -12,6 +12,7 @@ using NINA.Joko.Plugins.HocusFocus.CameraSimulator;
 using NINA.Joko.Plugins.HocusFocus.Interfaces;
 using NINA.Joko.Plugins.HocusFocus.TiltAdapterDevices;
 using NINA.Joko.Plugins.HocusFocus.TiltAdapterDevices.AsgEat;
+using NINA.Joko.Plugins.HocusFocus.TiltAdapterDevices.Manual;
 using NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard;
 using NINA.Joko.Plugins.HocusFocus.Tests.TestDoubles;
 using NINA.Joko.Plugins.HocusFocus.Utility;
@@ -36,7 +37,7 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
     [Apartment(System.Threading.ApartmentState.STA)]
     public class TiltAdapterWizardVMTests {
 
-        private static InspectorVM BuildInspector() {
+        private static InspectorVM BuildInspector(IInspectorOptions inspectorOptions = null) {
             return new InspectorVM(
                 profileService: Substitute.For<IProfileService>(),
                 applicationStatusMediator: Substitute.For<IApplicationStatusMediator>(),
@@ -47,7 +48,7 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
                 telescopeMediator: Substitute.For<ITelescopeMediator>(),
                 starDetectionOptions: Substitute.For<IStarDetectionOptions>(),
                 starAnnotatorOptions: Substitute.For<IStarAnnotatorOptions>(),
-                inspectorOptions: Substitute.For<IInspectorOptions>(),
+                inspectorOptions: inspectorOptions ?? Substitute.For<IInspectorOptions>(),
                 autoFocusOptions: Substitute.For<IAutoFocusOptions>(),
                 autoFocusEngineFactory: Substitute.For<IAutoFocusEngineFactory>(),
                 imageDataFactory: Substitute.For<IImageDataFactory>(),
@@ -61,7 +62,8 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
         private static (TiltAdapterWizardVM vm, ITiltAdapterOptions options, ICameraMediator camera, IFocuserMediator focuser) Build(
             int screwCount = 3, IApplicationDispatcher dispatcher = null, System.Action<ITiltAdapterOptions> configureOptions = null,
             IProfileService profileService = null, TiltDeviceConnectionService tiltDeviceService = null,
-            ISerialPortProvider serialPortProvider = null, Func<Task<bool>> confirmIdleDisconnectAsync = null) {
+            ISerialPortProvider serialPortProvider = null, Func<Task<bool>> confirmIdleDisconnectAsync = null,
+            IInspectorOptions inspectorOptions = null) {
             profileService ??= Substitute.For<IProfileService>();
             var camera = Substitute.For<ICameraMediator>();
             var focuser = Substitute.For<IFocuserMediator>();
@@ -69,7 +71,7 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
             options.ScrewCount.Returns(screwCount);
             options.MeasurementAverageCount.Returns(1);
             configureOptions?.Invoke(options);
-            var inspector = BuildInspector();
+            var inspector = BuildInspector(inspectorOptions);
             var vm = new TiltAdapterWizardVM(
                 profileService: profileService,
                 applicationStatusMediator: Substitute.For<IApplicationStatusMediator>(),
@@ -79,9 +81,35 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
                 applicationDispatcher: dispatcher ?? new SynchronousApplicationDispatcher(),
                 tiltAdapterOptions: options,
                 tiltDeviceConnectionService: tiltDeviceService,
-                serialPortProvider: serialPortProvider,
-                confirmIdleDisconnectAsync: confirmIdleDisconnectAsync);
+                serialPortProvider: serialPortProvider);
             return (vm, options, camera, focuser);
+        }
+
+        // A saved, valid calibration on a motorized preset — the state the Trust banner is about.
+        // "ASG Electronic EAT - 90mm" is a real registered preset name; TiltMotionControllerRegistry.IsMotorized
+        // does an exact-name lookup, so an invented name would silently make every banner test pass vacuously.
+        private const string MotorizedPreset = "ASG Electronic EAT - 90mm";
+
+        // 4 screws, not 3: the ctor's re-lock-on-load ApplyDevice writes the motorized preset's own ScrewCount
+        // (4) onto the substitute -- and an NSubstitute property SET does feed its getter -- so a 3-screw stub
+        // would leave ScrewCount(4) != CalibratedScrewCount(3) and IsCalibrationValid false, silently hiding
+        // the banner for a reason that has nothing to do with automation trust.
+        //
+        // manual defaults TRUE because the Trust banner is about a HAND-ENTERED calibration specifically; pass
+        // false for the device-driven/replay states that also lack the automation markers but must NOT be
+        // offered a Trust button.
+        private static (TiltAdapterWizardVM vm, ITiltAdapterOptions options) BuildCalibrated(
+            string deviceName = MotorizedPreset, string linkedDevice = "", bool reliable = false,
+            bool manual = true, IProfileService profileService = null) {
+            var (vm, options, _, _) = Build(screwCount: 4, profileService: profileService, configureOptions: o => {
+                o.DeviceName.Returns(deviceName);
+                o.IsCalibrated.Returns(true);
+                o.CalibratedScrewCount.Returns(4);
+                o.CalibrationIsManual.Returns(manual);
+                o.DeviceLinkedCalibrationDeviceName.Returns(linkedDevice);
+                o.CalibrationIsReliable.Returns(reliable);
+            });
+            return (vm, options);
         }
 
         // --- Motorized device connection pane (T10) test rig -------------------------------------------------
@@ -108,8 +136,7 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
         // seam: no interface extraction or virtuals on the service, production wiring untouched.
         private static (TiltAdapterWizardVM vm, ITiltAdapterOptions options, TiltDeviceConnectionService service,
             ITiltMotionController controller, FakeTiltDeviceTimeSource time, List<string> requestedPresets)
-            BuildMotorized(string deviceName = "ASG Electronic EAT - 90mm",
-                Func<Task<bool>> confirmIdleDisconnectAsync = null, TiltDevicePositions polledPositions = null,
+            BuildMotorized(string deviceName = "ASG Electronic EAT - 90mm", TiltDevicePositions polledPositions = null,
                 ICameraSimulatorOptions cameraSimulatorOptions = null,
                 Func<string, string, Task<bool>> confirmSimConfigChangeAsync = null) {
             var profile = Substitute.For<IProfileService>();
@@ -143,7 +170,6 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
                 tiltAdapterOptions: options,
                 tiltDeviceConnectionService: service,
                 serialPortProvider: ports,
-                confirmIdleDisconnectAsync: confirmIdleDisconnectAsync,
                 cameraSimulatorOptions: cameraSimulatorOptions,
                 confirmSimConfigChangeAsync: confirmSimConfigChangeAsync);
             return (vm, options, service, controller, time, requestedPresets);
@@ -538,6 +564,7 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
                 Assert.That(TiltAdapterWizardVM.StepIsAtBaseline(WizardStep.ReBaseline1), Is.True);
                 Assert.That(TiltAdapterWizardVM.StepIsAtBaseline(WizardStep.ReBaseline2), Is.True);
                 Assert.That(TiltAdapterWizardVM.StepIsAtBaseline(WizardStep.Complete), Is.True);
+                Assert.That(TiltAdapterWizardVM.StepIsAtBaseline(WizardStep.ReBaseline3), Is.True);
                 Assert.That(TiltAdapterWizardVM.StepIsAtBaseline(WizardStep.AllInward), Is.False);
                 Assert.That(TiltAdapterWizardVM.StepIsAtBaseline(WizardStep.Screw1), Is.False);
                 Assert.That(TiltAdapterWizardVM.StepIsAtBaseline(WizardStep.Screw2), Is.False);
@@ -549,18 +576,18 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
             // 3-screw: undo only the moved screw (CW/CCW vocabulary — never "inward/outward").
             Assert.Multiple(() => {
                 Assert.That(TiltAdapterWizardVM.BaselineRecoveryText(WizardStep.AllInward, 3, false, 1.0), Does.Contain("ALL screws back COUNTER-CLOCKWISE"));
-                Assert.That(TiltAdapterWizardVM.BaselineRecoveryText(WizardStep.Screw1, 3, false, 1.0), Does.Contain("screw 1 back COUNTER-CLOCKWISE"));
-                Assert.That(TiltAdapterWizardVM.BaselineRecoveryText(WizardStep.Screw2, 3, false, 1.0), Does.Contain("screw 2 back COUNTER-CLOCKWISE"));
+                Assert.That(TiltAdapterWizardVM.BaselineRecoveryText(WizardStep.Screw1, 3, false, 1.0), Does.Contain("Screw 1 back COUNTER-CLOCKWISE"));
+                Assert.That(TiltAdapterWizardVM.BaselineRecoveryText(WizardStep.Screw2, 3, false, 1.0), Does.Contain("Screw 2 back COUNTER-CLOCKWISE"));
             });
             // 4-screw: the opposing screw is undone too.
             Assert.Multiple(() => {
-                Assert.That(TiltAdapterWizardVM.BaselineRecoveryText(WizardStep.Screw1, 4, false, 1.0), Does.Contain("screw 3 back CLOCKWISE"));
-                Assert.That(TiltAdapterWizardVM.BaselineRecoveryText(WizardStep.Screw2, 4, false, 1.0), Does.Contain("screw 4 back CLOCKWISE"));
+                Assert.That(TiltAdapterWizardVM.BaselineRecoveryText(WizardStep.Screw1, 4, false, 1.0), Does.Contain("Screw 3 back CLOCKWISE"));
+                Assert.That(TiltAdapterWizardVM.BaselineRecoveryText(WizardStep.Screw2, 4, false, 1.0), Does.Contain("Screw 4 back CLOCKWISE"));
             });
             // Steppers: signed steps (U+2212 minus for undo).
             Assert.Multiple(() => {
                 Assert.That(TiltAdapterWizardVM.BaselineRecoveryText(WizardStep.AllInward, 3, true, 2.0), Does.Contain("−2 steps to every motor"));
-                Assert.That(TiltAdapterWizardVM.BaselineRecoveryText(WizardStep.Screw1, 4, true, 2.0), Does.Contain("−2 steps to motor 1").And.Contain("+2 steps to motor 3"));
+                Assert.That(TiltAdapterWizardVM.BaselineRecoveryText(WizardStep.Screw1, 4, true, 2.0), Does.Contain("−2 steps to Screw 1").And.Contain("+2 steps to Screw 3"));
             });
         }
 
@@ -578,11 +605,24 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
         [Test]
         public void GetMeasurementSteps_FourStepFlowSkipsCurvatureSteps() {
             Assert.Multiple(() => {
-                Assert.That(TiltAdapterWizardVM.GetMeasurementSteps(measureCurvature: true), Is.EqualTo(new[] {
+                Assert.That(TiltAdapterWizardVM.GetMeasurementSteps(measureCurvature: true, measureFinalRebaseline: false), Is.EqualTo(new[] {
                     WizardStep.Baseline, WizardStep.AllInward, WizardStep.ReBaseline1,
                     WizardStep.Screw1, WizardStep.ReBaseline2, WizardStep.Screw2 }));
-                Assert.That(TiltAdapterWizardVM.GetMeasurementSteps(measureCurvature: false), Is.EqualTo(new[] {
+                Assert.That(TiltAdapterWizardVM.GetMeasurementSteps(measureCurvature: false, measureFinalRebaseline: false), Is.EqualTo(new[] {
                     WizardStep.Baseline, WizardStep.Screw1, WizardStep.ReBaseline2, WizardStep.Screw2 }));
+            });
+        }
+
+        // --- Task 6: optional measured final re-baseline appended to either base flow ---
+
+        [Test]
+        public void GetMeasurementSteps_WithFinalRebaseline_AppendsReBaseline3AsTheLastStep() {
+            Assert.Multiple(() => {
+                Assert.That(TiltAdapterWizardVM.GetMeasurementSteps(measureCurvature: true, measureFinalRebaseline: true), Is.EqualTo(new[] {
+                    WizardStep.Baseline, WizardStep.AllInward, WizardStep.ReBaseline1,
+                    WizardStep.Screw1, WizardStep.ReBaseline2, WizardStep.Screw2, WizardStep.ReBaseline3 }));
+                Assert.That(TiltAdapterWizardVM.GetMeasurementSteps(measureCurvature: false, measureFinalRebaseline: true), Is.EqualTo(new[] {
+                    WizardStep.Baseline, WizardStep.Screw1, WizardStep.ReBaseline2, WizardStep.Screw2, WizardStep.ReBaseline3 }));
             });
         }
 
@@ -596,9 +636,15 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
                 Assert.That(TiltAdapterWizardVM.StepInstructionsText(WizardStep.ReBaseline1, 3, false, 1.0),
                     Does.Contain("COUNTER-CLOCKWISE (loosen) exactly 1 full turn"));
                 Assert.That(TiltAdapterWizardVM.StepInstructionsText(WizardStep.Screw1, 4, false, 1.0),
-                    Does.Contain("screw 1 CLOCKWISE").And.Contain("screw 3 COUNTER-CLOCKWISE"));
+                    Does.Contain("Screw 1 CLOCKWISE").And.Contain("Screw 3 COUNTER-CLOCKWISE"));
                 Assert.That(TiltAdapterWizardVM.StepInstructionsText(WizardStep.Screw2, 3, false, 1.5),
-                    Does.Contain("screw 2 CLOCKWISE exactly 1.5 turns"));
+                    Does.Contain("Screw 2 CLOCKWISE exactly 1.5 turns"));
+                // Task 6: the optional measured final re-baseline undoes screw 2's move (motor/screw 2 and,
+                // 4-screw, its opposite motor/screw 4) -- same shape as ReBaseline2's undo of screw 1, mirrored.
+                Assert.That(TiltAdapterWizardVM.StepInstructionsText(WizardStep.ReBaseline3, 3, false, 1.0),
+                    Does.Contain("Screw 2 back COUNTER-CLOCKWISE").And.Contain("returning to the baseline position"));
+                Assert.That(TiltAdapterWizardVM.StepInstructionsText(WizardStep.ReBaseline3, 4, false, 1.0),
+                    Does.Contain("Screw 2 back COUNTER-CLOCKWISE").And.Contain("Screw 4 back CLOCKWISE"));
             });
         }
 
@@ -608,21 +654,115 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
                 Assert.That(TiltAdapterWizardVM.StepInstructionsText(WizardStep.AllInward, 3, isStepper: true, appliedAmount: 2.0),
                     Does.Contain("+2 steps to EVERY motor"));
                 Assert.That(TiltAdapterWizardVM.StepInstructionsText(WizardStep.ReBaseline2, 3, true, 2.0),
-                    Does.Contain("−2 steps to motor 1"));
+                    Does.Contain("−2 steps to Screw 1"));
                 Assert.That(TiltAdapterWizardVM.StepInstructionsText(WizardStep.Screw1, 4, true, 2.0),
-                    Does.Contain("+2 steps to motor 1").And.Contain("−2 steps to motor 3"));
+                    Does.Contain("+2 steps to Screw 1").And.Contain("−2 steps to Screw 3"));
+                // Task 6: stepper wording for the optional measured final re-baseline (motor 2 / motor 4).
+                Assert.That(TiltAdapterWizardVM.StepInstructionsText(WizardStep.ReBaseline3, 4, true, 2.0),
+                    Does.Contain("−2 steps to Screw 2").And.Contain("+2 steps to Screw 4"));
+                Assert.That(TiltAdapterWizardVM.StepInstructionsText(WizardStep.ReBaseline3, 3, true, 2.0),
+                    Does.Contain("−2 steps to Screw 2").And.Not.Contain("Screw 4"));
             });
         }
 
-        [TestCase(WizardStep.Baseline, "Baseline Measurement")]
-        [TestCase(WizardStep.AllInward, "All Screws Inward")]
-        [TestCase(WizardStep.ReBaseline1, "Return to Baseline")]
-        [TestCase(WizardStep.Screw1, "Move Screw 1")]
-        [TestCase(WizardStep.ReBaseline2, "Return to Baseline")]
-        [TestCase(WizardStep.Screw2, "Move Screw 2")]
-        [TestCase(WizardStep.Complete, "Calibration Complete")]
-        public void StepTitleText_IsShortPerStepHeader(WizardStep step, string expected) {
-            Assert.That(TiltAdapterWizardVM.StepTitleText(step), Is.EqualTo(expected));
+        // The correctness win. Before labels, this prose said "apply +N steps to motor 1 and -N steps to
+        // motor 3" -- and those were WIZARD screw indices, so a user who obeyed literally and turned the
+        // EAT's physical M3 moved the wrong corner (wizard screw 3 is motor 4). With the EAT's own names in
+        // the prose there is nothing left to misread.
+        [Test]
+        public void StepInstructionsText_OnAnEat_NamesTheMotorsTheUserCanActuallySee() {
+            var eat = TiltScrewLabels.ForScheme(ScrewLabelScheme.AsgEat);
+            Assert.Multiple(() => {
+                Assert.That(TiltAdapterWizardVM.StepInstructionsText(WizardStep.Screw1, 4, true, 150, eat),
+                    Is.EqualTo("Apply +150 steps to M1 and −150 steps to M4, then click Run Measurement."));
+                Assert.That(TiltAdapterWizardVM.StepInstructionsText(WizardStep.Screw2, 4, true, 150, eat),
+                    Is.EqualTo("Apply +150 steps to M2 and −150 steps to M3, then click Run Measurement."));
+                Assert.That(TiltAdapterWizardVM.StepInstructionsText(WizardStep.ReBaseline2, 4, true, 150, eat),
+                    Does.Contain("−150 steps to M1").And.Contain("+150 steps to M4"));
+                Assert.That(TiltAdapterWizardVM.StepInstructionsText(WizardStep.ReBaseline3, 4, true, 150, eat),
+                    Does.Contain("−150 steps to M2").And.Contain("+150 steps to M3"));
+                // The old wording must not survive anywhere in the per-screw prose.
+                foreach (var step in new[] { WizardStep.Screw1, WizardStep.Screw2, WizardStep.ReBaseline2, WizardStep.ReBaseline3 }) {
+                    Assert.That(TiltAdapterWizardVM.StepInstructionsText(step, 4, true, 150, eat),
+                        Does.Not.Contain("motor 1").And.Not.Contain("motor 3"), step.ToString());
+                }
+            });
+        }
+
+        [Test]
+        public void StepInstructionsText_Baseline_IntroducesTheNamesOrTeachesTheNumbering() {
+            var eat = TiltScrewLabels.ForScheme(ScrewLabelScheme.AsgEat);
+            Assert.Multiple(() => {
+                // Named: state the order the wizard expects, in the user's vocabulary.
+                Assert.That(TiltAdapterWizardVM.StepInstructionsText(WizardStep.Baseline, 4, true, 150, eat),
+                    Does.Contain("Your screws are M1, M2, M4, and M3, in that clockwise order."));
+                // Unnamed: keep the original instruction, and point at where names can be entered.
+                var unnamed = TiltAdapterWizardVM.StepInstructionsText(WizardStep.Baseline, 4, false, 1.0);
+                Assert.That(unnamed, Does.Contain("Label your screws 1, 2, 3, and 4 in a consistent clockwise order."));
+                Assert.That(unnamed, Does.Contain("Screw Labels"), "the feature has to be discoverable at the moment it is relevant");
+            });
+        }
+
+        [Test]
+        public void StepTitleText_UsesTheScrewName() {
+            var eat = TiltScrewLabels.ForScheme(ScrewLabelScheme.AsgEat);
+            Assert.Multiple(() => {
+                Assert.That(TiltAdapterWizardVM.StepTitleText(WizardStep.Screw1, eat, false), Is.EqualTo("Move M1"));
+                Assert.That(TiltAdapterWizardVM.StepTitleText(WizardStep.Screw2, eat, false), Is.EqualTo("Move M2"));
+            });
+        }
+
+        [TestCase(WizardStep.Baseline, false, "Baseline Measurement")]
+        [TestCase(WizardStep.AllInward, false, "All Screws Clockwise")]
+        [TestCase(WizardStep.AllInward, true, "All Motors Positive Steps")]
+        [TestCase(WizardStep.ReBaseline1, false, "Return to Baseline")]
+        [TestCase(WizardStep.Screw1, false, "Move Screw 1")]
+        [TestCase(WizardStep.ReBaseline2, false, "Return to Baseline")]
+        [TestCase(WizardStep.Screw2, false, "Move Screw 2")]
+        [TestCase(WizardStep.Complete, false, "Calibration Complete")]
+        [TestCase(WizardStep.ReBaseline3, false, "Return to Baseline")]
+        public void StepTitleText_IsShortPerStepHeader(WizardStep step, bool isStepper, string expected) {
+            Assert.That(TiltAdapterWizardVM.StepTitleText(step, null, isStepper), Is.EqualTo(expected));
+        }
+
+        // The wizard reserves "inward"/"outward" for ADAPTER-PLATE motion; screw and motor moves are worded
+        // clockwise/counter-clockwise or as signed steps. A step titled "All Screws Inward" while the device
+        // applies +N to every motor is what made a correct move look like a bug — and "+N is inward" is not
+        // something the wizard knows, it is what this very step measures.
+        [Test]
+        public void NoUserFacingMoveWording_ClaimsInwardOrOutward() {
+            var offenders = new List<string>();
+            foreach (var step in Enum.GetValues<WizardStep>()) {
+                foreach (var isStepper in new[] { false, true }) {
+                    foreach (var screwCount in new[] { 3, 4 }) {
+                        offenders.AddRange(new[] {
+                            TiltAdapterWizardVM.StepTitleText(step, null, isStepper),
+                            TiltAdapterWizardVM.StepInstructionsText(step, screwCount, isStepper, 1.0),
+                            TiltAdapterWizardVM.BaselineRecoveryText(step, screwCount, isStepper, 1.0),
+                        }.Where(t => t != null &&
+                            (t.IndexOf("inward", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                             t.IndexOf("outward", StringComparison.OrdinalIgnoreCase) >= 0)));
+                    }
+                }
+                // DeviceStepInstructionsText is the wording actually shown for a connected motorized run — it
+                // must be in the sweep, not merely safe transitively via StepInstructionsText.
+                foreach (var autoRunning in new[] { false, true }) {
+                    foreach (var measuredFinalRebaseline in new[] { false, true }) {
+                        offenders.AddRange(new[] {
+                            TiltAdapterWizardVM.DeviceStepInstructionsText(step, 150, autoRunning, measuredFinalRebaseline),
+                        }.Where(t => t != null &&
+                            (t.IndexOf("inward", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                             t.IndexOf("outward", StringComparison.OrdinalIgnoreCase) >= 0)));
+                    }
+                }
+                var move = EatWizardMapping.MoveForStep(step, 150);
+                if (move?.Description != null &&
+                    (move.Description.IndexOf("inward", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                     move.Description.IndexOf("outward", StringComparison.OrdinalIgnoreCase) >= 0)) {
+                    offenders.Add(move.Description);
+                }
+            }
+            Assert.That(offenders, Is.Empty, "user-facing move wording must not claim a direction the wizard has not measured");
         }
 
         [Test]
@@ -639,6 +779,26 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
                     Does.Contain("Click Run Measurement"));
                 Assert.That(TiltAdapterWizardVM.DeviceStepInstructionsText(WizardStep.Screw1, 150, autoRunning: true),
                     Does.StartWith("Running automatically").And.Not.Contain("Click"));
+            });
+        }
+
+        [Test]
+        public void DeviceStepInstructionsText_Complete_NoMoveOnlyWhenMeasuredFinalRebaseline() {
+            // Default (measuredFinalRebaseline: false, the implicit default) -- unchanged from before Task 6:
+            // Complete's own restore move is described.
+            Assert.Multiple(() => {
+                Assert.That(TiltAdapterWizardVM.DeviceStepInstructionsText(WizardStep.Complete, 150, autoRunning: false),
+                    Does.Contain("diagonal-B (restore)").And.Contain("Click Run Measurement"));
+                Assert.That(TiltAdapterWizardVM.DeviceStepInstructionsText(WizardStep.Complete, 150, autoRunning: true),
+                    Does.Contain("diagonal-B (restore)"));
+
+                // measuredFinalRebaseline: true -- ReBaseline3 (an earlier ordinary step in this same run)
+                // already sent and measured the restore, so Complete becomes pure status/no-op wording, with
+                // no move description and no second restore mentioned.
+                Assert.That(TiltAdapterWizardVM.DeviceStepInstructionsText(WizardStep.Complete, 150, autoRunning: false, measuredFinalRebaseline: true),
+                    Is.EqualTo("Click Run Measurement to continue.").And.Not.Contain("diagonal-B"));
+                Assert.That(TiltAdapterWizardVM.DeviceStepInstructionsText(WizardStep.Complete, 150, autoRunning: true, measuredFinalRebaseline: true),
+                    Is.EqualTo("Running automatically — measuring…").And.Not.Contain("diagonal-B"));
             });
         }
 
@@ -692,11 +852,13 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
         }
 
         [Test]
-        public void ApplyManualCalibration_WritesCalibrationState_PositiveSignStoresPhysicalAngles() {
-            // On +1 rigs the stored response-convention angles coincide with the physical angles the
-            // user typed, so 30° places the clockwise-numbered screws at 30/150/270.
+        public void ApplyManualCalibration_WritesCalibrationState_CwTowardObjectiveStoresPhysicalAngles() {
+            // σ = −1 at the standard focuser is m = −1 — a CW turn drives the plate toward the
+            // objective, RAISING best focus at that screw, so the response direction points along the
+            // screw and the stored angles coincide with the physical angles the user typed: 30° places
+            // the clockwise-numbered screws at 30/150/270.
             var (vm, options, _, _) = Build(screwCount: 3);
-            options.ScrewInwardCurvatureSign.Returns(1);
+            options.ScrewInwardCurvatureSign.Returns(-1);
             vm.ManualScrew1AngleDegrees = 30;
             vm.ManualNumberingClockwise = true;
 
@@ -719,13 +881,14 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
         }
 
         [Test]
-        public void ApplyManualCalibration_NegativeSign_ConvertsPhysicalToResponseConvention() {
-            // On −1 rigs a CW turn drives the tilt gradient opposite the physical screw direction, so
-            // the stored (response-convention) angles are the typed physical angle + 180°: wizard runs
+        public void ApplyManualCalibration_CwTowardCamera_ConvertsPhysicalToResponseConvention() {
+            // σ = +1 at the standard focuser is m = +1 — a CW turn drives the plate toward the camera,
+            // LOWERING best focus at that screw, so the tilt gradient responds opposite the physical
+            // screw direction and the stored angles are the typed physical angle + 180°. Wizard runs
             // persist response-convention angles and the guidance math consumes them, so a manual
             // entry must convert or its arrows would invert on these rigs.
             var (vm, options, _, _) = Build(screwCount: 3);
-            options.ScrewInwardCurvatureSign.Returns(-1);
+            options.ScrewInwardCurvatureSign.Returns(1);
             vm.ManualScrew1AngleDegrees = 30;
             vm.ManualNumberingClockwise = true;
 
@@ -769,7 +932,7 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
         // ---- Screw-angle display shows the PHYSICAL image position (readout + wizard diagram) --------------
         //
         // The persisted Screw{N}AngleDegrees are RESPONSE-convention angles (physical + 180° on
-        // "CW moves adapter toward the objective" / −1 rigs). Both the calibration readout and the
+        // "CW moves adapter toward the camera" rigs — m = σ·sign(k) = +1). Both the calibration readout and the
         // wizard diagram are labelled image-space ("0° points up; image as shown in NINA"), and must
         // therefore display the PHYSICAL angle — matching the Manual Calibration Entry field — not the
         // raw stored value. Regression guard for docs/tilt-wizard-diagram-orientation-design.md.
@@ -789,38 +952,61 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
         }
 
         [Test]
-        public void RebuildDiagram_NegativeSign_PlacesPhysicalTopScrewAtCanvasTop() {
-            // −1 rig: screw 1 is physically at the TOP (physical 0°), stored as 0+180 = 180°. The
-            // diagram must draw it at canvas-top (cy = 100 − 75·cos0 = 25 → Y = 25 − 12 = 13), NOT at
-            // the bottom (the raw-stored 180° would give cy = 175). Screws 2/3 are physically 120/240.
-            var (vm, _) = BuildCalibrated(sign: -1, s1: 180, s2: 300, s3: 60);
+        public void RebuildDiagram_OffsetRig_PlacesPhysicalTopScrewAtCanvasTop() {
+            // m = +1 rig (σ = +1 at the standard focuser): screw 1 is physically at the TOP (physical
+            // 0°), stored as 0+180 = 180°. The diagram must draw it at canvas-top (cy = 130 − 75·cos0
+            // = 55 → Y = 55 − 12 = 43), NOT at the bottom (the raw-stored 180° would give cy = 205).
+            // Screws 2/3 are physically 120/240.
+            var (vm, _) = BuildCalibrated(sign: 1, s1: 180, s2: 300, s3: 60);
 
             var screw1 = vm.ScrewDiagramItems.Single(i => i.Number == 1);
             Assert.Multiple(() => {
                 Assert.That(screw1.AngleDegrees, Is.EqualTo(0.0).Within(1e-9), "physical angle");
-                Assert.That(screw1.Y, Is.EqualTo(13.0).Within(0.5), "canvas-top, not bottom");
-                Assert.That(screw1.X, Is.EqualTo(88.0).Within(0.5), "horizontally centred");
+                Assert.That(screw1.Y, Is.EqualTo(43.0).Within(0.5), "canvas-top, not bottom");
+                Assert.That(screw1.X, Is.EqualTo(118.0).Within(0.5), "horizontally centred");
             });
         }
 
         [Test]
-        public void RebuildDiagram_PositiveSign_PlacesScrewsAtStoredAngles() {
-            // +1 rig: stored == physical, so the diagram is unchanged. Screw 1 stored 90° → right edge
-            // (cx = 175, cy = 100 → X = 163, Y = 88). Guards against a double 180° offset.
-            var (vm, _) = BuildCalibrated(sign: 1, s1: 90, s2: 210, s3: 330);
+        public void RebuildDiagram_NoOffsetRig_PlacesScrewsAtStoredAngles() {
+            // m = −1 rig (σ = −1 at the standard focuser): stored == physical, so the diagram plots the
+            // stored angles directly. Screw 1 stored 90° → right edge (cx = 205, cy = 130 → X = 193,
+            // Y = 118). Guards against a double 180° offset.
+            var (vm, _) = BuildCalibrated(sign: -1, s1: 90, s2: 210, s3: 330);
 
             var screw1 = vm.ScrewDiagramItems.Single(i => i.Number == 1);
             Assert.Multiple(() => {
                 Assert.That(screw1.AngleDegrees, Is.EqualTo(90.0).Within(1e-9));
-                Assert.That(screw1.X, Is.EqualTo(163.0).Within(0.5));
-                Assert.That(screw1.Y, Is.EqualTo(88.0).Within(0.5));
+                Assert.That(screw1.X, Is.EqualTo(193.0).Within(0.5));
+                Assert.That(screw1.Y, Is.EqualTo(118.0).Within(0.5));
             });
         }
 
         [Test]
-        public void PhysicalScrewAngles_NegativeSign_ConvertStoredResponseAnglesToPhysical() {
-            // Readout binds these; on a −1 rig they must be the stored angle − 180° (self-inverse).
-            var (vm, _) = BuildCalibrated(sign: -1, s1: 180, s2: 300, s3: 60);
+        public void RebuildDiagram_CarriesTheScrewNameAndKeepsItClearOfTheCircle() {
+            // The circle keeps the number; the name is drawn just outside it. Placement flips side with the
+            // half of the canvas the screw sits in, so a name never lands on the sensor rectangle between
+            // the circles, and the label block always stays inside the 260x260 canvas.
+            var (vm, _) = BuildCalibrated(sign: -1, s1: 0, s2: 120, s3: 240);
+
+            var top = vm.ScrewDiagramItems.Single(i => i.Number == 1);      // physical 0deg -> canvas top
+            var lower = vm.ScrewDiagramItems.Single(i => i.Number == 2);    // physical 120deg -> lower right
+
+            Assert.Multiple(() => {
+                Assert.That(top.Label, Is.EqualTo("Screw 1"), "an unlabeled manual rig still names its screws");
+                Assert.That(top.LabelY, Is.LessThan(top.Y), "top-half names sit above their circle");
+                Assert.That(lower.LabelY, Is.GreaterThan(lower.Y), "bottom-half names sit below theirs");
+                foreach (var item in vm.ScrewDiagramItems) {
+                    Assert.That(item.LabelX, Is.GreaterThanOrEqualTo(0.0).And.LessThanOrEqualTo(260.0 - 64.0), $"screw {item.Number} X");
+                    Assert.That(item.LabelY, Is.GreaterThanOrEqualTo(0.0).And.LessThanOrEqualTo(260.0 - 14.0), $"screw {item.Number} Y");
+                }
+            });
+        }
+
+        [Test]
+        public void PhysicalScrewAngles_OffsetRig_ConvertStoredResponseAnglesToPhysical() {
+            // Readout binds these; on an m = +1 rig they must be the stored angle − 180° (self-inverse).
+            var (vm, _) = BuildCalibrated(sign: 1, s1: 180, s2: 300, s3: 60);
 
             Assert.Multiple(() => {
                 Assert.That(vm.PhysicalScrew1AngleDegrees, Is.EqualTo(0.0).Within(1e-9));
@@ -830,8 +1016,8 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
         }
 
         [Test]
-        public void PhysicalScrewAngles_PositiveSign_EqualStoredAngles() {
-            var (vm, _) = BuildCalibrated(sign: 1, s1: 90, s2: 210, s3: 330);
+        public void PhysicalScrewAngles_NoOffsetRig_EqualStoredAngles() {
+            var (vm, _) = BuildCalibrated(sign: -1, s1: 90, s2: 210, s3: 330);
 
             Assert.Multiple(() => {
                 Assert.That(vm.PhysicalScrew1AngleDegrees, Is.EqualTo(90.0).Within(1e-9));
@@ -844,21 +1030,21 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
         public void ScrewInwardCurvatureSignChange_RefreshesPhysicalAnglesAndDiagram() {
             // Changing the adapter-direction setting flips the physical interpretation by 180°, so both
             // the readout properties and the diagram must refresh when ScrewInwardCurvatureSign changes.
-            var (vm, options) = BuildCalibrated(sign: 1, s1: 0, s2: 120, s3: 240);
-            // Built on +1: screw 1 (stored 0° = physical top) starts at canvas-top.
-            Assert.That(vm.ScrewDiagramItems.Single(i => i.Number == 1).Y, Is.EqualTo(13.0).Within(0.5));
+            var (vm, options) = BuildCalibrated(sign: -1, s1: 0, s2: 120, s3: 240);
+            // Built on m = −1 (no offset): screw 1 (stored 0° = physical top) starts at canvas-top.
+            Assert.That(vm.ScrewDiagramItems.Single(i => i.Number == 1).Y, Is.EqualTo(43.0).Within(0.5));
 
             var raised = new System.Collections.Generic.List<string>();
             vm.PropertyChanged += (_, e) => raised.Add(e.PropertyName);
-            options.ScrewInwardCurvatureSign.Returns(-1);
+            options.ScrewInwardCurvatureSign.Returns(1);
             options.PropertyChanged += Raise.Event<System.ComponentModel.PropertyChangedEventHandler>(
                 options, new System.ComponentModel.PropertyChangedEventArgs(nameof(ITiltAdapterOptions.ScrewInwardCurvatureSign)));
 
             Assert.Multiple(() => {
                 Assert.That(raised, Does.Contain(nameof(TiltAdapterWizardVM.PhysicalScrew1AngleDegrees)));
                 Assert.That(raised, Does.Contain(nameof(TiltAdapterWizardVM.PhysicalScrew2AngleDegrees)));
-                // Now interpreted as a −1 rig: physical = 0 + 180 = 180° → screw 1 moves to the bottom.
-                Assert.That(vm.ScrewDiagramItems.Single(i => i.Number == 1).Y, Is.EqualTo(163.0).Within(0.5));
+                // Now interpreted as an m = +1 rig: physical = 0 + 180 = 180° → screw 1 moves to the bottom.
+                Assert.That(vm.ScrewDiagramItems.Single(i => i.Number == 1).Y, Is.EqualTo(193.0).Within(0.5));
             });
         }
 
@@ -879,6 +1065,9 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
                 Assert.That(vm4.StepDescription(WizardStep.Screw1), Is.EqualTo("Screw 1 ⟳, Screw 3 ⟲"));
                 Assert.That(vm4.StepDescription(WizardStep.ReBaseline2), Is.EqualTo("Re-baseline (Screw 1 ⟲, Screw 3 ⟳)"));
                 Assert.That(vm4.StepDescription(WizardStep.Screw2), Is.EqualTo("Screw 2 ⟳, Screw 4 ⟲"));
+                // Task 6: the optional measured final re-baseline undoes screw 2's move.
+                Assert.That(vm3.StepDescription(WizardStep.ReBaseline3), Is.EqualTo("Re-baseline (Screw 2 ⟲)"));
+                Assert.That(vm4.StepDescription(WizardStep.ReBaseline3), Is.EqualTo("Re-baseline (Screw 2 ⟲, Screw 4 ⟳)"));
             });
         }
 
@@ -936,17 +1125,17 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
         public void Constructor_PrefillsManualAngleAsPhysical() {
             // Stored calibration angles are response-convention; the manual-entry field holds the
             // PHYSICAL image angle, so the pre-fill must convert back (the conversion is self-inverse).
-            var (vmNeg, _, _, _) = Build(screwCount: 3, configureOptions: o => {
+            var (vmOffset, _, _, _) = Build(screwCount: 3, configureOptions: o => {
                 o.Screw1AngleDegrees.Returns(210.0);
-                o.ScrewInwardCurvatureSign.Returns(-1);
+                o.ScrewInwardCurvatureSign.Returns(1); // m = +1 ⇒ 180° offset
             });
-            Assert.That(vmNeg.ManualScrew1AngleDegrees, Is.EqualTo(30).Within(1e-9));
+            Assert.That(vmOffset.ManualScrew1AngleDegrees, Is.EqualTo(30).Within(1e-9));
 
-            var (vmPos, _, _, _) = Build(screwCount: 3, configureOptions: o => {
+            var (vmNoOffset, _, _, _) = Build(screwCount: 3, configureOptions: o => {
                 o.Screw1AngleDegrees.Returns(210.0);
-                o.ScrewInwardCurvatureSign.Returns(1);
+                o.ScrewInwardCurvatureSign.Returns(-1); // m = −1 ⇒ identity
             });
-            Assert.That(vmPos.ManualScrew1AngleDegrees, Is.EqualTo(210).Within(1e-9));
+            Assert.That(vmNoOffset.ManualScrew1AngleDegrees, Is.EqualTo(210).Within(1e-9));
         }
 
         [Test]
@@ -1044,7 +1233,8 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
             var store = new InMemoryPluginOptionsAccessor();
             var options = new TiltAdapterOptions(profileService, store);
             // Old profile: measured "CW moves the adapter toward the objective" (stored sign −1 per the empirical
-            // anchor) with a calibrated screw 1 at stored angle 210° (physical 30° on a −1 rig).
+            // anchor) with a calibrated screw 1 at stored angle 210°. m = σ·sign(k) = −1 takes no offset, so the
+            // physical angle is 210° too.
             options.ScrewInwardCurvatureSign = -1;
             options.ScrewInwardCurvatureSignIsMeasured = true;
             options.Screw1AngleDegrees = 210.0;
@@ -1061,7 +1251,7 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
                 tiltAdapterOptions: options);
             Assert.Multiple(() => {
                 Assert.That(vm.CwMovesAdapterTowardObjective, Is.True, "precondition: old profile's direction");
-                Assert.That(vm.ManualScrew1AngleDegrees, Is.EqualTo(30).Within(1e-9), "precondition: ctor pre-fill");
+                Assert.That(vm.ManualScrew1AngleDegrees, Is.EqualTo(210).Within(1e-9), "precondition: ctor pre-fill");
             });
 
             // The new profile stores the opposite (assumed) direction and a different screw-1 angle.
@@ -1084,8 +1274,9 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
                 Assert.That(raised, Does.Contain(nameof(vm.IsCalibrationValid)));
                 Assert.That(raised, Does.Contain(nameof(vm.StepInstructions)));
                 Assert.That(raised, Does.Contain(nameof(vm.BaselineRecoveryInstructions)));
-                // The manual pre-fill re-runs against the new profile: sign +1 stores physical angles unchanged.
-                Assert.That(vm.ManualScrew1AngleDegrees, Is.EqualTo(90).Within(1e-9));
+                // The manual pre-fill re-runs against the new profile: sign +1 is m = +1, so stored 90° is
+                // physical 270°.
+                Assert.That(vm.ManualScrew1AngleDegrees, Is.EqualTo(270).Within(1e-9));
                 Assert.That(raised, Does.Contain(nameof(vm.ManualScrew1AngleDegrees)));
             });
         }
@@ -1159,6 +1350,69 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
                 WizardStep.Screw1, WizardStep.ReBaseline2, WizardStep.Screw2, WizardStep.Complete }));
         }
 
+        // Task 6, code-quality follow-up (Fix 2): the shipped DEFAULT configuration (curvature measurement
+        // OFF, MeasureFinalRebaseline ON) is a 5-step run. RunCalibrationForTest bypasses activeMeasurementSteps/
+        // NextStep entirely (it seeds stepReadings directly and calls RunCalibrationMath), and ReplayAsync is a
+        // structurally different loop -- neither exercises the real production state machine every live user's
+        // default run actually walks. This mirrors NextStep_FourStepFlow_SkipsCurvatureStepsAndCompletes above,
+        // with ReBaseline3 appended.
+        [Test]
+        public void NextStep_FiveStepFlow_WithFinalRebaseline_WalksAndCompletes() {
+            var (vm, _, _, _) = Build(configureOptions: o => {
+                o.MeasureCurvatureDuringCalibration.Returns(false);
+                o.MeasureFinalRebaseline.Returns(true);
+            });
+            vm.StartCommand.Execute(null);
+            Assert.That(vm.CurrentStep, Is.EqualTo(WizardStep.Baseline));
+
+            vm.SeedStepReading(WizardStep.Baseline, 0.0, 0.0, 1000.0);
+            vm.SeedStepReading(WizardStep.Screw1, 0.5, 0.0, 1000.0);
+            vm.SeedStepReading(WizardStep.ReBaseline2, 0.0, 0.0, 1000.0);
+            vm.SeedStepReading(WizardStep.Screw2, -0.25, 0.433, 1000.0);
+            vm.SeedStepReading(WizardStep.ReBaseline3, 0.0, 0.0, 1000.0);
+
+            var walked = new List<WizardStep> { vm.CurrentStep };
+            for (int i = 0; i < 5; i++) {
+                vm.NextStep();
+                walked.Add(vm.CurrentStep);
+            }
+
+            Assert.Multiple(() => {
+                Assert.That(walked, Is.EqualTo(new[] {
+                    WizardStep.Baseline, WizardStep.Screw1, WizardStep.ReBaseline2,
+                    WizardStep.Screw2, WizardStep.ReBaseline3, WizardStep.Complete }));
+                Assert.That(vm.IsComplete, Is.True);
+            });
+        }
+
+        // Cheap to also cover: curvature ON + final re-baseline ON is a 7-step run.
+        [Test]
+        public void NextStep_SevenStepFlow_WithCurvatureAndFinalRebaseline_WalksAndCompletes() {
+            var (vm, _, _, _) = Build(configureOptions: o => {
+                o.MeasureCurvatureDuringCalibration.Returns(true);
+                o.MeasureFinalRebaseline.Returns(true);
+            });
+            vm.StartCommand.Execute(null);
+
+            vm.SeedStepReading(WizardStep.Baseline, 0.0, 0.0, 1000.0);
+            vm.SeedStepReading(WizardStep.AllInward, 0.0, 0.0, 1010.0);
+            vm.SeedStepReading(WizardStep.ReBaseline1, 0.0, 0.0, 1000.0);
+            vm.SeedStepReading(WizardStep.Screw1, 0.5, 0.0, 1000.0);
+            vm.SeedStepReading(WizardStep.ReBaseline2, 0.0, 0.0, 1000.0);
+            vm.SeedStepReading(WizardStep.Screw2, -0.25, 0.433, 1000.0);
+            vm.SeedStepReading(WizardStep.ReBaseline3, 0.0, 0.0, 1000.0);
+
+            var walked = new List<WizardStep> { vm.CurrentStep };
+            for (int i = 0; i < 7; i++) {
+                vm.NextStep();
+                walked.Add(vm.CurrentStep);
+            }
+
+            Assert.That(walked, Is.EqualTo(new[] {
+                WizardStep.Baseline, WizardStep.AllInward, WizardStep.ReBaseline1, WizardStep.Screw1,
+                WizardStep.ReBaseline2, WizardStep.Screw2, WizardStep.ReBaseline3, WizardStep.Complete }));
+        }
+
         // --- Curvature-sign persistence semantics at run completion ---
 
         [Test]
@@ -1166,7 +1420,9 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
             var (vm, options, _, _) = Build(configureOptions: o => o.MeasureCurvatureDuringCalibration.Returns(true));
             vm.StartCommand.Execute(null);
 
-            // AllInward mean focus (990) below baseline (1000) => ComputeCurvatureSign(990, 1000) = −1.
+            // AllInward mean focus (990) below baseline (1000) => ComputeCurvatureSign(990, 1000) = +1:
+            // an all-screws-CW step that LOWERS the mean best focus is σ = +1
+            // (docs/focuser-direction-convention-design.md §1(c)).
             vm.SeedStepReading(WizardStep.Baseline, 0.0, 0.0, 1000.0);
             vm.SeedStepReading(WizardStep.AllInward, 0.0, 0.0, 990.0);
             vm.SeedStepReading(WizardStep.ReBaseline1, 0.0, 0.0, 1000.0);
@@ -1181,7 +1437,7 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
 
             Assert.That(vm.CurrentStep, Is.EqualTo(WizardStep.Complete));
             Assert.Multiple(() => {
-                options.Received().ScrewInwardCurvatureSign = -1;
+                options.Received().ScrewInwardCurvatureSign = 1;
                 options.Received().ScrewInwardCurvatureSignIsMeasured = true;
                 options.Received().IsCalibrated = true;
             });
@@ -1240,7 +1496,9 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
         [Test]
         public void CaptureMeasurementContext_ReadsInspectorAndProfileValues() {
             var inspector = Substitute.For<IInspectorOptions>();
-            inspector.MicronsPerFocuserStep.Returns(3.6);
+            // The EFFECTIVE step size, not the raw override: a run captured while the focuser driver supplied
+            // the step size must record what it actually measured with, or a replay reinterprets it wrongly.
+            inspector.EffectiveMicronsPerFocuserStep.Returns(3.6);
             inspector.UseRANSAC.Returns(true);
             inspector.AcceptableRSquaredMin.Returns(0.8);
             inspector.SensorROI.Returns(1.0); inspector.CornersROI.Returns(1.0);
@@ -1277,18 +1535,14 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
             // reapplied by the tilt replay overlay. A knob present in the DTO but missing from OverlayOptimizedSettings
             // silently leaks the live-profile value on replay — the LocallyAdaptiveBinarization / AdaptiveNoiseBlockSize
             // regression that made a replayed calibration disagree with the run it was captured from.
-            var metadataOnly = new HashSet<string> {
-                nameof(OptimizedStarDetectionSettings.CreatedAtUtc),
-                nameof(OptimizedStarDetectionSettings.RunCount),
-                nameof(OptimizedStarDetectionSettings.BaselineJ),
-                nameof(OptimizedStarDetectionSettings.FinalJ),
-                nameof(OptimizedStarDetectionSettings.RecommendedStepSize),
-                nameof(OptimizedStarDetectionSettings.RecommendedOffsetSteps),
-                nameof(OptimizedStarDetectionSettings.SchemaVersion),
-            };
+            // The knob/bookkeeping split comes from the DTO itself, NOT from a second copy of the exclusion list
+            // kept here. This test used to own that copy, and it drifted the moment two bookkeeping fields were
+            // added to the DTO (F32's keep floor): they were reported as detector knobs the overlay had failed to
+            // apply. A coverage guard that keeps its own idea of what it is covering guards the wrong set.
+            var curatedNames = new HashSet<string>(OptimizedStarDetectionSettings.CuratedKnobNames);
             var curatedKnobs = typeof(OptimizedStarDetectionSettings)
                 .GetProperties(BindingFlags.Public | BindingFlags.Instance)
-                .Where(p => p.CanRead && p.CanWrite && !metadataOnly.Contains(p.Name))
+                .Where(p => p.CanRead && p.CanWrite && curatedNames.Contains(p.Name))
                 .ToList();
             Assert.That(curatedKnobs, Is.Not.Empty, "Expected OptimizedStarDetectionSettings to expose curated knobs");
 
@@ -1642,10 +1896,12 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
         public void DeviceMove_UpdatesScrewPositionDisplayWithDeltaFromStart() {
             var (vm, options, service, controller, _, _) = BuildMotorized();
             options.CalibrationAppliedAmount.Returns(150.0);
-            // First read is the run baseline (captured before the first move); second is the post-move position.
-            controller.QueryPositionsAsync(Arg.Any<CancellationToken>()).Returns(
-                Task.FromResult(new TiltDevicePositions(new[] { 0, 0, 0, 0 }, known: true)),
-                Task.FromResult(new TiltDevicePositions(new[] { 150, 150, 150, 150 }, known: true)));
+            // The counters come from the controller's own latest report, read once when the service connects,
+            // once for the run baseline (before the first move), and once per move (what the move itself carried).
+            controller.LastKnownPositions.Returns(
+                new TiltDevicePositions(new[] { 0, 0, 0, 0 }, known: true),
+                new TiltDevicePositions(new[] { 0, 0, 0, 0 }, known: true),
+                new TiltDevicePositions(new[] { 150, 150, 150, 150 }, known: true));
 
             vm.SelectedPortName = "COM3";
             ((AsyncRelayCommand)vm.ConnectDeviceCommand).ExecuteAsync(null).GetAwaiter().GetResult();
@@ -1654,6 +1910,69 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
 
             // TR = motor 1 = index 0: shows the live position plus the delta from the run's baseline.
             Assert.That(vm.ScrewPositionTopRightDisplay, Does.Contain("150").And.Contain("Δ").And.Contain("+150"));
+        }
+
+        // The run baseline is captured ONCE (before the run's first move), so every later step's display must
+        // keep counting from it -- the delta is "since this calibration run started", not "since the last move".
+        [Test]
+        public void DeviceMove_LaterStepsInSameRun_KeepUpdatingAgainstTheRunBaseline() {
+            var (vm, options, service, controller, _, _) = BuildMotorized();
+            options.CalibrationAppliedAmount.Returns(150.0);
+            controller.LastKnownPositions.Returns(
+                new TiltDevicePositions(new[] { 0, 0, 0, 0 }, known: true),         // read when the service connects
+                new TiltDevicePositions(new[] { 0, 0, 0, 0 }, known: true),         // run baseline
+                new TiltDevicePositions(new[] { 150, 150, 150, 150 }, known: true), // after step 1
+                new TiltDevicePositions(new[] { 300, 150, 150, 0 }, known: true));  // after step 2
+
+            vm.SelectedPortName = "COM3";
+            ((AsyncRelayCommand)vm.ConnectDeviceCommand).ExecuteAsync(null).GetAwaiter().GetResult();
+
+            vm.ExecuteDeviceMoveForCurrentStepAsync(WizardStep.AllInward, CancellationToken.None).GetAwaiter().GetResult();
+            vm.ExecuteDeviceMoveForCurrentStepAsync(WizardStep.Screw1, CancellationToken.None).GetAwaiter().GetResult();
+
+            Assert.That(vm.ScrewPositionTopRightDisplay, Does.Contain("300").And.Contain("+300"));
+        }
+
+        // The device reports its new counters as part of the move it just acknowledged, so a step must never
+        // depend on a follow-up position query: that query was a wasted round trip AND an extra failure point
+        // that, when it came back unparseable, silently froze the position/Δ display at its pre-move values.
+        [Test]
+        public void DeviceMove_UpdatesTheDisplayWithoutASeparatePositionQuery() {
+            var (vm, options, service, controller, _, _) = BuildMotorized();
+            options.CalibrationAppliedAmount.Returns(150.0);
+            controller.LastKnownPositions.Returns(
+                new TiltDevicePositions(new[] { 0, 0, 0, 0 }, known: true),
+                new TiltDevicePositions(new[] { 0, 0, 0, 0 }, known: true),
+                new TiltDevicePositions(new[] { 150, 150, 150, 150 }, known: true));
+
+            vm.SelectedPortName = "COM3";
+            ((AsyncRelayCommand)vm.ConnectDeviceCommand).ExecuteAsync(null).GetAwaiter().GetResult();
+
+            vm.ExecuteDeviceMoveForCurrentStepAsync(WizardStep.AllInward, CancellationToken.None).GetAwaiter().GetResult();
+
+            Assert.Multiple(() => {
+                Assert.That(vm.ScrewPositionTopRightDisplay, Does.Contain("150").And.Contain("+150"));
+                controller.DidNotReceive().QueryPositionsAsync(Arg.Any<CancellationToken>());
+            });
+        }
+
+        // A run whose counters are not confirmed (nothing has ever parsed a position report) must keep the last
+        // snapshot rather than blanking the panel mid-run -- and the service logs it, so a frozen display is
+        // diagnosable instead of silent.
+        [Test]
+        public void DeviceMove_PositionsNeverConfirmed_KeepsTheLastSnapshotInsteadOfBlanking() {
+            var (vm, options, service, controller, _, _) = BuildMotorized(
+                polledPositions: new TiltDevicePositions(new[] { 7, 7, 7, 7 }, known: true));
+            options.CalibrationAppliedAmount.Returns(150.0);
+            controller.LastKnownPositions.Returns(TiltDevicePositions.Unknown);
+
+            vm.SelectedPortName = "COM3";
+            ((AsyncRelayCommand)vm.ConnectDeviceCommand).ExecuteAsync(null).GetAwaiter().GetResult();
+            service.PublishControllerPositions(); // no-op: nothing confirmed
+            vm.ExecuteDeviceMoveForCurrentStepAsync(WizardStep.AllInward, CancellationToken.None).GetAwaiter().GetResult();
+
+            Assert.That(vm.ScrewPositionTopRightDisplay, Is.EqualTo("unknown"),
+                "an unconfirmed position must read 'unknown', never a stale number presented as current");
         }
 
         [Test]
@@ -1674,50 +1993,59 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
             });
         }
 
+        // The modal is gone: the service arms a countdown the panels render, and disconnects on its own if
+        // nothing intervenes. These pin the VM-visible end of that, which is what the banner binds to.
         [Test]
-        public void IdlePrompt_ConfirmYes_DisconnectsThroughService() {
-            int promptCount = 0;
-            var (vm, _, service, controller, time, _) = BuildMotorized(
-                confirmIdleDisconnectAsync: () => { promptCount++; return Task.FromResult(true); });
+        public void Idle_AfterTheThreshold_ExposesAPendingCountdownWithoutDisconnecting() {
+            var (vm, _, service, controller, time, _) = BuildMotorized();
             vm.SelectedPortName = "COM3";
             ((AsyncRelayCommand)vm.ConnectDeviceCommand).ExecuteAsync(null).GetAwaiter().GetResult();
             Assert.That(service.Connected, Is.True, "precondition");
 
             time.Advance(TimeSpan.FromMinutes(31));
-            Assert.That(vm.LastIdlePromptTask, Is.Not.Null, "the idle prompt handler should have run");
-            vm.LastIdlePromptTask.GetAwaiter().GetResult();
 
             Assert.Multiple(() => {
-                Assert.That(promptCount, Is.EqualTo(1));
-                Assert.That(service.Connected, Is.False, "Yes must route to ConfirmIdleDisconnectAsync (disconnect)");
-                controller.Received(1).DisconnectAsync(Arg.Any<CancellationToken>());
+                Assert.That(service.IdleDisconnectPending, Is.True);
+                Assert.That(service.Connected, Is.True);
+                controller.DidNotReceive().DisconnectAsync(Arg.Any<CancellationToken>());
             });
         }
 
         [Test]
-        public void IdlePrompt_ConfirmNo_KeepsConnected_AndResetsIdleTimer() {
-            int promptCount = 0;
-            var (vm, _, service, controller, time, _) = BuildMotorized(
-                confirmIdleDisconnectAsync: () => { promptCount++; return Task.FromResult(false); });
+        public void Idle_GraceExpires_DisconnectsWithoutAnyPrompt() {
+            var (vm, _, service, controller, time, _) = BuildMotorized();
             vm.SelectedPortName = "COM3";
             ((AsyncRelayCommand)vm.ConnectDeviceCommand).ExecuteAsync(null).GetAwaiter().GetResult();
 
             time.Advance(TimeSpan.FromMinutes(31));
-            vm.LastIdlePromptTask.GetAwaiter().GetResult();
+            time.Advance(TiltDeviceConnectionService.IdleDisconnectGrace);
+            service.LastIdleAutoDisconnectTask.GetAwaiter().GetResult();
+
             Assert.Multiple(() => {
-                Assert.That(promptCount, Is.EqualTo(1));
-                Assert.That(service.Connected, Is.True, "No must route to KeepConnectedResetIdle (stay connected)");
-                controller.DidNotReceive().DisconnectAsync(Arg.Any<CancellationToken>());
+                Assert.That(service.Connected, Is.False);
+                Assert.That(service.LastIdleAutoDisconnectUtc, Is.Not.Null);
             });
+            controller.Received(1).DisconnectAsync(Arg.Any<CancellationToken>());
+        }
 
-            // KeepConnectedResetIdle restarted the 30-minute window: 29 more minutes -> no new prompt...
-            time.Advance(TimeSpan.FromMinutes(29));
-            Assert.That(promptCount, Is.EqualTo(1), "the idle timer must have been reset by the No answer");
+        [Test]
+        public void Idle_StayConnected_CancelsTheCountdownAndReArms() {
+            var (vm, _, service, controller, time, _) = BuildMotorized();
+            vm.SelectedPortName = "COM3";
+            ((AsyncRelayCommand)vm.ConnectDeviceCommand).ExecuteAsync(null).GetAwaiter().GetResult();
 
-            // ...but 31 minutes past the reset the prompt is re-armed and fires again.
-            time.Advance(TimeSpan.FromMinutes(2));
-            vm.LastIdlePromptTask.GetAwaiter().GetResult();
-            Assert.That(promptCount, Is.EqualTo(2));
+            time.Advance(TimeSpan.FromMinutes(31));
+            service.KeepConnectedResetIdle();
+
+            time.Advance(TiltDeviceConnectionService.IdleDisconnectGrace + TimeSpan.FromMinutes(1));
+            Assert.Multiple(() => {
+                Assert.That(service.Connected, Is.True, "the cancelled countdown must not fire later");
+                Assert.That(service.IdleDisconnectPending, Is.False);
+            });
+            controller.DidNotReceive().DisconnectAsync(Arg.Any<CancellationToken>());
+
+            time.Advance(TimeSpan.FromMinutes(31));
+            Assert.That(service.IdleDisconnectPending, Is.True, "a full new idle window re-arms it");
         }
 
         [Test]
@@ -1789,6 +2117,10 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
         [TestCase(WizardStep.ReBaseline2, TiltMoveAxis.DiagonalA, -150)]
         [TestCase(WizardStep.Screw2, TiltMoveAxis.DiagonalB, 150)]
         [TestCase(WizardStep.Complete, TiltMoveAxis.DiagonalB, -150)]
+        // Task 6, code-quality follow-up (Fix 1): ReBaseline3's move is unconditional in EatWizardMapping
+        // (only Complete branches on measuredFinalRebaseline), so this proves DiagonalB/-N is sent for it
+        // without needing StartCommand first (mirrors every other case above, none of which call it either).
+        [TestCase(WizardStep.ReBaseline3, TiltMoveAxis.DiagonalB, -150)]
         public void ExecuteDeviceMoveForCurrentStepAsync_EachStep_SendsExpectedMove(WizardStep step, TiltMoveAxis expectedAxis, int expectedSteps) {
             var (vm, options, service, controller, _, _) = BuildMotorized();
             options.CalibrationAppliedAmount.Returns(150.0);
@@ -1802,6 +2134,32 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
                 controller.Received(1).ExecuteMoveAsync(
                     Arg.Is<TiltAdapterMove>(m => m.Axis == expectedAxis && m.Steps == expectedSteps),
                     Arg.Any<IProgress<string>>(), Arg.Any<CancellationToken>());
+            });
+        }
+
+        // Task 6, code-quality follow-up (Fix 1): this is the wiring that decides what physically moves the
+        // hardware -- with MeasureFinalRebaseline active for THIS run (captured into activeMeasurementSteps by
+        // StartCommand, exactly as a live device-driven run would), ReBaseline3 (an earlier ordinary step in
+        // the same sequence) already sent and measured the restore, so Complete must send NOTHING to the
+        // controller here. A second DiagonalB(-N) would be a spurious, physically real move on real hardware.
+        [Test]
+        public void ExecuteDeviceMoveForCurrentStepAsync_Complete_SendsNothingWhenFinalRebaselineWasMeasured() {
+            var (vm, options, service, controller, _, _) = BuildMotorized();
+            options.CalibrationAppliedAmount.Returns(150.0);
+            StubSuccessfulMoves(controller);
+            Connect(vm);
+            // Connecting defaults MeasureCurvatureDuringCalibration ON (T11 item 4); re-assert false AFTER
+            // connecting so StartAsync (read fresh at Start) resolves the 4-step base flow this test wants,
+            // with ReBaseline3 appended by MeasureFinalRebaseline below.
+            options.MeasureCurvatureDuringCalibration.Returns(false);
+            options.MeasureFinalRebaseline.Returns(true);
+            vm.StartCommand.Execute(null); // captures activeMeasurementSteps INCLUDING ReBaseline3
+
+            bool result = vm.ExecuteDeviceMoveForCurrentStepAsync(WizardStep.Complete, CancellationToken.None).GetAwaiter().GetResult();
+
+            Assert.Multiple(() => {
+                Assert.That(result, Is.True, "Complete succeeds trivially -- there is nothing left to send");
+                controller.DidNotReceive().ExecuteMoveAsync(Arg.Any<TiltAdapterMove>(), Arg.Any<IProgress<string>>(), Arg.Any<CancellationToken>());
             });
         }
 
@@ -2160,7 +2518,7 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
         [Test]
         public void Disconnected_StepInstructions_MatchesManualTextExactly_EvenForAMotorizedPreset() {
             var (vm, options, service, controller, _, _) = BuildMotorized(); // motorized preset, never connected
-            string expected = TiltAdapterWizardVM.StepInstructionsText(WizardStep.Baseline, 4, true, vm.CalibrationAppliedAmount);
+            string expected = TiltAdapterWizardVM.StepInstructionsText(WizardStep.Baseline, 4, true, vm.CalibrationAppliedAmount, vm.ScrewLabels);
             Assert.That(vm.StepInstructions, Is.EqualTo(expected));
         }
 
@@ -2170,7 +2528,7 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
             options.CalibrationAppliedAmount.Returns(150.0);
             Connect(vm);
 
-            string manualText = TiltAdapterWizardVM.StepInstructionsText(WizardStep.Baseline, 4, true, vm.CalibrationAppliedAmount);
+            string manualText = TiltAdapterWizardVM.StepInstructionsText(WizardStep.Baseline, 4, true, vm.CalibrationAppliedAmount, vm.ScrewLabels);
             Assert.Multiple(() => {
                 Assert.That(vm.StepInstructions, Is.Not.EqualTo(manualText));
                 Assert.That(vm.StepInstructions, Does.Contain("wizard will drive"));
@@ -2417,18 +2775,86 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
                         "Step 1 of 6", "Step 2 of 6", "Step 3 of 6", "Step 4 of 6", "Step 5 of 6", "Step 6 of 6" }));
                     // The title must track the step too -- same root cause, separately visible to the user.
                     Assert.That(observed.Select(o => o.title),
-                        Is.EqualTo(steps.Select(TiltAdapterWizardVM.StepTitleText)));
+                        Is.EqualTo(steps.Select(s => TiltAdapterWizardVM.StepTitleText(s, null, false))));
                     // Status text uses the human step title, not the raw enum name.
                     Assert.That(observed.Select(o => o.status),
-                        Is.EqualTo(steps.Select(s => $"Replaying {TiltAdapterWizardVM.StepTitleText(s)}...")));
+                        Is.EqualTo(steps.Select(s => $"Replaying {TiltAdapterWizardVM.StepTitleText(s, null, false)}...")));
                     // A replay re-analyzes saved frames: the instruction paragraph must not tell the user to turn
                     // screws or click a button that is collapsed for the whole replay.
                     Assert.That(observed.Select(o => o.instructions),
-                        Is.EqualTo(steps.Select(TiltAdapterWizardVM.ReplayStepInstructionsText)));
+                        Is.EqualTo(steps.Select(s => TiltAdapterWizardVM.ReplayStepInstructionsText(s, null, false))));
                     Assert.That(observed.Select(o => o.instructions),
                         Has.None.Contains("Run Measurement").And.None.Contains("CLOCKWISE"));
                     // The replay flag is transient: it must be cleared once the replay finishes.
                     Assert.That(vm.IsReplaying, Is.False);
+                });
+            } finally {
+                System.IO.Directory.Delete(runRoot, recursive: true);
+            }
+        }
+
+        // CRITICAL regression (code review of Task 8): the bold StepTitle header and the StatusText line
+        // directly below it are both derived from StepTitleText, but ReplayAsync's StatusText assignment
+        // used to omit isStepper -- silently defaulting to false. On a stepper rig replaying a saved run,
+        // StepTitle correctly read "All Motors Positive Steps" while StatusText, on screen at the same
+        // time, read "Replaying All Screws Clockwise...": title and status visibly disagreeing about the
+        // rig's own adjustment type. The previous test (screw rig, isStepper defaults to false on both
+        // sides) could never have caught this -- it passed by coincidence. This test forces a stepper rig
+        // and asserts title and status agree.
+        [Test]
+        public void ReplayAsync_OnStepperRig_TitleAndStatusAgreeOnAdjustmentType() {
+            var (vm, _, _, _) = Build(screwCount: 3, configureOptions: o => {
+                o.MeasureCurvatureDuringCalibration.Returns(true);
+                o.AdjustmentType.Returns(TiltAdjustmentType.StepperMotors);
+            });
+
+            string runRoot = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "hf-tilt-replay-stepper-test-" + Guid.NewGuid().ToString("N"));
+            var stepFolders = new[] { "01_Baseline", "02_AllInward", "03_ReBaseline1", "04_Screw1", "05_ReBaseline2", "06_Screw2" };
+            var steps = new[] { WizardStep.Baseline, WizardStep.AllInward, WizardStep.ReBaseline1, WizardStep.Screw1, WizardStep.ReBaseline2, WizardStep.Screw2 };
+            System.IO.Directory.CreateDirectory(runRoot);
+            try {
+                foreach (var stepFolder in stepFolders) {
+                    System.IO.Directory.CreateDirectory(System.IO.Path.Combine(runRoot, stepFolder));
+                }
+                var metadata = new TiltCalibrationMetadata {
+                    NumberOfScrews = 3,
+                    PixelSizeMicrons = 3.76,
+                    FocuserStepSizeMicrons = 3.6,
+                    ScrewRadiusMillimeters = 44,
+                    CalibrationAppliedAmount = 1.0,
+                    RunStepMapping = steps.Select((s, i) => new TiltRunStepMapping { Step = s.ToString(), Folder = stepFolders[i] }).ToList()
+                };
+                System.IO.File.WriteAllText(System.IO.Path.Combine(runRoot, "metadata.json"), metadata.Serialize());
+
+                var tiltPlane = new TiltPlaneModel(new System.Drawing.Size(6248, 4176), fRatio: 7,
+                    a: 0.1, b: 0.05, c: 0, mean: 7000, focuserStepSizeMicrons: 3.6,
+                    centerPosition: 7000, topLeftPosition: 7000, topRightPosition: 7000,
+                    bottomLeftPosition: 7000, bottomRightPosition: 7000);
+                vm.CalibrationTiltPlaneOverrideForTest = tiltPlane;
+                vm.SelectReplayFolderForTest = _ => runRoot;
+                vm.SelectReplaySettingsForTest = _ => Task.FromResult(ReplaySettingsChoice.UseCurrentSettings);
+
+                var observed = new List<(WizardStep step, string title, string status)>();
+                vm.ReplayStepOverrideForTest = (step, ct) => {
+                    observed.Add((step, vm.StepTitle, vm.StatusText));
+                    return Task.FromResult(true);
+                };
+
+                ((AsyncRelayCommand)vm.ReplayCommand).ExecuteAsync(null).GetAwaiter().GetResult();
+
+                Assert.Multiple(() => {
+                    Assert.That(vm.IsComplete, Is.True, "precondition: the replay actually ran to completion");
+                    // The AllInward step is where the two used to disagree: the title said stepper wording,
+                    // the status line said screw wording, for the same rig at the same instant.
+                    var allInward = observed.Single(o => o.step == WizardStep.AllInward);
+                    Assert.That(allInward.title, Is.EqualTo("All Motors Positive Steps"));
+                    Assert.That(allInward.status, Is.EqualTo("Replaying All Motors Positive Steps..."));
+                    Assert.That(allInward.status, Does.Not.Contain("Clockwise"), "status must not show screw wording on a stepper rig");
+                    // Every step, not just AllInward: the status line's embedded title must always equal the
+                    // bold title shown above it, whatever the rig.
+                    foreach (var o in observed) {
+                        Assert.That(o.status, Is.EqualTo($"Replaying {o.title}..."), $"title/status must agree for {o.step}");
+                    }
                 });
             } finally {
                 System.IO.Directory.Delete(runRoot, recursive: true);
@@ -2483,6 +2909,139 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
             }
         }
 
+        // Task 6: a saved run captured WITH the optional measured final re-baseline replays as a 5-step run
+        // (ReBaseline3 detected from RunStepMapping, exactly how AllInward's presence already detects the
+        // 6- vs 4-step curvature flow) -- the "think rather than transcribe" backward-compatibility point:
+        // a metadata file predating this feature simply has no "ReBaseline3" entry, so byStep.ContainsKey
+        // comes back false and this replays as an ordinary 4-step run (already covered by every OTHER
+        // ReplayAsync test above, none of which include a ReBaseline3 folder).
+        [Test]
+        public void ReplayAsync_WithReBaseline3InMetadata_ReplaysFiveStepsAndCompletes() {
+            var (vm, _, _, _) = Build(screwCount: 4);
+
+            string runRoot = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "hf-tilt-replay-rb3-test-" + Guid.NewGuid().ToString("N"));
+            var stepFolders = new[] { "01_Baseline", "02_Screw1", "03_ReBaseline2", "04_Screw2", "07_ReBaseline3" };
+            var steps = new[] { WizardStep.Baseline, WizardStep.Screw1, WizardStep.ReBaseline2, WizardStep.Screw2, WizardStep.ReBaseline3 };
+            System.IO.Directory.CreateDirectory(runRoot);
+            try {
+                foreach (var stepFolder in stepFolders) {
+                    System.IO.Directory.CreateDirectory(System.IO.Path.Combine(runRoot, stepFolder));
+                }
+                var metadata = new TiltCalibrationMetadata {
+                    NumberOfScrews = 4,
+                    PixelSizeMicrons = 3.76,
+                    FocuserStepSizeMicrons = 3.6,
+                    ScrewRadiusMillimeters = 44,
+                    CalibrationAppliedAmount = 1.0,
+                    RunStepMapping = steps.Select((s, i) => new TiltRunStepMapping { Step = s.ToString(), Folder = stepFolders[i] }).ToList()
+                };
+                System.IO.File.WriteAllText(System.IO.Path.Combine(runRoot, "metadata.json"), metadata.Serialize());
+
+                var tiltPlane = new TiltPlaneModel(new System.Drawing.Size(6248, 4176), fRatio: 7,
+                    a: 0.1, b: 0.05, c: 0, mean: 7000, focuserStepSizeMicrons: 3.6,
+                    centerPosition: 7000, topLeftPosition: 7000, topRightPosition: 7000,
+                    bottomLeftPosition: 7000, bottomRightPosition: 7000);
+                vm.CalibrationTiltPlaneOverrideForTest = tiltPlane;
+                vm.SelectReplayFolderForTest = _ => runRoot;
+                vm.SelectReplaySettingsForTest = _ => Task.FromResult(ReplaySettingsChoice.UseCurrentSettings);
+
+                var observedSteps = new List<WizardStep>();
+                vm.ReplayStepOverrideForTest = (step, ct) => {
+                    observedSteps.Add(step);
+                    return Task.FromResult(true);
+                };
+
+                ((AsyncRelayCommand)vm.ReplayCommand).ExecuteAsync(null).GetAwaiter().GetResult();
+
+                Assert.Multiple(() => {
+                    Assert.That(vm.IsComplete, Is.True, "precondition: the replay actually ran to completion");
+                    Assert.That(observedSteps, Is.EqualTo(steps), "every saved step, including the optional ReBaseline3, is replayed in order");
+                });
+            } finally {
+                System.IO.Directory.Delete(runRoot, recursive: true);
+            }
+        }
+
+        // Fix 4 (post-review): CornerTiltPlaneOverrideForTest mirrors CalibrationTiltPlaneOverrideForTest but
+        // was never exercised by a test -- ReplayAsync's corner-capture line only ever ran its null/NaN
+        // fallback. Sets BOTH overrides per replayed step (a fresh TiltPlaneModel each time, since
+        // ReplayStepOverrideForTest runs before ReplayAsync reads CalibrationTiltPlane/corner for that step) to
+        // the SAME 25%-higher-corner geometry as RunCalibrationForTest_CornerMagnitudes25PercentHigherThan-
+        // Paraboloid... above, proving the real capture site (not just the SeedStepReading test shortcut) wires
+        // through to the cross-check end to end. UseCaptureTimeSettingsInMemory (rather than UseCurrentSettings,
+        // used by the other ReplayAsync tests) so RunCalibrationMath's geometry comes entirely from `metadata`
+        // (radius/pixel/focuser-step/applied all under test control), matching the isotropic-sensor convention
+        // the seeded-reading tests use -- not from the unconfigured profile/options substitutes.
+        [Test]
+        public void ReplayAsync_CapturesCornerReadingsAndTheCrossCheckFires() {
+            var (vm, _, _, _) = Build(screwCount: 4);
+
+            string runRoot = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "hf-tilt-replay-corner-test-" + Guid.NewGuid().ToString("N"));
+            var stepFolders = new[] { "01_Baseline", "02_Screw1", "03_ReBaseline2", "04_Screw2" };
+            System.IO.Directory.CreateDirectory(runRoot);
+            try {
+                foreach (var stepFolder in stepFolders) {
+                    System.IO.Directory.CreateDirectory(System.IO.Path.Combine(runRoot, stepFolder));
+                }
+                var metadata = new TiltCalibrationMetadata {
+                    NumberOfScrews = 4,
+                    PixelSizeMicrons = 1,
+                    FocuserStepSizeMicrons = 1,
+                    ScrewRadiusMillimeters = 44,
+                    CalibrationAppliedAmount = 1.0,
+                    RunStepMapping = new List<TiltRunStepMapping> {
+                        new TiltRunStepMapping { Step = "Baseline", Folder = stepFolders[0] },
+                        new TiltRunStepMapping { Step = "Screw1", Folder = stepFolders[1] },
+                        new TiltRunStepMapping { Step = "ReBaseline2", Folder = stepFolders[2] },
+                        new TiltRunStepMapping { Step = "Screw2", Folder = stepFolders[3] },
+                    }
+                };
+                System.IO.File.WriteAllText(System.IO.Path.Combine(runRoot, "metadata.json"), metadata.Serialize());
+
+                // Paraboloid: clean (0,-5e-5)/(5e-5,0) deltas (magnitude 5e-5 each). Corner: the SAME deltas
+                // scaled 25% higher (magnitude 6.25e-5 each) -- identical numbers to the seeded-reading
+                // disagreement test, so the expected outputs below are the same known values (2.75 µm/turn).
+                var paraboloidByStep = new Dictionary<WizardStep, (double a, double b)> {
+                    [WizardStep.Baseline] = (0.0, 0.0),
+                    [WizardStep.Screw1] = (0.0, -0.00005),
+                    [WizardStep.ReBaseline2] = (0.0, 0.0),
+                    [WizardStep.Screw2] = (0.00005, 0.0),
+                };
+                var cornerByStep = new Dictionary<WizardStep, (double a, double b)> {
+                    [WizardStep.Baseline] = (0.0, 0.0),
+                    [WizardStep.Screw1] = (0.0, -0.0000625),
+                    [WizardStep.ReBaseline2] = (0.0, 0.0),
+                    [WizardStep.Screw2] = (0.0000625, 0.0),
+                };
+                TiltPlaneModel PlaneFor(double a, double b) => new TiltPlaneModel(new System.Drawing.Size(1, 1), fRatio: 7,
+                    a: a, b: b, c: 0, mean: 1000, focuserStepSizeMicrons: 1,
+                    centerPosition: 1000, topLeftPosition: 1000, topRightPosition: 1000,
+                    bottomLeftPosition: 1000, bottomRightPosition: 1000);
+
+                vm.SelectReplayFolderForTest = _ => runRoot;
+                vm.SelectReplaySettingsForTest = _ => Task.FromResult(ReplaySettingsChoice.UseCaptureTimeSettingsInMemory);
+                vm.ReplayStepOverrideForTest = (step, ct) => {
+                    var (pa, pb) = paraboloidByStep[step];
+                    vm.CalibrationTiltPlaneOverrideForTest = PlaneFor(pa, pb);
+                    var (ca, cb) = cornerByStep[step];
+                    vm.CornerTiltPlaneOverrideForTest = PlaneFor(ca, cb);
+                    return Task.FromResult(true);
+                };
+
+                ((AsyncRelayCommand)vm.ReplayCommand).ExecuteAsync(null).GetAwaiter().GetResult();
+
+                Assert.Multiple(() => {
+                    Assert.That(vm.IsComplete, Is.True, "precondition: the replay actually completed (RunCalibrationMath was reached)");
+                    Assert.That(vm.HasCornerCrossCheck, Is.True);
+                    Assert.That(vm.CornerCrossCheckDisplay, Is.EqualTo("Corner-AF cross-check: 2.75 µm/turn"));
+                    Assert.That(vm.WarningText, Does.Contain("The per-star model and the corner-region AF differ by"));
+                    Assert.That(vm.WarningText, Does.Contain("corner-region AF puts the pitch at 2.75 µm"));
+                });
+            } finally {
+                System.IO.Directory.Delete(runRoot, recursive: true);
+            }
+        }
+
         [Test]
         public void ApplyManualCalibrationCommand_ClearsDeviceLinkedMarker() {
             var (vm, options, _, _) = Build();
@@ -2505,7 +3064,13 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
             vm.SeedStepReading(WizardStep.ReBaseline2, 0.0, 0.0, 1000.0);
             vm.SeedStepReading(WizardStep.Screw2, -0.25, 0.433, 1000.0);
 
-            vm.RunCalibrationForTest(deviceDriven: true);
+            // No tiltPlaneOverride -> RunCalibrationMath's inputs fall back to a 1x1 image size, so real (any
+            // positive, equal-for-both-axes) pixel/focuser sizes must be supplied explicitly: PhysicalDelta has
+            // no fallback for a zero sensor size (geometry is a precondition -- see its doc comment), and
+            // BuildMotorized's mocked profile otherwise leaves PixelSize at its NSubstitute default of 0. A 1x1
+            // image size keeps the conversion isotropic, so the SNR ratio (and thus IsReliable) is unchanged
+            // from the pre-F2-fix raw-(A,B) computation this test was written against.
+            vm.RunCalibrationForTest(deviceDriven: true, pixelSizeMicrons: 3.76, focuserStepMicrons: 3.6);
 
             options.Received(1).CalibrationIsReliable = true;
         }
@@ -2522,12 +3087,460 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
             vm.SeedStepReading(WizardStep.ReBaseline2, 0.4, 0.0, 1000.0);
             vm.SeedStepReading(WizardStep.Screw2, 0.9, 0.0, 1000.0);
 
-            vm.RunCalibrationForTest(deviceDriven: true);
+            // Explicit isotropic geometry -- see RunCalibrationForTest_DeviceDriven_ReliableCalibration_SetsCalibrationIsReliableTrue.
+            vm.RunCalibrationForTest(deviceDriven: true, pixelSizeMicrons: 3.76, focuserStepMicrons: 3.6);
 
             Assert.Multiple(() => {
                 options.Received(1).CalibrationIsReliable = false;
                 options.Received(1).DeviceLinkedCalibrationDeviceName = "ASG Electronic EAT - 90mm";
             });
+        }
+
+        // F2 regression lock at the VM<->calculator seam: RunCalibrationMath must persist the PHYSICAL-space
+        // screw angles/ratio TiltCalibrationCalculator.Calibate() computes, not raw (A,B)-tilt-plane-coefficient
+        // values. The bug this refactor fixed (RunCalibrationMath hand-mirroring angle/ratio algebra in raw
+        // (A,B) space) manifested exactly at this seam, and the calculator-level anisotropic tests alone can't
+        // catch a future edit that bypasses Calibrate() again here.
+        //
+        // Two single-screw moves of EQUAL physical magnitude at physical directions 200 deg and 290 deg (90 deg
+        // apart -- this adapter's ideal 4-screw spacing) on a strongly non-square 6000x2000 image. Physically
+        // (what Calibrate() now correctly produces): Screw1 = 200 deg exactly, Screw2 = 290 deg exactly,
+        // RawAngleDiffDegrees = 90 deg, MoveMagnitudeRatio = 1.0 -- no warning.
+        // In raw (A,B) space (what the pre-refactor/pre-F2-fix inline math in RunCalibrationMath produced for
+        // these exact same deltas): Screw1 ~= 207.22 deg, Screw2 ~= 297.22 deg, RawAngleDiffDegrees ~= 49.4 deg,
+        // MoveMagnitudeRatio ~= 2.04 -- comfortably past the 1.5x "unequal tilt changes" warning threshold.
+        [Test]
+        public void RunCalibrationForTest_AnisotropicSensor_PersistsPhysicalSpaceScrewAnglesNotRawSpace() {
+            var (vm, options, _, _) = Build(screwCount: 4);
+            var tiltPlane = new TiltPlaneModel(new System.Drawing.Size(6000, 2000), fRatio: 7,
+                a: 0, b: 0, c: 0, mean: 1000, focuserStepSizeMicrons: 0.5,
+                centerPosition: 1000, topLeftPosition: 1000, topRightPosition: 1000,
+                bottomLeftPosition: 1000, bottomRightPosition: 1000);
+            vm.SeedStepReading(WizardStep.Baseline, 0.0, 0.0, 1000.0);
+            vm.SeedStepReading(WizardStep.Screw1, -30.86389773370834, 28.265954033240128, 1000.0);
+            vm.SeedStepReading(WizardStep.ReBaseline2, 0.0, 0.0, 1000.0);
+            vm.SeedStepReading(WizardStep.Screw2, -84.79786209972038, -10.287965911236123, 1000.0);
+
+            vm.RunCalibrationForTest(pixelSizeMicrons: 3.76, focuserStepMicrons: 0.5, tiltPlaneOverride: tiltPlane);
+
+            Assert.Multiple(() => {
+                options.Received(1).Screw1AngleDegrees = Arg.Is<double>(v => Math.Abs(v - 200.0) < 0.01);
+                options.Received(1).Screw2AngleDegrees = Arg.Is<double>(v => Math.Abs(v - 290.0) < 0.01);
+                // MoveMagnitudeRatio has no direct public getter, but it feeds the very same
+                // ValidateCalibrationQuality warning check as the angle gap: the physical ratio (1.0) is
+                // nowhere near the 1.5x threshold, whereas the raw-(A,B) ratio (~2.04x) would have tripped it
+                // -- so a clean (no-warning) WarningText is itself evidence MoveMagnitudeRatio came from
+                // Calibrate()'s physical result, not a raw-(A,B) recomputation.
+                Assert.That(vm.HasWarning, Is.False);
+                Assert.That(vm.WarningText, Is.Empty);
+            });
+        }
+
+        // --- Auto Focus Binning (NINA's CAPTURE binning, not the star detector's software DetectionBinning) --
+
+        // The sensor as it physically is, and the one screw move the two runs below both measure.
+        //
+        // (A, B) are focuser steps per NORMALIZED image coordinate, so they are IDENTICAL whatever binning the
+        // frames were captured at -- normalized coordinates do not shrink with the frame. The only things that
+        // change between a 1x1 and a 2x2 run are the frame's pixel dimensions (halved) and the pitch of one of
+        // its pixels (doubled), and those two changes cancel: the sensor is the same piece of silicon. So the
+        // recovered thread pitch MUST come out the same, and the physical constants below are shared by both.
+        private const int SensorWidthPixels = 6248;
+        private const int SensorHeightPixels = 4176;
+        private const double NativePixelSizeMicrons = 3.76;      // the profile's CameraSettings.PixelSize
+        private const double BinningFocuserStepMicrons = 3.6;
+        private const double BinningScrewRadiusMm = 44.0;
+
+        // Screw 1's move, chosen along +x only (physical direction 90 deg); screw 2 gets the same magnitude at
+        // 210 deg -- a 3-screw adapter's ideal 120 deg gap, so no screw-angle-gap warning muddies the result.
+        private const double Screw1A = 50.0;
+
+        private static double BinningSensorWidthMicrons => SensorWidthPixels * NativePixelSizeMicrons;
+        private static double BinningSensorHeightMicrons => SensorHeightPixels * NativePixelSizeMicrons;
+
+        // |ΔG| for screw 1's move, in physical gradient units (µm of focuser travel per µm of sensor).
+        private static double BinningScrewMoveGradient => Screw1A * BinningFocuserStepMicrons / BinningSensorWidthMicrons;
+
+        // Runs one full 6-step calibration whose frames were captured at `binning`, and returns the pitch the
+        // wizard recovered. Everything except the FRAME (its dimensions and its pixel pitch) is held fixed --
+        // including the profile pixel size handed to RunCalibrationMath, which is always the camera's native
+        // value because that is what production reads from the profile.
+        private static (double recoveredPitch, bool hasWarning, string warningText) RunBinnedCalibration(int binning) {
+            var (vm, options, _, _) = Build(screwCount: 3);
+
+            double capturedPitch = double.NaN;
+            options.When(o => o.LastMeasuredThreadPitchMicrons = Arg.Any<double>())
+                   .Do(ci => capturedPitch = ci.Arg<double>());
+
+            // The frame as captured: binning shrinks the pixel grid and coarsens each pixel by the same factor.
+            var tiltPlane = new TiltPlaneModel(
+                new System.Drawing.Size(SensorWidthPixels / binning, SensorHeightPixels / binning), fRatio: 7,
+                a: 0, b: 0, c: 0, mean: 10000, focuserStepSizeMicrons: BinningFocuserStepMicrons,
+                centerPosition: 10000, topLeftPosition: 10000, topRightPosition: 10000,
+                bottomLeftPosition: 10000, bottomRightPosition: 10000,
+                pixelSizeMicrons: NativePixelSizeMicrons * binning);
+
+            double g = BinningScrewMoveGradient;
+            double screw2A = -0.5 * g * BinningSensorWidthMicrons / BinningFocuserStepMicrons;
+            double screw2B = (Math.Sqrt(3.0) / 2.0) * g * BinningSensorHeightMicrons / BinningFocuserStepMicrons;
+
+            // The all-inward step is a PURE PISTON: no tilt change, and a mean-focus shift sized so the
+            // geometry-free piston-implied pitch lands exactly on the true pitch. That makes the wizard's
+            // tilt-vs-piston agreement check a direct read-out of whether the tilt side got the geometry right.
+            double truePitchMicrons = 1.5 * BinningScrewRadiusMm * 1000.0 * g / vm.CalibrationAppliedAmount;
+            double pistonShiftSteps = truePitchMicrons * vm.CalibrationAppliedAmount / BinningFocuserStepMicrons;
+
+            vm.SeedStepReading(WizardStep.Baseline, 0.0, 0.0, 10000.0);
+            vm.SeedStepReading(WizardStep.AllInward, 0.0, 0.0, 10000.0 + pistonShiftSteps);
+            vm.SeedStepReading(WizardStep.ReBaseline1, 0.0, 0.0, 10000.0);
+            vm.SeedStepReading(WizardStep.Screw1, Screw1A, 0.0, 10000.0);
+            vm.SeedStepReading(WizardStep.ReBaseline2, 0.0, 0.0, 10000.0);
+            vm.SeedStepReading(WizardStep.Screw2, screw2A, screw2B, 10000.0);
+
+            vm.RunCalibrationForTest(radiusMm: BinningScrewRadiusMm, pixelSizeMicrons: NativePixelSizeMicrons,
+                focuserStepMicrons: BinningFocuserStepMicrons, tiltPlaneOverride: tiltPlane);
+
+            return (capturedPitch, vm.HasWarning, vm.WarningText);
+        }
+
+        // REGRESSION (Auto Focus Binning): the wizard used to pair the tilt plane's BINNED ImageSize with the
+        // profile's NATIVE CameraSettings.PixelSize, so the sensor's physical width/height came out N times too
+        // small and every physical gradient -- and with it the recovered thread pitch / stepper step size --
+        // was inflated by exactly the binning factor. A 2x2 run reported double the true pitch, which then
+        // became the µm-per-turn every automated correction divides by.
+        [Test]
+        public void RunCalibrationForTest_AutoFocusBinning_RecoversTheSamePitchAtEveryBinning() {
+            var bin1 = RunBinnedCalibration(1);
+            var bin2 = RunBinnedCalibration(2);
+            var bin4 = RunBinnedCalibration(4);
+
+            // The closed-form truth, independent of the wizard: a single screw on a 3-screw adapter moves with
+            // a 1.5*R lever arm, so its axial move is 1.5*R*|ΔG| and the pitch is that over the applied turns.
+            double expected = 1.5 * BinningScrewRadiusMm * 1000.0 * BinningScrewMoveGradient
+                / Build(screwCount: 3).vm.CalibrationAppliedAmount;
+
+            Assert.Multiple(() => {
+                Assert.That(expected, Is.GreaterThan(0),
+                    "precondition: the applied amount must be non-zero or every run is vacuously NaN");
+                Assert.That(bin1.recoveredPitch, Is.EqualTo(expected).Within(1e-6), "1x1");
+                Assert.That(bin2.recoveredPitch, Is.EqualTo(expected).Within(1e-6), "2x2 (was 2x the truth)");
+                Assert.That(bin4.recoveredPitch, Is.EqualTo(expected).Within(1e-6), "4x4 (was 4x the truth)");
+            });
+        }
+
+        // The user-visible face of the same bug: the piston-implied pitch needs NO sensor geometry, so it
+        // stayed honest while the tilt-derived pitch was inflated by the binning factor -- and the two were
+        // then compared. At 2x2 they differed by 50%, well past the 20% threshold, so a physically perfect
+        // calibration reported "the piston-implied pitch and the tilt-derived pitch differ".
+        [Test]
+        public void RunCalibrationForTest_AutoFocusBinning_DoesNotFireThePistonDisagreementWarning() {
+            var bin1 = RunBinnedCalibration(1);
+            var bin2 = RunBinnedCalibration(2);
+
+            Assert.Multiple(() => {
+                Assert.That(bin1.hasWarning, Is.False, $"1x1 baseline must be clean: {bin1.warningText}");
+                Assert.That(bin2.warningText, Does.Not.Contain("piston-implied"));
+                Assert.That(bin2.hasWarning, Is.False, $"2x2 must be equally clean: {bin2.warningText}");
+            });
+        }
+
+        // The other half of the same pairing: screw ORIENTATION survives symmetric binning untouched, because
+        // gx and gy are inflated by the same factor and atan2 is scale-invariant. Worth pinning explicitly --
+        // it is the reason the bug was invisible on the diagram while the pitch was silently doubling, and it
+        // would stop being true the moment someone "fixed" one axis' pixel pitch without the other.
+        [Test]
+        public void RunCalibrationForTest_AutoFocusBinning_LeavesScrewAnglesUnchanged() {
+            var (vm1, options1, _, _) = Build(screwCount: 3);
+            var (vm2, options2, _, _) = Build(screwCount: 3);
+
+            double captured1 = double.NaN, captured2 = double.NaN;
+            options1.When(o => o.Screw1AngleDegrees = Arg.Any<double>()).Do(ci => captured1 = ci.Arg<double>());
+            options2.When(o => o.Screw1AngleDegrees = Arg.Any<double>()).Do(ci => captured2 = ci.Arg<double>());
+
+            SeedBinningScrewMoves(vm1, 1);
+            SeedBinningScrewMoves(vm2, 2);
+
+            Assert.Multiple(() => {
+                Assert.That(captured1, Is.EqualTo(90.0).Within(1e-6), "screw 1's move points along +x, i.e. 90 deg");
+                Assert.That(captured2, Is.EqualTo(captured1).Within(1e-9));
+            });
+        }
+
+        private static void SeedBinningScrewMoves(TiltAdapterWizardVM vm, int binning) {
+            var tiltPlane = new TiltPlaneModel(
+                new System.Drawing.Size(SensorWidthPixels / binning, SensorHeightPixels / binning), fRatio: 7,
+                a: 0, b: 0, c: 0, mean: 10000, focuserStepSizeMicrons: BinningFocuserStepMicrons,
+                centerPosition: 10000, topLeftPosition: 10000, topRightPosition: 10000,
+                bottomLeftPosition: 10000, bottomRightPosition: 10000,
+                pixelSizeMicrons: NativePixelSizeMicrons * binning);
+            double g = BinningScrewMoveGradient;
+            vm.SeedStepReading(WizardStep.Baseline, 0.0, 0.0, 10000.0);
+            vm.SeedStepReading(WizardStep.Screw1, Screw1A, 0.0, 10000.0);
+            vm.SeedStepReading(WizardStep.ReBaseline2, 0.0, 0.0, 10000.0);
+            vm.SeedStepReading(WizardStep.Screw2,
+                -0.5 * g * BinningSensorWidthMicrons / BinningFocuserStepMicrons,
+                (Math.Sqrt(3.0) / 2.0) * g * BinningSensorHeightMicrons / BinningFocuserStepMicrons,
+                10000.0);
+            vm.RunCalibrationForTest(radiusMm: BinningScrewRadiusMm, pixelSizeMicrons: NativePixelSizeMicrons,
+                focuserStepMicrons: BinningFocuserStepMicrons, tiltPlaneOverride: tiltPlane);
+        }
+
+        // --- Piston-implied-pitch warning wiring (Task 4) -------------------------------------------------
+
+        // Both piston tests share the same clean screw geometry: Screw1's delta is (0, -g), Screw2's is
+        // (g, 0) with g = 5e-5. A 1x1 isotropic tiltPlaneOverride + unit pixel size/focuser step (see
+        // RunCalibrationForTest below) makes PhysicalDelta byte-identical to these raw (A,B) seeds -- no
+        // forward/inverse conversion needed to reason about the numbers. That gives:
+        //  - equal magnitudes (ratio 1.0, comfortably under the 1.5x MagnitudeRatioWarnThreshold)
+        //  - a clean 90 deg gap (screw count 4's exact expected spacing, no angle warning)
+        //  - CalibrationAppliedAmount defaults to 1 turn (unconfigured options resolve to the VM's "Manual"
+        //    device-preset fallback -- see CalibrationAppliedAmount's getter), and the 4-screw lever arm is
+        //    the screw radius itself, so measured (tilt-derived) hardware = g * radiusMicrons / applied
+        //    = 0.00005 * 44000 / 1 = 2.2 um/turn.
+        // So the only thing that varies between the two tests below is AllInward's mean focuser position,
+        // which drives the piston-implied pitch relative to that fixed 2.2 um/turn -- isolating the piston
+        // check from the angle/magnitude checks (which never contribute a warning part in either case).
+        private static TiltPlaneModel IsotropicPistonWarningTiltPlane() =>
+            new TiltPlaneModel(new System.Drawing.Size(1, 1), fRatio: 7,
+                a: 0, b: 0, c: 0, mean: 1000, focuserStepSizeMicrons: 1,
+                centerPosition: 1000, topLeftPosition: 1000, topRightPosition: 1000,
+                bottomLeftPosition: 1000, bottomRightPosition: 1000);
+
+        [Test]
+        public void RunCalibrationForTest_PistonDisagreesWithMeasuredHardwareBy30Percent_WarnsAndDisplaysPiston() {
+            var (vm, _, _, _) = Build(screwCount: 4);
+            vm.SeedStepReading(WizardStep.Baseline, 0.0, 0.0, 1000.0);
+            // AllInward's mean sits 2.86 focuser units below the Baseline/ReBaseline1 midpoint (both 1000.0,
+            // so there is no drift to correct for): piston = |1000.0 - 997.14| * fStep(1) / applied(1) =
+            // 2.86 um/turn. Relative to measured = 2.2 um/turn, that is a 30% disagreement (2.86 / 2.2 =
+            // 1.3) -- comfortably over the 20% PistonDisagreementWarnThreshold.
+            vm.SeedStepReading(WizardStep.AllInward, 0.0, 0.0, 997.14);
+            vm.SeedStepReading(WizardStep.ReBaseline1, 0.0, 0.0, 1000.0);
+            vm.SeedStepReading(WizardStep.Screw1, 0.0, -0.00005, 1000.0);
+            vm.SeedStepReading(WizardStep.ReBaseline2, 0.0, 0.0, 1000.0);
+            vm.SeedStepReading(WizardStep.Screw2, 0.00005, 0.0, 1000.0);
+
+            vm.RunCalibrationForTest(radiusMm: 44, pixelSizeMicrons: 1, focuserStepMicrons: 1,
+                tiltPlaneOverride: IsotropicPistonWarningTiltPlane());
+
+            Assert.Multiple(() => {
+                Assert.That(vm.HasWarning, Is.True);
+                Assert.That(vm.WarningText, Does.Contain(
+                    "The piston-implied pitch (2.86 µm) and the tilt-derived pitch (2.2 µm) differ by 30%."));
+                Assert.That(vm.PistonPitchDisplay, Is.EqualTo("Piston-implied: 2.9 µm/turn"));
+            });
+        }
+
+        [Test]
+        public void RunCalibrationForTest_PistonAgreesWithMeasuredHardwareWithin20Percent_NoWarning() {
+            var (vm, _, _, _) = Build(screwCount: 4);
+            vm.SeedStepReading(WizardStep.Baseline, 0.0, 0.0, 1000.0);
+            // Same fixed measured hardware (2.2 um/turn) as the disagreement test above, but AllInward's mean
+            // is only 2.53 focuser units below the Baseline/ReBaseline1 midpoint: piston = 2.53 um/turn, a
+            // 15% relative difference from measured (2.53 / 2.2 = 1.15) -- comfortably under the 20%
+            // threshold without being close to zero, so this is a meaningful negative case, not a trivial one.
+            vm.SeedStepReading(WizardStep.AllInward, 0.0, 0.0, 997.47);
+            vm.SeedStepReading(WizardStep.ReBaseline1, 0.0, 0.0, 1000.0);
+            vm.SeedStepReading(WizardStep.Screw1, 0.0, -0.00005, 1000.0);
+            vm.SeedStepReading(WizardStep.ReBaseline2, 0.0, 0.0, 1000.0);
+            vm.SeedStepReading(WizardStep.Screw2, 0.00005, 0.0, 1000.0);
+
+            vm.RunCalibrationForTest(radiusMm: 44, pixelSizeMicrons: 1, focuserStepMicrons: 1,
+                tiltPlaneOverride: IsotropicPistonWarningTiltPlane());
+
+            Assert.Multiple(() => {
+                Assert.That(vm.HasWarning, Is.False);
+                Assert.That(vm.WarningText, Is.Empty);
+                Assert.That(vm.PistonPitchDisplay, Is.EqualTo("Piston-implied: 2.5 µm/turn"));
+            });
+        }
+
+        // --- Corner-region AF cross-check wiring (Task 5) -------------------------------------------------
+
+        // All three tests below share the same clean paraboloid geometry as the piston tests above (Screw1
+        // delta (0,-5e-5), Screw2 delta (5e-5,0) — equal magnitudes, a clean 90° gap, no AllInward/ReBaseline1
+        // step so no piston check contributes either) and the same isotropic 1x1 pseudo-sensor, so the ONLY
+        // thing that varies between them is the corner-region reading — isolating the cross-check from every
+        // other warning the same way the piston tests isolate PistonAgreement.
+        private static void SeedCleanParaboloidReadings(TiltAdapterWizardVM vm,
+            double screw1CornerA, double screw1CornerB, double screw2CornerA, double screw2CornerB) {
+            vm.SeedStepReading(WizardStep.Baseline, 0.0, 0.0, 1000.0, cornerA: 0.0, cornerB: 0.0, cornerMean: 1000.0);
+            vm.SeedStepReading(WizardStep.Screw1, 0.0, -0.00005, 1000.0, cornerA: screw1CornerA, cornerB: screw1CornerB, cornerMean: 1000.0);
+            vm.SeedStepReading(WizardStep.ReBaseline2, 0.0, 0.0, 1000.0, cornerA: 0.0, cornerB: 0.0, cornerMean: 1000.0);
+            vm.SeedStepReading(WizardStep.Screw2, 0.00005, 0.0, 1000.0, cornerA: screw2CornerA, cornerB: screw2CornerB, cornerMean: 1000.0);
+        }
+
+        [Test]
+        public void RunCalibrationForTest_CornerCrossCheckAgreesWithin15Percent_NoNewWarningPart() {
+            var (vm, _, _, _) = Build(screwCount: 4);
+            // Corner deltas are a uniform 10% higher magnitude than the paraboloid's (0,-5.5e-5) / (5.5e-5,0)
+            // vs (0,-5e-5) / (5e-5,0): relative difference |5e-5 - 5.5e-5| / 5.5e-5 = 9.09% -- comfortably
+            // under the 15% threshold without being the trivial (identical-values) case.
+            SeedCleanParaboloidReadings(vm, screw1CornerA: 0.0, screw1CornerB: -0.000055, screw2CornerA: 0.000055, screw2CornerB: 0.0);
+
+            vm.RunCalibrationForTest(radiusMm: 44, pixelSizeMicrons: 1, focuserStepMicrons: 1,
+                tiltPlaneOverride: IsotropicPistonWarningTiltPlane());
+
+            Assert.Multiple(() => {
+                Assert.That(vm.HasWarning, Is.False);
+                Assert.That(vm.WarningText, Is.Empty);
+                // The cross-check estimate itself is still computed and displayed regardless of whether it
+                // disagrees enough to warn -- the display and the warning are separate signals (locked
+                // decision: flag/display, never silently blend).
+                Assert.That(vm.HasCornerCrossCheck, Is.True);
+                Assert.That(vm.CornerCrossCheckDisplay, Is.EqualTo("Corner-AF cross-check: 2.42 µm/turn"));
+            });
+        }
+
+        [Test]
+        public void RunCalibrationForTest_CornerMagnitudes25PercentHigherThanParaboloid_WarnsAndDisplaysCornerEstimate() {
+            var (vm, _, _, _) = Build(screwCount: 4);
+            // Corner deltas are a uniform 25% higher magnitude than the paraboloid's: (0,-6.25e-5) /
+            // (6.25e-5,0) vs (0,-5e-5) / (5e-5,0) -- relative difference |5e-5 - 6.25e-5| / 6.25e-5 = 20%,
+            // comfortably over the 15% threshold.
+            SeedCleanParaboloidReadings(vm, screw1CornerA: 0.0, screw1CornerB: -0.0000625, screw2CornerA: 0.0000625, screw2CornerB: 0.0);
+
+            vm.RunCalibrationForTest(radiusMm: 44, pixelSizeMicrons: 1, focuserStepMicrons: 1,
+                tiltPlaneOverride: IsotropicPistonWarningTiltPlane());
+
+            Assert.Multiple(() => {
+                Assert.That(vm.HasWarning, Is.True);
+                Assert.That(vm.WarningText, Does.Contain("The per-star model and the corner-region AF differ by"));
+                Assert.That(vm.WarningText, Does.Contain("corner-region AF puts the pitch at 2.75 µm"));
+                Assert.That(vm.HasCornerCrossCheck, Is.True);
+                Assert.That(vm.CornerCrossCheckDisplay, Is.EqualTo("Corner-AF cross-check: 2.75 µm/turn"));
+            });
+        }
+
+        [Test]
+        public void RunCalibrationForTest_PartialCornerData_SkipsCrossCheckCleanly() {
+            var (vm, _, _, _) = Build(screwCount: 4);
+            // Same 25%-higher corner geometry as the disagreement test above -- WOULD warn if the cross-check
+            // ran -- but Screw1's corner reading is left at its NaN default (never seeded), simulating a step
+            // whose corner regions failed to fit / an older saved run captured before this feature shipped.
+            // A partially-available run must degrade to "no cross-check" cleanly: no NaN-contaminated warning
+            // text, no display, and — critically — no OTHER warning either (proving the missing corner data
+            // doesn't leak NaN into the rest of ValidateCalibrationQuality).
+            vm.SeedStepReading(WizardStep.Baseline, 0.0, 0.0, 1000.0, cornerA: 0.0, cornerB: 0.0, cornerMean: 1000.0);
+            vm.SeedStepReading(WizardStep.Screw1, 0.0, -0.00005, 1000.0); // corner NaN -- not seeded
+            vm.SeedStepReading(WizardStep.ReBaseline2, 0.0, 0.0, 1000.0, cornerA: 0.0, cornerB: 0.0, cornerMean: 1000.0);
+            vm.SeedStepReading(WizardStep.Screw2, 0.00005, 0.0, 1000.0, cornerA: 0.0000625, cornerB: 0.0, cornerMean: 1000.0);
+
+            vm.RunCalibrationForTest(radiusMm: 44, pixelSizeMicrons: 1, focuserStepMicrons: 1,
+                tiltPlaneOverride: IsotropicPistonWarningTiltPlane());
+
+            Assert.Multiple(() => {
+                Assert.That(vm.HasWarning, Is.False);
+                Assert.That(vm.WarningText, Is.Empty);
+                Assert.That(vm.HasCornerCrossCheck, Is.False);
+                Assert.That(vm.CornerCrossCheckDisplay, Is.Empty);
+            });
+        }
+
+        [Test]
+        public void RunCalibrationForTest_StepEntirelyMissingFromReadings_SkipsCrossCheckCleanly() {
+            var (vm, _, _, _) = Build(screwCount: 4);
+            // Distinct from the partial-corner-data test above (which SEEDS Screw1 but leaves its corner
+            // fields at their NaN default): here Screw2 is never seeded AT ALL, so stepReadings has no entry
+            // for it. Reading(WizardStep.Screw2) then falls back to default(StepReading), whose CornerA/B/Mean
+            // are a struct-default 0.0 -- NOT NaN -- so a completeness check built on the non-NaN test alone
+            // would be fooled into treating this as a complete, valid (0,0,0) corner reading for Screw2 (Fix
+            // 2, post-review). Screw2's corner delta would then be (0,0) - ReBaseline2's corner (0,0) = (0,0),
+            // and 4-screw RecoverHardwareDetailed's own guard only rejects an overall measured <= 0 (not a
+            // per-screw zero) -- averaging that zero against Screw1's real corner move still yields a
+            // non-NaN, plausible-looking µm/turn, so this specific failure mode would NOT be caught by
+            // downstream NaN propagation; only the explicit stepReadings.ContainsKey/TryGetValue check does.
+            // (Screw2's paraboloid side is equally absent, which trips the UNRELATED screw-angle-gap warning
+            // -- expected, and not asserted against; this test only cares about the corner outputs.)
+            vm.SeedStepReading(WizardStep.Baseline, 0.0, 0.0, 1000.0, cornerA: 0.0, cornerB: 0.0, cornerMean: 1000.0);
+            vm.SeedStepReading(WizardStep.Screw1, 0.0, -0.00005, 1000.0, cornerA: 0.0, cornerB: -0.0000625, cornerMean: 1000.0);
+            vm.SeedStepReading(WizardStep.ReBaseline2, 0.0, 0.0, 1000.0, cornerA: 0.0, cornerB: 0.0, cornerMean: 1000.0);
+            // WizardStep.Screw2 intentionally NEVER seeded.
+
+            vm.RunCalibrationForTest(radiusMm: 44, pixelSizeMicrons: 1, focuserStepMicrons: 1,
+                tiltPlaneOverride: IsotropicPistonWarningTiltPlane());
+
+            Assert.Multiple(() => {
+                Assert.That(vm.HasCornerCrossCheck, Is.False);
+                Assert.That(vm.CornerCrossCheckDisplay, Is.Empty);
+                Assert.That(vm.WarningText, Does.Not.Contain("corner-region AF differ"));
+            });
+        }
+
+        // --- Task 6: optional measured final re-baseline wiring (RunCalibrationMath reads a seeded
+        // ReBaseline3 reading and passes it -- and HasFinalRebaseline -- through the SAME shared MakeInputs
+        // both the paraboloid and (Task 5) corner-cross-check estimators are built from) -----------------
+
+        [Test]
+        public void RunCalibrationForTest_ReBaseline3EqualToReBaseline2_MatchesRunWithoutFinalRebaseline() {
+            // When the seeded ReBaseline3 reading is IDENTICAL to ReBaseline2, the drift-cancelling midpoint
+            // mid(ReBaseline2, ReBaseline3) collapses to ReBaseline2 itself -- Screw2Delta becomes numerically
+            // identical to the no-final-rebaseline reference (Screw2 - ReBaseline2 alone). Proves
+            // RunCalibrationMath actually reads a seeded ReBaseline3 rather than ignoring it, without
+            // re-deriving the drift-cancelling algebra itself (already pinned exactly by
+            // TiltCalibrationCalculatorTests.Calibrate_WithFinalRebaseline_Screw2DeltaIsDriftImmune).
+            var (vmWithout, _, _, _) = Build(screwCount: 4);
+            vmWithout.SeedStepReading(WizardStep.Baseline, 0.0, 0.0, 1000.0);
+            vmWithout.SeedStepReading(WizardStep.Screw1, 0.0, -0.00005, 1000.0);
+            vmWithout.SeedStepReading(WizardStep.ReBaseline2, 0.0002, -0.0001, 1000.0);
+            vmWithout.SeedStepReading(WizardStep.Screw2, 0.00005, 0.0, 1000.0);
+            vmWithout.RunCalibrationForTest(radiusMm: 44, pixelSizeMicrons: 1, focuserStepMicrons: 1,
+                tiltPlaneOverride: IsotropicPistonWarningTiltPlane());
+
+            var (vmWith, _, _, _) = Build(screwCount: 4);
+            vmWith.SeedStepReading(WizardStep.Baseline, 0.0, 0.0, 1000.0);
+            vmWith.SeedStepReading(WizardStep.Screw1, 0.0, -0.00005, 1000.0);
+            vmWith.SeedStepReading(WizardStep.ReBaseline2, 0.0002, -0.0001, 1000.0);
+            vmWith.SeedStepReading(WizardStep.Screw2, 0.00005, 0.0, 1000.0);
+            vmWith.SeedStepReading(WizardStep.ReBaseline3, 0.0002, -0.0001, 1000.0); // identical to ReBaseline2
+            vmWith.RunCalibrationForTest(radiusMm: 44, pixelSizeMicrons: 1, focuserStepMicrons: 1,
+                tiltPlaneOverride: IsotropicPistonWarningTiltPlane());
+
+            Assert.Multiple(() => {
+                Assert.That(vmWith.MeasuredHardwareDisplay, Is.EqualTo(vmWithout.MeasuredHardwareDisplay));
+                Assert.That(vmWith.PitchUncertaintyDisplay, Is.EqualTo(vmWithout.PitchUncertaintyDisplay));
+            });
+        }
+
+        [Test]
+        public void RunCalibrationForTest_ReBaseline3DifferentFromReBaseline2_ChangesRecoveredHardware() {
+            // Now ReBaseline3 genuinely differs from ReBaseline2 -- Screw2Delta references
+            // mid(ReBaseline2, ReBaseline3) instead of ReBaseline2 alone, so the recovered hardware must
+            // differ from the no-ReBaseline3 run. Proves the wizard is actually READING and USING the
+            // seeded ReBaseline3 value (not silently ignoring it because HasFinalRebaseline never got wired).
+            var (vmWithout, _, _, _) = Build(screwCount: 4);
+            vmWithout.SeedStepReading(WizardStep.Baseline, 0.0, 0.0, 1000.0);
+            vmWithout.SeedStepReading(WizardStep.Screw1, 0.0, -0.00005, 1000.0);
+            vmWithout.SeedStepReading(WizardStep.ReBaseline2, 0.0, 0.0, 1000.0);
+            vmWithout.SeedStepReading(WizardStep.Screw2, 0.00005, 0.0, 1000.0);
+            vmWithout.RunCalibrationForTest(radiusMm: 44, pixelSizeMicrons: 1, focuserStepMicrons: 1,
+                tiltPlaneOverride: IsotropicPistonWarningTiltPlane());
+
+            var (vmWith, _, _, _) = Build(screwCount: 4);
+            vmWith.SeedStepReading(WizardStep.Baseline, 0.0, 0.0, 1000.0);
+            vmWith.SeedStepReading(WizardStep.Screw1, 0.0, -0.00005, 1000.0);
+            vmWith.SeedStepReading(WizardStep.ReBaseline2, 0.0, 0.0, 1000.0);
+            vmWith.SeedStepReading(WizardStep.Screw2, 0.00005, 0.0, 1000.0);
+            vmWith.SeedStepReading(WizardStep.ReBaseline3, 0.00002, 0.00002, 1000.0); // drifted from ReBaseline2
+            vmWith.RunCalibrationForTest(radiusMm: 44, pixelSizeMicrons: 1, focuserStepMicrons: 1,
+                tiltPlaneOverride: IsotropicPistonWarningTiltPlane());
+
+            Assert.That(vmWith.MeasuredHardwareDisplay, Is.Not.EqualTo(vmWithout.MeasuredHardwareDisplay));
+        }
+
+        [Test]
+        public void StartAsync_WithMeasureFinalRebaseline_ExtendsActiveStepsToFive() {
+            // StartAsync (the live-run caller of GetMeasurementSteps) must read BOTH options -- proves the
+            // wiring reaches the real entry point, not just the static GetMeasurementSteps helper tested
+            // directly above.
+            var (vm, _, _, _) = Build(configureOptions: o => {
+                o.MeasureCurvatureDuringCalibration.Returns(false);
+                o.MeasureFinalRebaseline.Returns(true);
+            });
+
+            vm.StartCommand.Execute(null);
+
+            Assert.That(vm.StepProgressDisplay, Is.EqualTo("Step 1 of 5"));
         }
 
         [Test]
@@ -2597,6 +3610,490 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.TiltAdapterWizard {
             Connect(vm);
 
             options.DidNotReceive().MeasureCurvatureDuringCalibration = Arg.Any<bool>();
+        }
+
+        // ---- Warning-only curvature-channel cross-check (design §2.4) --------------------------------------
+        //
+        // σ is measured from the mean best-focus change (geometric channel). The curvature effect responds to
+        // the same piston and σ is DEFINED as the sign of that response, so the two are now independent
+        // measurements of one quantity. A large, contradicting curvature change is worth surfacing — but only
+        // as information: the optical channel is usually drift-buried and must never veto the robust one, nor
+        // change the stored sign.
+
+        // Seeds a 6-step run whose mean-focus channel always measures σ = +1 (all-inward mean 990 < baseline
+        // 1000), with the curvature effect at screw radius supplied per step so the cross-check has a signal
+        // and a drift scale to compare it against.
+        private static (TiltAdapterWizardVM vm, ITiltAdapterOptions options) RunSixStepWithCurvature(
+                double baselineE, double allInwardE, double reBaseline1E, double reBaseline2E) {
+            // Deliberately isotropic UNIT geometry (1 µm pixels, 1 µm focuser step). ComputeConfidence converts
+            // its deltas to physical gradient space, where valid sensor/focuser geometry is a precondition — an
+            // unpopulated profile makes the conversion non-finite, which fails safe to an SNR warning and would
+            // drown out the curvature cross-check these tests are actually about. Unit geometry over the 1x1
+            // pseudo-sensor makes that conversion the identity, so the SNR here is exactly what raw (A,B) gives.
+            var profile = Substitute.For<IProfileService>();
+            profile.ActiveProfile.CameraSettings.PixelSize.Returns(1.0);
+            var inspectorOptions = Substitute.For<IInspectorOptions>();
+            inspectorOptions.EffectiveMicronsPerFocuserStep.Returns(1.0);
+            var (vm, options, _, _) = Build(
+                configureOptions: o => o.MeasureCurvatureDuringCalibration.Returns(true),
+                profileService: profile,
+                inspectorOptions: inspectorOptions);
+            vm.StartCommand.Execute(null);
+
+            vm.SeedStepReading(WizardStep.Baseline, 0.0, 0.0, 1000.0, baselineE);
+            vm.SeedStepReading(WizardStep.AllInward, 0.0, 0.0, 990.0, allInwardE);
+            vm.SeedStepReading(WizardStep.ReBaseline1, 0.0, 0.0, 1000.0, reBaseline1E);
+            vm.SeedStepReading(WizardStep.Screw1, 0.5, 0.0, 1000.0, reBaseline1E);
+            vm.SeedStepReading(WizardStep.ReBaseline2, 0.0, 0.0, 1000.0, reBaseline2E);
+            vm.SeedStepReading(WizardStep.Screw2, -0.25, 0.433, 1000.0, reBaseline2E);
+
+            for (int i = 0; i < 6; i++) {
+                vm.NextStep();
+            }
+            return (vm, options);
+        }
+
+        [Test]
+        public void CurvatureCrossCheck_ChannelsAgree_NoWarning() {
+            // σ = +1 from the mean-focus channel; the curvature effect rose by +100 µm on the same step, which
+            // is what σ = +1 means by definition. Nothing to report.
+            var (vm, _) = RunSixStepWithCurvature(baselineE: -400, allInwardE: -300, reBaseline1E: -395, reBaseline2E: -390);
+
+            Assert.Multiple(() => {
+                Assert.That(vm.CurrentStep, Is.EqualTo(WizardStep.Complete));
+                Assert.That(vm.HasConfidenceWarning, Is.False);
+                Assert.That(vm.ConfidenceWarningText, Is.Empty);
+            });
+        }
+
+        [Test]
+        public void CurvatureCrossCheck_ContradictingButWithinDrift_NoWarning() {
+            // The curvature effect moved the "wrong" way, but only by 6 µm against re-baseline drifts of 20
+            // and 25 µm — exactly the drift-buried regime the reference session showed. Staying quiet here is
+            // the point: a noisy optical channel must not cast doubt on the robust one.
+            var (vm, _) = RunSixStepWithCurvature(baselineE: -400, allInwardE: -406, reBaseline1E: -380, reBaseline2E: -355);
+
+            Assert.Multiple(() => {
+                Assert.That(vm.CurrentStep, Is.EqualTo(WizardStep.Complete));
+                Assert.That(vm.HasConfidenceWarning, Is.False);
+            });
+        }
+
+        [Test]
+        public void CurvatureCrossCheck_ContradictingAndLarge_WarnsWithoutChangingTheSign() {
+            // A 150 µm move the wrong way against ~5 µm of re-baseline drift. Surface it — and keep the
+            // measured sign exactly as the mean-focus channel set it.
+            var (vm, options) = RunSixStepWithCurvature(baselineE: -400, allInwardE: -550, reBaseline1E: -404, reBaseline2E: -398);
+
+            Assert.Multiple(() => {
+                Assert.That(vm.CurrentStep, Is.EqualTo(WizardStep.Complete));
+                Assert.That(vm.HasConfidenceWarning, Is.True);
+                Assert.That(vm.ConfidenceWarningText, Does.Contain("cross-check"));
+                Assert.That(vm.ConfidenceWarningText, Does.Contain("informational"));
+                // Warning-only: the stored sign is still the mean-focus channel's verdict.
+                options.Received().ScrewInwardCurvatureSign = 1;
+                options.Received().ScrewInwardCurvatureSignIsMeasured = true;
+                options.Received().IsCalibrated = true;
+            });
+        }
+
+        [Test]
+        public void CurvatureCrossCheck_FourStepRun_NeverWarns() {
+            // No all-screws step ⇒ no curvature channel to compare against, and the configured sign is left
+            // untouched anyway.
+            // Unit geometry for the same reason as RunSixStepWithCurvature: without it the physical-gradient
+            // conversion is non-finite and fails safe to an SNR warning, which is not what this test is about.
+            var profile = Substitute.For<IProfileService>();
+            profile.ActiveProfile.CameraSettings.PixelSize.Returns(1.0);
+            var inspectorOptions = Substitute.For<IInspectorOptions>();
+            inspectorOptions.EffectiveMicronsPerFocuserStep.Returns(1.0);
+            var (vm, _, _, _) = Build(
+                configureOptions: o => o.MeasureCurvatureDuringCalibration.Returns(false),
+                profileService: profile,
+                inspectorOptions: inspectorOptions);
+            vm.StartCommand.Execute(null);
+
+            vm.SeedStepReading(WizardStep.Baseline, 0.0, 0.0, 1000.0, -400);
+            vm.SeedStepReading(WizardStep.Screw1, 0.5, 0.0, 1000.0, -400);
+            vm.SeedStepReading(WizardStep.ReBaseline2, 0.0, 0.0, 1000.0, -400);
+            vm.SeedStepReading(WizardStep.Screw2, -0.25, 0.433, 1000.0, -400);
+
+            for (int i = 0; i < 4; i++) {
+                vm.NextStep();
+            }
+
+            Assert.Multiple(() => {
+                Assert.That(vm.CurrentStep, Is.EqualTo(WizardStep.Complete));
+                Assert.That(vm.HasConfidenceWarning, Is.False);
+            });
+        }
+
+        // ---- The focuser-direction setting k is display-only (design §2.2) ---------------------------------
+
+        [Test]
+        public void SixStepRun_MeasuredCurvatureSign_IsIdenticalUnderEitherFocuserDirection() {
+            // THE INVARIANCE GUARD FOR THE MEASUREMENT. σ is measured from the mean best-focus change, and the
+            // focuser convention provably cancels out of that probe (design §1(c)) — m and k enter both σ and
+            // the probe only through their product. So a seeded 6-step run must store the SAME sign with k
+            // toggled either way. If this ever fails, k has leaked into the calibration math and the design's
+            // central guarantee ("a wrong k gives wrong labels, never wrong motion") is broken.
+            int MeasureWith(bool focuserIncreasesTowardObjective) {
+                var inspectorOptions = Substitute.For<IInspectorOptions>();
+                inspectorOptions.FocuserIncreasesTowardObjective.Returns(focuserIncreasesTowardObjective);
+                var (vm, options, _, _) = Build(
+                    configureOptions: o => o.MeasureCurvatureDuringCalibration.Returns(true),
+                    inspectorOptions: inspectorOptions);
+                vm.StartCommand.Execute(null);
+
+                vm.SeedStepReading(WizardStep.Baseline, 0.0, 0.0, 1000.0);
+                vm.SeedStepReading(WizardStep.AllInward, 0.0, 0.0, 990.0);
+                vm.SeedStepReading(WizardStep.ReBaseline1, 0.0, 0.0, 1000.0);
+                vm.SeedStepReading(WizardStep.Screw1, 0.5, 0.0, 1000.0);
+                vm.SeedStepReading(WizardStep.ReBaseline2, 0.0, 0.0, 1000.0);
+                vm.SeedStepReading(WizardStep.Screw2, -0.25, 0.433, 1000.0);
+
+                int stored = 0;
+                options.When(o => o.ScrewInwardCurvatureSign = Arg.Any<int>())
+                    .Do(ci => stored = ci.Arg<int>());
+
+                for (int i = 0; i < 6; i++) {
+                    vm.NextStep();
+                }
+
+                Assert.That(vm.CurrentStep, Is.EqualTo(WizardStep.Complete), "precondition: the run completed");
+                return stored;
+            }
+
+            var standard = MeasureWith(false);
+            var reversed = MeasureWith(true);
+
+            Assert.Multiple(() => {
+                Assert.That(standard, Is.EqualTo(1), "the all-screws step lowered mean focus ⇒ σ = +1");
+                Assert.That(reversed, Is.EqualTo(standard), "the measured σ must not depend on the focuser setting");
+            });
+        }
+
+        [Test]
+        public void CwMovesAdapterTowardObjective_ReversedFocuser_RoundTripsThroughTheOppositeSign() {
+            // The ONE deliberate exception (design §2.3): the combo asks about the adapter mechanics m, but
+            // stores σ = m·sign(k). On a reversed focuser the same mechanical answer therefore stores the
+            // opposite σ — which is what makes the manual path correct there, where a pinned k = +1
+            // conversion would store an inverted sign for an honest answer. It writes only the ASSUMED σ.
+            var inspectorOptions = Substitute.For<IInspectorOptions>();
+            inspectorOptions.FocuserIncreasesTowardObjective.Returns(true);
+            var (vm, options, _, _) = Build(inspectorOptions: inspectorOptions);
+
+            options.ScrewInwardCurvatureSign.Returns(0);
+            vm.CwMovesAdapterTowardObjective = true;
+            var storedForTowardObjective = TiltScrewGeometry.CurvatureSignForCwDirection(true) * -1;
+
+            Assert.Multiple(() => {
+                options.Received().ScrewInwardCurvatureSign = storedForTowardObjective;
+                options.Received().ScrewInwardCurvatureSignIsMeasured = false;
+
+                // And the getter reads it back consistently, so the combo never contradicts itself.
+                options.ScrewInwardCurvatureSign.Returns(storedForTowardObjective);
+                Assert.That(vm.CwMovesAdapterTowardObjective, Is.True);
+            });
+        }
+
+        [Test]
+        public void FocuserDirectionChange_RefreshesTheMechanicalWordingAndPhysicalAngles() {
+            // k is display-only, so a change must re-raise the wording and re-run the physical-angle
+            // conversion — and touch nothing stored.
+            var inspectorOptions = Substitute.For<IInspectorOptions>();
+            var (vm, options, _, _) = Build(configureOptions: o => {
+                o.IsCalibrated.Returns(true);
+                o.CalibratedScrewCount.Returns(3);
+                o.ScrewInwardCurvatureSign.Returns(1);
+                o.Screw1AngleDegrees.Returns(180.0);
+                o.Screw2AngleDegrees.Returns(300.0);
+                o.Screw3AngleDegrees.Returns(60.0);
+            }, inspectorOptions: inspectorOptions);
+
+            Assert.That(vm.PhysicalScrew1AngleDegrees, Is.EqualTo(0.0).Within(1e-9),
+                "precondition: σ = +1 on a standard focuser is m = +1, so stored 180° is physical 0°");
+            options.ClearReceivedCalls();
+
+            var raised = new List<string>();
+            vm.PropertyChanged += (_, e) => raised.Add(e.PropertyName);
+            inspectorOptions.FocuserIncreasesTowardObjective.Returns(true);
+            inspectorOptions.PropertyChanged += Raise.Event<System.ComponentModel.PropertyChangedEventHandler>(
+                inspectorOptions, new System.ComponentModel.PropertyChangedEventArgs(nameof(IInspectorOptions.FocuserIncreasesTowardObjective)));
+
+            Assert.Multiple(() => {
+                Assert.That(raised, Does.Contain(nameof(TiltAdapterWizardVM.CwMovesAdapterTowardObjective)));
+                Assert.That(raised, Does.Contain(nameof(TiltAdapterWizardVM.PhysicalScrew1AngleDegrees)));
+                Assert.That(vm.PhysicalScrew1AngleDegrees, Is.EqualTo(180.0).Within(1e-9),
+                    "σ = +1 on a reversed focuser is m = −1, so the offset drops and stored == physical");
+                options.DidNotReceive().ScrewInwardCurvatureSign = Arg.Any<int>();
+                options.DidNotReceive().Screw1AngleDegrees = Arg.Any<double>();
+                options.DidNotReceive().IsCalibrated = Arg.Any<bool>();
+            });
+        }
+
+        // --- Opt-in re-link: trusting a hand-entered calibration for automation (Task 9) --------------------
+
+        [Test]
+        public void TrustCalibration_AloneWritesNothing() {
+            var (vm, options) = BuildCalibrated();
+            options.ClearReceivedCalls();
+
+            vm.TrustCalibrationCommand.Execute(null);
+
+            Assert.Multiple(() => {
+                Assert.That(vm.IsTrustCalibrationPending, Is.True, "the button only arms the confirmation");
+                options.DidNotReceive().DeviceLinkedCalibrationDeviceName = Arg.Any<string>();
+                options.DidNotReceive().CalibrationIsReliable = Arg.Any<bool>();
+            });
+        }
+
+        [Test]
+        public void ConfirmTrustCalibration_ArmsBothAutomationMarkersForTheCurrentDevice() {
+            var (vm, options) = BuildCalibrated();
+            options.ClearReceivedCalls();
+
+            vm.TrustCalibrationCommand.Execute(null);
+            vm.ConfirmTrustCalibrationCommand.Execute(null);
+
+            Assert.Multiple(() => {
+                options.Received().DeviceLinkedCalibrationDeviceName = MotorizedPreset;
+                options.Received().CalibrationIsReliable = true;
+                Assert.That(vm.IsTrustCalibrationPending, Is.False);
+            });
+        }
+
+        [Test]
+        public void CancelTrustCalibration_WritesNothing() {
+            var (vm, options) = BuildCalibrated();
+            options.ClearReceivedCalls();
+
+            vm.TrustCalibrationCommand.Execute(null);
+            vm.CancelTrustCalibrationCommand.Execute(null);
+
+            Assert.Multiple(() => {
+                Assert.That(vm.IsTrustCalibrationPending, Is.False);
+                options.DidNotReceive().DeviceLinkedCalibrationDeviceName = Arg.Any<string>();
+                options.DidNotReceive().CalibrationIsReliable = Arg.Any<bool>();
+            });
+        }
+
+        [Test]
+        public void ApplyManualCalibration_DisarmsAPendingTrustConfirmation() {
+            // A stale confirmation must not survive the state change that invalidated it.
+            var (vm, options) = BuildCalibrated(linkedDevice: MotorizedPreset, reliable: true);
+            options.ScrewInwardCurvatureSign.Returns(1);
+            vm.TrustCalibrationCommand.Execute(null);
+            vm.ManualScrew1AngleDegrees = 30;
+
+            vm.ApplyManualCalibration();
+
+            Assert.Multiple(() => {
+                Assert.That(vm.IsTrustCalibrationPending, Is.False);
+                options.Received().DeviceLinkedCalibrationDeviceName = string.Empty;
+                options.Received().CalibrationIsReliable = false;
+            });
+        }
+
+        [Test]
+        public void ClearCalibration_AlsoClearsTheAutomationMarkers() {
+            var (vm, options) = BuildCalibrated(linkedDevice: MotorizedPreset, reliable: true);
+            options.ClearReceivedCalls();
+
+            vm.ClearCalibrationCommand.Execute(null);
+
+            Assert.Multiple(() => {
+                options.Received().DeviceLinkedCalibrationDeviceName = string.Empty;
+                options.Received().CalibrationIsReliable = false;
+            });
+        }
+
+        [Test]
+        public void AutomationTrustBanner_IsHiddenForADeviceLinkedReliableCalibration() {
+            var (vm, _) = BuildCalibrated(linkedDevice: MotorizedPreset, reliable: true);
+            Assert.That(vm.AutomationTrustBannerVisible, Is.False);
+        }
+
+        [Test]
+        public void AutomationTrustBanner_IsShownForAManualCalibrationOnAMotorizedPreset() {
+            var (vm, _) = BuildCalibrated();
+            Assert.That(vm.AutomationTrustBannerVisible, Is.True);
+        }
+
+        [Test]
+        public void AutomationTrustBanner_IsHiddenOnANonMotorizedPreset() {
+            var (vm, _) = BuildCalibrated(deviceName: TiltAdapterDevicePreset.ManualName);
+            Assert.That(vm.AutomationTrustBannerVisible, Is.False,
+                "there is nothing to automate without a motorized device");
+        }
+
+        [Test]
+        public void AutomationTrustBanner_IsHiddenWithNoSavedCalibration() {
+            var (vm, _, _, _) = Build(screwCount: 3, configureOptions: o => {
+                o.DeviceName.Returns(MotorizedPreset);
+                o.IsCalibrated.Returns(false);
+            });
+            Assert.That(vm.AutomationTrustBannerVisible, Is.False);
+        }
+
+        [Test]
+        public void ConfirmedTrust_SatisfiesTheAutomaticAdjustmentGate() {
+            // The point of the whole feature: the Inspector's gate reads exactly these two markers.
+            var (vm, options) = BuildCalibrated();
+            vm.TrustCalibrationCommand.Execute(null);
+            vm.ConfirmTrustCalibrationCommand.Execute(null);
+            // No re-stubbing needed: an NSubstitute property setter feeds its own getter, so the getters below
+            // return exactly what ConfirmTrustCalibration just wrote. That is the point -- the assertion reads
+            // production state, not test state.
+
+            Assert.Multiple(() => {
+                Assert.That(InspectorVM.IsCalibrationDeviceLinked(options), Is.True);
+                Assert.That(InspectorVM.CanExecuteAutomaticAdjustment(
+                    serviceConnected: true, controllerAvailable: true,
+                    deviceLinked: InspectorVM.IsCalibrationDeviceLinked(options),
+                    calibrationIsReliable: options.CalibrationIsReliable,
+                    hasNumericGuidance: true, isOperationActive: false,
+                    currentGeneration: 2, lastExecutedGeneration: 1), Is.True);
+                Assert.That(vm.AutomationTrustBannerVisible, Is.False, "the banner retires once trust is granted");
+            });
+        }
+
+        [Test]
+        public void RunCalibrationForTest_DisarmsAPendingTrustConfirmation() {
+            // Same invariant as the manual-entry / clear / preset-change disarms: a fresh run rewrites both
+            // automation markers, so a confirmation armed against the PREVIOUS calibration is stale. Seed data
+            // is the device-driven-but-low-confidence case (the one that leaves the banner showing), copied
+            // from RunCalibrationForTest_DeviceDriven_UnreliableCalibration_SetsCalibrationIsReliableFalse_EvenThoughDeviceLinked.
+            var (vm, options, _, _, _, _) = BuildMotorized();
+            options.IsCalibrated.Returns(true);
+            options.CalibratedScrewCount.Returns(4);
+            vm.TrustCalibrationCommand.Execute(null);
+            Assert.That(vm.IsTrustCalibrationPending, Is.True, "precondition: armed");
+
+            vm.SeedStepReading(WizardStep.Baseline, 0.0, 0.0, 1000.0);
+            vm.SeedStepReading(WizardStep.Screw1, 0.5, 0.0, 1000.0);
+            vm.SeedStepReading(WizardStep.ReBaseline2, 0.4, 0.0, 1000.0);
+            vm.SeedStepReading(WizardStep.Screw2, 0.9, 0.0, 1000.0);
+            vm.RunCalibrationForTest(deviceDriven: true, pixelSizeMicrons: 3.76, focuserStepMicrons: 3.6);
+
+            Assert.Multiple(() => {
+                Assert.That(vm.IsTrustCalibrationPending, Is.False);
+                // And NO Trust button afterwards: the run cleared CalibrationIsManual, and a low-confidence
+                // calibration is not something the banner's screw-numbering check could validate anyway.
+                Assert.That(vm.AutomationTrustBannerVisible, Is.False);
+            });
+        }
+
+        [Test]
+        public void SwitchingProfiles_DisarmsAPendingTrustConfirmation() {
+            // [CRITICAL GATE] TiltAdapterOptions' own ProfileChanged reload raises one broadcast (null-name)
+            // PropertyChanged that the VM's named-property handler never matches, so the VM re-raises its
+            // derived properties in its ProfileChanged handler instead. An armed confirmation left standing
+            // there would end up describing a DIFFERENT profile's calibration.
+            var profileService = Substitute.For<IProfileService>();
+            var (vm, _) = BuildCalibrated(profileService: profileService);
+            vm.TrustCalibrationCommand.Execute(null);
+            Assert.That(vm.IsTrustCalibrationPending, Is.True, "precondition: armed");
+
+            var raised = new List<string>();
+            vm.PropertyChanged += (_, e) => raised.Add(e.PropertyName);
+            profileService.ProfileChanged += Raise.Event<EventHandler>(profileService, EventArgs.Empty);
+
+            Assert.Multiple(() => {
+                Assert.That(vm.IsTrustCalibrationPending, Is.False);
+                Assert.That(raised, Does.Contain(nameof(TiltAdapterWizardVM.AutomationTrustBannerVisible)),
+                    "the banner must re-read the new profile's calibration, not keep showing the old one's");
+            });
+        }
+
+        [Test]
+        public void ConfirmTrustCalibration_WithTheBannerHidden_WritesNothing() {
+            // The button lives inside the collapsed banner Border, but this write unlocks unattended hardware
+            // motion -- it must not rest on a XAML binding alone.
+            var (vm, options) = BuildCalibrated(deviceName: TiltAdapterDevicePreset.ManualName);
+            Assert.That(vm.AutomationTrustBannerVisible, Is.False, "precondition: nothing to trust");
+            options.ClearReceivedCalls();
+
+            vm.TrustCalibrationCommand.Execute(null);
+            vm.ConfirmTrustCalibrationCommand.Execute(null);
+
+            Assert.Multiple(() => {
+                Assert.That(vm.IsTrustCalibrationPending, Is.False);
+                options.DidNotReceive().DeviceLinkedCalibrationDeviceName = Arg.Any<string>();
+                options.DidNotReceive().CalibrationIsReliable = Arg.Any<bool>();
+            });
+        }
+
+        // [CRITICAL GATE] The warning fires only when automation was genuinely available, which is the SAME
+        // conjunction InspectorVM.CanExecuteAutomaticAdjustment requires -- not either half on its own.
+        [TestCase(true, true, true, TestName = "ManualEntryRevokesAutomation_LinkedAndReliable_Revokes")]
+        [TestCase(false, true, false, TestName = "ManualEntryRevokesAutomation_ReliableButNeverLinked_RevokesNothing")]
+        [TestCase(true, false, false, TestName = "ManualEntryRevokesAutomation_LinkedButUnreliable_RevokesNothing")]
+        [TestCase(false, false, false, TestName = "ManualEntryRevokesAutomation_NeitherMarker_RevokesNothing")]
+        public void ManualEntryRevokesAutomation_MirrorsTheAutomationGateExactly(
+                bool linked, bool reliable, bool expected) {
+            var options = Substitute.For<ITiltAdapterOptions>();
+            options.DeviceName.Returns(MotorizedPreset);
+            options.DeviceLinkedCalibrationDeviceName.Returns(linked ? MotorizedPreset : string.Empty);
+            options.CalibrationIsReliable.Returns(reliable);
+
+            Assert.That(TiltAdapterWizardVM.ManualEntryRevokesAutomation(options), Is.EqualTo(expected));
+            // Whatever the warning claims must match what the gate actually permits.
+            Assert.That(InspectorVM.CanExecuteAutomaticAdjustment(
+                serviceConnected: true, controllerAvailable: true,
+                deviceLinked: InspectorVM.IsCalibrationDeviceLinked(options),
+                calibrationIsReliable: options.CalibrationIsReliable,
+                hasNumericGuidance: true, isOperationActive: false,
+                currentGeneration: 2, lastExecutedGeneration: 1), Is.EqualTo(expected));
+        }
+
+        [Test]
+        public void AutomationTrustBanner_IsHiddenForADeviceDrivenLowConfidenceCalibration() {
+            // [CRITICAL GATE] Device-linked but not reliable, and NOT hand-entered (RunCalibrationMath writes
+            // CalibrationIsManual = false). Trust writes CalibrationIsReliable = true, which overrides the
+            // noise-vs-signal quality check -- and the banner's verification ("move one screw, watch which
+            // corner moves") cannot detect a noise-dominated calibration, which has correct screw numbering and
+            // wrong angles. The remedy for this state is re-running the calibration, not trusting it.
+            var (vm, _) = BuildCalibrated(linkedDevice: MotorizedPreset, reliable: false, manual: false);
+            Assert.That(vm.AutomationTrustBannerVisible, Is.False);
+        }
+
+        [Test]
+        public void AutomationTrustBanner_IsHiddenForAReplayedCalibration() {
+            // A replay clears the device link (not a connected run) and CalibrationIsManual -- so it lands in
+            // the same not-automatable state as a hand entry, but "entered or edited by hand" would be false.
+            var (vm, _) = BuildCalibrated(linkedDevice: "", reliable: true, manual: false);
+            Assert.That(vm.AutomationTrustBannerVisible, Is.False,
+                "the banner asserts hand-entry; a replay is not hand-entry");
+        }
+
+        [Test]
+        public void ChangingTheDevicePreset_DisarmsAPendingTrustConfirmation() {
+            // The confirmation was armed against the PREVIOUS preset's screw wiring — confirming it afterwards
+            // would link a hand-entered calibration to a device it was never entered for.
+            var (vm, options) = BuildCalibrated();
+            vm.TrustCalibrationCommand.Execute(null);
+            Assert.That(vm.IsTrustCalibrationPending, Is.True, "precondition: armed");
+
+            options.DeviceName.Returns("ASG Electronic EAT - ZWO 461");
+            options.PropertyChanged += Raise.Event<System.ComponentModel.PropertyChangedEventHandler>(
+                options, new System.ComponentModel.PropertyChangedEventArgs(nameof(ITiltAdapterOptions.DeviceName)));
+
+            Assert.That(vm.IsTrustCalibrationPending, Is.False);
+        }
+
+        [Test]
+        public void SelectingADifferentDevicePreset_RevokesTheTrust() {
+            // No explicit revoke needed: IsCalibrationDeviceLinked compares against the CURRENT DeviceName.
+            var (vm, options) = BuildCalibrated(linkedDevice: MotorizedPreset, reliable: true);
+            Assert.That(vm.AutomationTrustBannerVisible, Is.False, "precondition: trusted");
+
+            options.DeviceName.Returns("ASG Electronic EAT - ZWO 461");
+
+            Assert.Multiple(() => {
+                Assert.That(InspectorVM.IsCalibrationDeviceLinked(options), Is.False);
+                Assert.That(vm.AutomationTrustBannerVisible, Is.True);
+            });
         }
 
         private static object SentinelFor(Type type, int index) {

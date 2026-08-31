@@ -206,6 +206,29 @@ public class SimulatedTiltAdapterVMTests {
         });
     }
 
+    /// <summary>
+    /// The ABSOLUTE direction of the simulator's mean-focus shift — the pin that was missing while only the
+    /// antisymmetry below was asserted, which is exactly why the simulator could be built to satisfy an inverted
+    /// measurement without any test noticing.
+    ///
+    /// On a σ=+1 rig a CW/+ turn of every screw drives the plate toward the camera, increasing the sensor's
+    /// objective-distance, so best focus is reached at a LOWER focuser position
+    /// (docs/focuser-direction-convention-design.md §1(a)/(c)). This is what makes a simulated 6-step wizard run
+    /// measure σ correctly post-fix: the run's all-inward step reads a mean-focus DROP and
+    /// TiltCalibrationCalculator.ComputeCurvatureSign turns that back into σ = +1 = the configured rig.
+    /// </summary>
+    [Test]
+    public void BackfocusMove_CwOnPositiveRig_LowersOptimalFocuserPosition() {
+        var options = Configured(screwCount: 4, curvatureSign: +1);
+        options.OptimalFocuserPosition = 5000;
+
+        var vm = new SimulatedTiltAdapterVM(options, realAdapterOptions: null) { MovementMode = SimTiltMovementMode.Backfocus, AmountPerClick = 0.5 };
+        vm.TurnCommand.Execute(new ScrewTurn(0, +1)); // ⟳ on all four
+
+        Assert.That(options.OptimalFocuserPosition, Is.LessThan(5000),
+            "an all-screws CW turn on a σ=+1 rig moves the plate toward the camera, which LOWERS best focus");
+    }
+
     /// <summary>The focuser shift is the same piston, so it carries the same sign asymmetry.</summary>
     [Test]
     public void BackfocusMove_OnOppositeRigs_ShiftsTheFocuserInOppositeDirections() {
@@ -334,13 +357,16 @@ public class SimulatedTiltAdapterVMTests {
     [Test]
     public void SideMove_TurnsTheNamedPairTogetherAndCounterTurnsTheOpposingPair() {
         var options = Configured(screwCount: 4);
+        // Compared against where the options started, not a literal zero — the shipped backfocus default is
+        // nonzero, and the claim here is that an antisymmetric move leaves it alone.
+        var baselineBackfocus = options.BackfocusErrorMicrons;
         var vm = new SimulatedTiltAdapterVM(options, realAdapterOptions: null) { MovementMode = SimTiltMovementMode.Side, AmountPerClick = 0.5 };
         vm.TurnCommand.Execute(new ScrewTurn(0, +1)); // Side 1+2 ⟳
 
         var delta = 0.5 * PitchMicrons;
         Assert.Multiple(() => {
             Assert.That(vm.NetAxialMicrons.ToArray(), Is.EqualTo(new[] { delta, delta, -delta, -delta }).Within(1e-9));
-            Assert.That(options.BackfocusErrorMicrons, Is.EqualTo(0.0).Within(1e-9),
+            Assert.That(options.BackfocusErrorMicrons, Is.EqualTo(baselineBackfocus).Within(1e-9),
                 "a side move is antisymmetric too — tilt about the edge axis only");
         });
     }
@@ -370,6 +396,27 @@ public class SimulatedTiltAdapterVMTests {
             Assert.That(vm.Rows, Has.Count.EqualTo(3));
             Assert.That(vm.Rows[1].Label, Does.Contain("Screw 2"));
             Assert.That(vm.Rows[1].CouplingText, Is.Empty, "3-screw rows are independent — nothing opposes");
+        });
+    }
+
+    [Test]
+    public void Rows_UseTheScrewNamesFromTheRealAdapter() {
+        // The simulated adapter stands in for the user's real one, so it speaks the same names -- and picks
+        // them up from the same per-profile store, without any Sim* option of its own.
+        var realAdapter = new TiltAdapterOptions(
+            NSubstitute.Substitute.For<NINA.Profile.Interfaces.IProfileService>(),
+            new NINA.Joko.Plugins.HocusFocus.Tests.TestDoubles.InMemoryPluginOptionsAccessor()) {
+            DeviceName = "ASG Electronic EAT - 90mm"
+        };
+
+        var vm = new SimulatedTiltAdapterVM(Configured(screwCount: 4), realAdapter);
+        vm.MovementMode = SimTiltMovementMode.Corner;
+
+        Assert.Multiple(() => {
+            // Row 3 is wizard screw 3, which is the EAT's motor 4.
+            Assert.That(vm.Rows[2].Label, Does.StartWith("M4"));
+            // Its opposite is wizard screw 1 = M1.
+            Assert.That(vm.Rows[2].CouplingText, Does.Contain("M1 opposes"));
         });
     }
 
@@ -601,6 +648,8 @@ public class SimulatedTiltAdapterVMTests {
 
     [Test]
     public void FourScrewAngles_DeriveTheOppositePairAt180Degrees() {
+        // Configured() defaults to σ = +1, i.e. m = +1, so the image-space readout sits 180° from the
+        // stored response-convention angle (TiltScrewGeometry.PhysicalToStoredAngle).
         var options = Configured(screwCount: 4);
         var vm = new SimulatedTiltAdapterVM(options, realAdapterOptions: null);
 
@@ -610,7 +659,7 @@ public class SimulatedTiltAdapterVMTests {
         Assert.Multiple(() => {
             Assert.That(options.SimScrew3AngleDegrees, Is.EqualTo(190.0).Within(1e-9));
             Assert.That(options.SimScrew4AngleDegrees, Is.EqualTo(280.0).Within(1e-9));
-            Assert.That(vm.Screw3AngleDisplay, Is.EqualTo("190.0°"));
+            Assert.That(vm.Screw3AngleDisplay, Is.EqualTo("10.0°"));
         });
     }
 
@@ -812,6 +861,59 @@ public class SimulatedTiltAdapterVMTests {
     }
 
     [Test]
+    public void ConfirmCopyToAdapter_ClearsTheAutomationMarkers() {
+        // [CRITICAL GATE] This writes a hand-made calibration over the user's real one, so it must make the
+        // same clears the wizard's manual-entry path makes: the sim geometry's screw numbering has no
+        // established correspondence to any device's motor wiring. Setting DeviceName to Manual breaks
+        // IsCalibrationDeviceLinked implicitly, but a stale device name left in the marker is exactly what
+        // survives a later preset change.
+        //
+        // realAdapter here is a REAL TiltAdapterOptions (this fixture's convention), not a substitute, so this
+        // asserts resulting state rather than Received() calls. Both markers are SEEDED to the "automation
+        // trusted" values first -- their defaults are already empty/false, so without the seed this test would
+        // pass unchanged even if the production clears were deleted.
+        var options = Configured(screwCount: 4, curvatureSign: -1);
+        var real = BuildRealAdapterOptions();
+        real.DeviceName = "ASG Electronic EAT - 90mm";
+        real.DeviceLinkedCalibrationDeviceName = "ASG Electronic EAT - 90mm";
+        real.CalibrationIsReliable = true;
+        Assert.Multiple(() => {
+            Assert.That(real.DeviceLinkedCalibrationDeviceName, Is.Not.Empty, "precondition: automation-trusted");
+            Assert.That(real.CalibrationIsReliable, Is.True, "precondition: automation-trusted");
+        });
+
+        var vm = new SimulatedTiltAdapterVM(options, real);
+        vm.CopyToAdapterCommand.Execute(null);
+        // The copy revokes automation, so the confirmation must SAY so before the user agrees to it.
+        Assert.That(vm.CopyToAdapterConfirmText, Does.Contain("Automatic Adjustment will be disabled"));
+        vm.ConfirmCopyToAdapterCommand.Execute(null);
+
+        Assert.Multiple(() => {
+            Assert.That(real.DeviceLinkedCalibrationDeviceName, Is.Empty);
+            Assert.That(real.CalibrationIsReliable, Is.False);
+            Assert.That(real.CalibrationIsManual, Is.True, "precondition for the clears: this IS a manual calibration now");
+        });
+    }
+
+    [Test]
+    public void CopyToAdapterConfirmText_DoesNotClaimToDisableAutomationThatWasNeverEnabled() {
+        // Mirrors the wizard's manual-entry warning: the clears are unconditional, but the ANNOUNCEMENT is not.
+        // A real adapter with no device link had Automatic Adjustment blocked already.
+        var options = Configured(screwCount: 4, curvatureSign: -1);
+        var real = BuildRealAdapterOptions();
+        real.CalibrationIsReliable = true; // reliable but never device-linked -> automation was still blocked
+
+        var vm = new SimulatedTiltAdapterVM(options, real);
+        vm.CopyToAdapterCommand.Execute(null);
+
+        Assert.Multiple(() => {
+            Assert.That(vm.CopyToAdapterConfirmText, Does.Not.Contain("Automatic Adjustment"));
+            Assert.That(vm.CopyToAdapterConfirmText, Does.Contain("marked as a manual calibration"),
+                "the rest of the confirmation is unchanged");
+        });
+    }
+
+    [Test]
     public void CoherenceBadge_IsHonestWhenThereIsNoRealAdapterToCompare() {
         var vm = new SimulatedTiltAdapterVM(Configured(screwCount: 3), realAdapterOptions: null);
         Assert.Multiple(() => {
@@ -839,18 +941,20 @@ public class SimulatedTiltAdapterVMTests {
         });
     }
 
-    // ---- Image-space (physical) angle display on −1 rigs -----------------------------------------------
+    // ---- Image-space (physical) angle display on m = +1 rigs -------------------------------------------
     //
     // SimScrew{N}AngleDegrees are RESPONSE-convention (SimulatedTiltAdapter's contract), 180° from the
-    // physical image position on "CW moves adapter toward the objective" (−1) rigs. The Screw 1 input,
-    // the derived-angle readouts, and the diagram are all image-space, so they must convert — otherwise a
-    // screw physically at the top is drawn/reported at the bottom on −1 rigs. Mirrors the wizard fix
+    // physical image position on "CW moves adapter toward the camera" rigs — m = σ·sign(k) = +1, which at
+    // the simulator's implicit standard focuser is σ = +1. The Screw 1 input, the derived-angle readouts,
+    // and the diagram are all image-space, so they must convert — otherwise a screw physically at the top
+    // is drawn/reported at the bottom. Mirrors the wizard fix
     // (docs/tilt-wizard-diagram-orientation-design.md); SimScrew stays response-convention internally so
-    // the physics / coherence badge / copy-to-adapter are untouched.
+    // the physics / coherence badge / copy-to-adapter are untouched. Which σ carries the offset was
+    // corrected on 2026-08-04 (docs/focuser-direction-convention-design.md §7).
 
     [Test]
-    public void Screw1AngleInput_NegativeSign_RoundTripsPhysicalToResponseConvention() {
-        var options = Configured(screwCount: 3, curvatureSign: -1);
+    public void Screw1AngleInput_OffsetRig_RoundTripsPhysicalToResponseConvention() {
+        var options = Configured(screwCount: 3, curvatureSign: 1);
         var vm = new SimulatedTiltAdapterVM(options, realAdapterOptions: null);
 
         vm.Screw1AngleDegrees = 0.0; // physical: screw 1 at the top of the image
@@ -862,8 +966,8 @@ public class SimulatedTiltAdapterVMTests {
     }
 
     [Test]
-    public void Screw1AngleInput_PositiveSign_IsIdentity() {
-        var options = Configured(screwCount: 3, curvatureSign: 1);
+    public void Screw1AngleInput_NoOffsetRig_IsIdentity() {
+        var options = Configured(screwCount: 3, curvatureSign: -1);
         var vm = new SimulatedTiltAdapterVM(options, realAdapterOptions: null);
 
         vm.Screw1AngleDegrees = 30.0;
@@ -875,9 +979,9 @@ public class SimulatedTiltAdapterVMTests {
     }
 
     [Test]
-    public void DerivedAngleDisplays_NegativeSign_ShowPhysicalImageAngles() {
-        // Stored 0/120/240 (response) → physical 180/300/60 on a −1 rig.
-        var options = Configured(screwCount: 3, curvatureSign: -1);
+    public void DerivedAngleDisplays_OffsetRig_ShowPhysicalImageAngles() {
+        // Stored 0/120/240 (response) → physical 180/300/60 on an m = +1 rig.
+        var options = Configured(screwCount: 3, curvatureSign: 1);
         var vm = new SimulatedTiltAdapterVM(options, realAdapterOptions: null);
 
         Assert.Multiple(() => {
@@ -887,8 +991,8 @@ public class SimulatedTiltAdapterVMTests {
     }
 
     [Test]
-    public void DerivedAngleDisplays_PositiveSign_Unchanged() {
-        var options = Configured(screwCount: 3, curvatureSign: 1);
+    public void DerivedAngleDisplays_NoOffsetRig_Unchanged() {
+        var options = Configured(screwCount: 3, curvatureSign: -1);
         var vm = new SimulatedTiltAdapterVM(options, realAdapterOptions: null);
 
         Assert.Multiple(() => {
@@ -898,10 +1002,10 @@ public class SimulatedTiltAdapterVMTests {
     }
 
     [Test]
-    public void Diagram_NegativeSign_DrawsStoredResponseAngleAtItsPhysicalPosition() {
-        // Stored screw 1 = 0° (response) is physically at 180° on a −1 rig → must draw at the BOTTOM
-        // (cy = 100 − 75·cos180 = 175 → Y = 163), not the top.
-        var options = Configured(screwCount: 3, curvatureSign: -1);
+    public void Diagram_OffsetRig_DrawsStoredResponseAngleAtItsPhysicalPosition() {
+        // Stored screw 1 = 0° (response) is physically at 180° on an m = +1 rig → must draw at the
+        // BOTTOM (cy = 100 − 75·cos180 = 175 → Y = 163), not the top.
+        var options = Configured(screwCount: 3, curvatureSign: 1);
         var vm = new SimulatedTiltAdapterVM(options, realAdapterOptions: null);
 
         var screw1 = vm.ScrewDiagramItems.Single(i => i.Number == 1);
@@ -913,13 +1017,13 @@ public class SimulatedTiltAdapterVMTests {
 
     [Test]
     public void AngleDisplaysAndDiagram_AdapterDirectionChange_FlipToTheOppositeSide() {
-        // Built +1: stored 0/120/240 == physical; screw 1 at the top.
-        var options = Configured(screwCount: 3, curvatureSign: 1);
+        // Built on m = −1 (σ = −1): stored 0/120/240 == physical; screw 1 at the top.
+        var options = Configured(screwCount: 3, curvatureSign: -1);
         var vm = new SimulatedTiltAdapterVM(options, realAdapterOptions: null);
         Assert.That(vm.ScrewDiagramItems.Single(i => i.Number == 1).Y, Is.EqualTo(13.0).Within(0.5));
         Assert.That(vm.Screw2AngleDisplay, Is.EqualTo("120.0°"));
 
-        options.SimScrewInwardCurvatureSign = -1; // reinterpret 180° away
+        options.SimScrewInwardCurvatureSign = 1; // reinterpret 180° away
 
         Assert.Multiple(() => {
             Assert.That(vm.ScrewDiagramItems.Single(i => i.Number == 1).Y, Is.EqualTo(163.0).Within(0.5), "screw 1 flips to the bottom");

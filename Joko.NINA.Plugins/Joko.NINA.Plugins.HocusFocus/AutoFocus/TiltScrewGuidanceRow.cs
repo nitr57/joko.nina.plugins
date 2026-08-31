@@ -1,4 +1,4 @@
-#region "copyright"
+﻿#region "copyright"
 
 /*
     Copyright © 2021 - 2026 George Hilios <ghilios+NINA@googlemail.com>
@@ -12,6 +12,7 @@
 
 using System;
 using NINA.Joko.Plugins.HocusFocus.Interfaces;
+using NINA.Joko.Plugins.HocusFocus.TiltAdapterDevices.Manual;
 
 namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
 
@@ -26,6 +27,20 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
         // (like every other cell) instead of a MultiDataTrigger, which did not re-apply when the whole
         // guidance object is swapped (this VM raises no per-property change notifications).
         public bool HasFourScrewBackfocus => HasFourScrews && HasBackfocusRow;
+
+        // Column headings: the user's names for their screws, or the selected device's own names when
+        // they set none. Defaults keep this DTO renderable before any guidance build has run.
+        public string Screw1Header { get; set; } = "Screw 1";
+        public string Screw2Header { get; set; } = "Screw 2";
+        public string Screw3Header { get; set; } = "Screw 3";
+        public string Screw4Header { get; set; } = "Screw 4";
+
+        // What each heading is a name FOR ("Screw 3 · BL · Motor 4"), shown as its tooltip because the
+        // columns are too narrow to carry a long label and its identity at once.
+        public string Screw1HeaderTooltip { get; set; } = string.Empty;
+        public string Screw2HeaderTooltip { get; set; } = string.Empty;
+        public string Screw3HeaderTooltip { get; set; } = string.Empty;
+        public string Screw4HeaderTooltip { get; set; } = string.Empty;
 
         public string Screw1TiltArrow { get; set; } = "—";
         public string Screw2TiltArrow { get; set; } = "—";
@@ -74,6 +89,25 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
         public bool HasDirectionLegend => !string.IsNullOrEmpty(DirectionLegend);
 
         /// <summary>
+        /// Populate the eight heading properties from the screw names in effect. The tooltip spells out the
+        /// wizard number, corner, and motor behind each name, so a reader can always map a label back to a
+        /// position even when the column has ellipsized it.
+        /// </summary>
+        public void FillHeaders(IScrewLabelProvider labels, int screwCount) {
+            Screw1Header = labels.Label(1);
+            Screw2Header = labels.Label(2);
+            Screw3Header = labels.Label(3);
+            Screw4Header = labels.Label(4);
+            Screw1HeaderTooltip = BuildHeaderTooltip(1, screwCount);
+            Screw2HeaderTooltip = BuildHeaderTooltip(2, screwCount);
+            Screw3HeaderTooltip = BuildHeaderTooltip(3, screwCount);
+            Screw4HeaderTooltip = BuildHeaderTooltip(4, screwCount);
+        }
+
+        private static string BuildHeaderTooltip(int wizardScrewNumber, int screwCount) =>
+            TiltScrewLabels.DescribeScrew(wizardScrewNumber, screwCount) + " · Rename in the Tilt Adapter Wizard settings.";
+
+        /// <summary>
         /// Fixed legend for the guidance table: ⬆/⬇ describe adapter-plate motion (toward the
         /// objective / toward the camera — pure physics, identical on every rig), and ⟳/⟲ (screws)
         /// or the +/− step sign (steppers) describe the rig-specific rotation that produces it.
@@ -100,13 +134,16 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
         /// and ignore the unit. Values below the 0.005-turn noise floor render as an em dash with no
         /// direction mark (so the smallest shown value is ~2° / 0.3 min).
         /// </summary>
+        /// <summary>What <see cref="FormatAmount"/> returns when the amount is below the noise floor.</summary>
+        public const string NoAdjustmentGlyph = "—";
+
         public static string FormatAmount(double signedAmount, bool steps, TiltGuidanceAngleUnit angleUnit) {
             if (steps) {
                 long rounded = (long)Math.Round(Math.Abs(signedAmount), MidpointRounding.AwayFromZero);
-                if (rounded == 0) return "—";
+                if (rounded == 0) return NoAdjustmentGlyph;
                 return signedAmount >= 0 ? $"+{rounded} steps" : $"−{rounded} steps";
             }
-            if (Math.Abs(signedAmount) < 0.005) return "—";
+            if (Math.Abs(signedAmount) < 0.005) return NoAdjustmentGlyph;
             string glyph = signedAmount >= 0 ? "⟳" : "⟲";
             if (angleUnit == TiltGuidanceAngleUnit.Degrees) {
                 long degrees = (long)Math.Round(Math.Abs(signedAmount) * 360.0, MidpointRounding.AwayFromZero);

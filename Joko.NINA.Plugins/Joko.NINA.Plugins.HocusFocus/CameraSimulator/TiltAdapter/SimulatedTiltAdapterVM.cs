@@ -11,8 +11,10 @@
 #endregion "copyright"
 
 using NINA.Core.Utility;
+using NINA.Core.Utility.Notification;
 using NINA.Joko.Plugins.HocusFocus.CameraSimulator.Sensors;
 using NINA.Joko.Plugins.HocusFocus.Interfaces;
+using NINA.Joko.Plugins.HocusFocus.TiltAdapterDevices.Manual;
 using NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard;
 using System;
 using System.Collections.Generic;
@@ -128,6 +130,9 @@ namespace NINA.Joko.Plugins.HocusFocus.CameraSimulator.TiltAdapter {
 
         private readonly ICameraSimulatorOptions options;
         private readonly ITiltAdapterOptions realAdapter;
+        // The simulated adapter stands in for the user's real one, so its rows speak the same names the
+        // wizard and the inspector do. Reads realAdapter live, so a device change is picked up.
+        private readonly IScrewLabelProvider screwLabels;
         // Per-screw net counters live on the shared options (options.SimNetAxialMicrons), NOT in a local field,
         // so automated moves (SimulatedTiltActuator) and every SimulatedTiltAdapterVM instance stay in lockstep.
 
@@ -148,6 +153,9 @@ namespace NINA.Joko.Plugins.HocusFocus.CameraSimulator.TiltAdapter {
         internal SimulatedTiltAdapterVM(ICameraSimulatorOptions options, ITiltAdapterOptions realAdapterOptions) {
             this.options = options ?? throw new ArgumentNullException(nameof(options));
             realAdapter = realAdapterOptions;
+            // The panel runs with no real adapter at all (the coherence badge is built to be honest about
+            // that), in which case there are no stored names to read and the rows use the wizard's numbering.
+            screwLabels = realAdapter != null ? TiltScrewLabels.For(realAdapter) : TiltScrewLabels.Default;
 
             amountPerClick = DefaultAmountPerClick;
             ScrewDiagramItems = new ObservableCollection<TiltScrewDiagramItem>();
@@ -159,7 +167,13 @@ namespace NINA.Joko.Plugins.HocusFocus.CameraSimulator.TiltAdapter {
             ZeroAberrationsCommand = new RelayCommand(ZeroAberrations);
             EnableAberrationsCommand = new RelayCommand(() => options.EnableAberrations = true);
             CopyFromAdapterCommand = new RelayCommand(CopyFromAdapter, () => CanCopyAdapterSettings);
-            CopyToAdapterCommand = new RelayCommand(() => IsCopyToAdapterPending = true, () => CanCopyAdapterSettings);
+            CopyToAdapterCommand = new RelayCommand(() => {
+                // The text is conditional on the real adapter's automation markers, which change underneath this
+                // VM -- re-read it every time the confirmation is armed rather than trusting a one-time binding
+                // evaluation.
+                RaisePropertyChanged(nameof(CopyToAdapterConfirmText));
+                IsCopyToAdapterPending = true;
+            }, () => CanCopyAdapterSettings);
             ConfirmCopyToAdapterCommand = new RelayCommand(ConfirmCopyToAdapter);
             CancelCopyToAdapterCommand = new RelayCommand(() => IsCopyToAdapterPending = false);
 
@@ -462,7 +476,7 @@ namespace NINA.Joko.Plugins.HocusFocus.CameraSimulator.TiltAdapter {
         /// Screw 1's PHYSICAL image angle (0° = straight up, increasing clockwise) — what the user enters and
         /// what the "Screw 1 angle" box shows. The stored <c>SimScrew1AngleDegrees</c> is response-convention
         /// (see <see cref="SimulatedTiltAdapter"/>), 180° from the physical position on "CW moves adapter toward
-        /// the objective" (−1) rigs; the self-inverse <see cref="TiltScrewGeometry.PhysicalToStoredAngle"/>
+        /// the camera" rigs; the self-inverse <see cref="TiltScrewGeometry.PhysicalToStoredAngle"/>
         /// converts both ways. Writing SimScrew1AngleDegrees re-derives screws 2..N and rebuilds the panel via
         /// <see cref="OnOptionsChanged"/>, which re-raises this property (through RebuildAll).
         /// </summary>
@@ -521,8 +535,10 @@ namespace NINA.Joko.Plugins.HocusFocus.CameraSimulator.TiltAdapter {
             : Math.Sign(options.SimScrewInwardCurvatureSign);
 
         /// <summary>Converts a stored response-convention screw angle to its physical image angle (self-inverse;
-        /// identical on +1 rigs, 180° apart on −1). Every image-space display (Screw 1 input, derived readouts,
-        /// the diagram, the row labels) goes through this; the physics keeps consuming the raw stored angle.</summary>
+        /// 180° apart when CW moves the adapter toward the camera, identical otherwise). Every image-space
+        /// display (Screw 1 input, derived readouts, the diagram, the row labels) goes through this; the
+        /// physics keeps consuming the raw stored angle. No focuser sign is passed: the simulator is k-free by
+        /// design (docs/focuser-direction-convention-design.md §4), so it renders the standard convention.</summary>
         private double ToPhysicalAngle(double storedAngle) =>
             TiltScrewGeometry.PhysicalToStoredAngle(storedAngle, ResolvedCurvatureSign);
 
@@ -565,7 +581,7 @@ namespace NINA.Joko.Plugins.HocusFocus.CameraSimulator.TiltAdapter {
             // Only the active screws are compared: a 3-screw rig's stale 4th angle is NaN by convention and must
             // never make the badge lie in either direction.
             for (var i = 0; i < ScrewCount && realAdapter.ScrewCount == ScrewCount; i++) {
-                if (!AnglesAgree(simAngles[i], realAngles[i])) differences.Add($"Screw {i + 1} angle");
+                if (!AnglesAgree(simAngles[i], realAngles[i])) differences.Add($"{ScrewName(i)} angle");
             }
 
             var realUnit = realAdapter.AdjustmentType == TiltAdjustmentType.StepperMotors
@@ -632,11 +648,20 @@ namespace NINA.Joko.Plugins.HocusFocus.CameraSimulator.TiltAdapter {
             }
         }
 
-        /// <summary>Names exactly what the copy overwrites — this is real, hand-measured calibration.</summary>
+        /// <summary>
+        /// Names exactly what the copy overwrites — this is real, hand-measured calibration. The automation
+        /// sentence appears only when automation was genuinely available: the marker clears below are
+        /// unconditional, but announcing the loss of something already unavailable is the same false claim the
+        /// wizard's manual-entry warning avoids.
+        /// </summary>
         public string CopyToAdapterConfirmText =>
             "Overwrite the real tilt adapter settings — screw count, screw angles, adapter direction, adjustment type, " +
             $"{(IsStepper ? "stepper step size" : "thread pitch")} and screw radius — with this simulated adapter's values? " +
-            "The result is marked as a manual calibration.";
+            "The result is marked as a manual calibration." +
+            (TiltAdapterWizardVM.ManualEntryRevokesAutomation(realAdapter)
+                ? " Automatic Adjustment will be disabled: a hand-made calibration can't be checked against the " +
+                  "device's motor wiring. Re-run calibration with the device connected to re-enable it."
+                : string.Empty);
 
         // ---- Turning ---------------------------------------------------------------------------------
 
@@ -761,13 +786,38 @@ namespace NINA.Joko.Plugins.HocusFocus.CameraSimulator.TiltAdapter {
             return sb.ToString();
         }
 
+        /// <summary>
+        /// What this panel calls a screw, by 0-based index: the user's name for it, or the selected device's
+        /// (M1/M2/M4/M3 on an ASG EAT), or "Screw 1".."Screw 4" when nothing is named. The simulated adapter
+        /// is a stand-in for a real one, so it uses the same vocabulary as the rest of the tilt UI.
+        /// </summary>
+        private string ScrewName(int index) => TiltScrewLabels.Resolve(screwLabels, index + 1);
+
+        /// <summary>True once anything -- a user label or a device's own names -- beats the bare numbering.</summary>
+        private bool HasScrewNames => TiltScrewLabels.AnyNamed(screwLabels, ScrewCount);
+
+        /// <summary>
+        /// The screw's name where only a token fits: inside "Side 1+2" and "3 opposes". Unnamed, that is the
+        /// bare number -- spelling it "Side Screw 1+Screw 2" would be a regression for everyone not using the
+        /// feature -- and named, it is the name itself.
+        /// </summary>
+        private string ScrewToken(int index) =>
+            HasScrewNames ? ScrewName(index) : (index + 1).ToString(CultureInfo.CurrentCulture);
+
+        /// <summary>
+        /// The screw's name in the terse motion summary, where it sits in parentheses inside a longer
+        /// sentence: "S1" unnamed (repeating "Screw 1" there would echo the row name), the name once set.
+        /// </summary>
+        private string ScrewMotionToken(int index) =>
+            HasScrewNames ? ScrewName(index) : $"S{index + 1}";
+
         /// <summary>The row's name without its angle — the last-action line is a sentence, not a row label.</summary>
         private string RowNameFor(int index) {
-            if (ScrewCount == 3) return $"Screw {index + 1}";
+            if (ScrewCount == 3) return ScrewName(index);
             return MovementMode switch {
                 SimTiltMovementMode.Backfocus => "All screws 1–4",
-                SimTiltMovementMode.Side => $"Side {index + 1}+{(index + 1) % 4 + 1}",
-                _ => $"Screw {index + 1}"
+                SimTiltMovementMode.Side => $"Side {ScrewToken(index)}+{ScrewToken((index + 1) % 4)}",
+                _ => ScrewName(index)
             };
         }
 
@@ -778,7 +828,7 @@ namespace NINA.Joko.Plugins.HocusFocus.CameraSimulator.TiltAdapter {
             if (moved.Length == ScrewCount && moves.All(m => m == moves[0])) {
                 return "all " + MotionArrow(moves[0]);
             }
-            return string.Join(", ", moved.Select(i => $"S{i + 1} {MotionArrow(moves[i])}"));
+            return string.Join(", ", moved.Select(i => $"{ScrewMotionToken(i)} {MotionArrow(moves[i])}"));
         }
 
         /// <summary>
@@ -883,6 +933,11 @@ namespace NINA.Joko.Plugins.HocusFocus.CameraSimulator.TiltAdapter {
             IsCopyToAdapterPending = false;
             if (realAdapter == null) return;
 
+            // Captured BEFORE ANY write below -- in particular before DeviceName becomes "Manual", which by
+            // itself makes IsCalibrationDeviceLinked false and would make this always report "nothing revoked".
+            // Same test, and the same message, as TiltAdapterWizardVM's manual-entry path.
+            bool revokedAutomation = TiltAdapterWizardVM.ManualEntryRevokesAutomation(realAdapter);
+
             realAdapter.ScrewCount = ScrewCount;
             realAdapter.Screw1AngleDegrees = options.SimScrew1AngleDegrees;
             realAdapter.Screw2AngleDegrees = options.SimScrew2AngleDegrees;
@@ -901,11 +956,21 @@ namespace NINA.Joko.Plugins.HocusFocus.CameraSimulator.TiltAdapter {
             realAdapter.IsCalibrated = true;
             realAdapter.ScrewInwardCurvatureSignIsMeasured = false;
             realAdapter.CalibrationIsManual = true;
+            // [CRITICAL GATE] Same clears the wizard's manual-entry path makes. Setting DeviceName to Manual
+            // above already breaks IsCalibrationDeviceLinked implicitly, but leaving a stale device name in the
+            // marker is exactly the kind of thing that survives a later preset change.
+            realAdapter.DeviceLinkedCalibrationDeviceName = string.Empty;
+            realAdapter.CalibrationIsReliable = false;
             // Retire the previous adapter's wizard measurements, so the inspector's pitch-mismatch warning cannot
             // compare the values we just wrote against a stale measurement (the manual-entry path does the same).
             realAdapter.LastMeasuredThreadPitchMicrons = -1;
             realAdapter.LastMeasuredStepperStepSizeMicrons = -1;
 
+            if (revokedAutomation) {
+                Notification.ShowWarning(
+                    "Automatic Adjustment is now disabled: a hand-made calibration can't be checked against the " +
+                    "device's motor wiring. Re-run calibration with the device connected to re-enable it.");
+            }
             RaiseCoherenceChanged();
         }
 
@@ -1067,7 +1132,7 @@ namespace NINA.Joko.Plugins.HocusFocus.CameraSimulator.TiltAdapter {
 
             if (n == 3) {
                 for (var i = 0; i < 3; i++) {
-                    Rows.Add(BuildRow(i, $"Screw {i + 1} · {FormatAngle(angles[i])}", string.Empty));
+                    Rows.Add(BuildRow(i, $"{ScrewName(i)} · {FormatAngle(angles[i])}", string.Empty));
                 }
                 return;
             }
@@ -1080,14 +1145,14 @@ namespace NINA.Joko.Plugins.HocusFocus.CameraSimulator.TiltAdapter {
                 case SimTiltMovementMode.Side:
                     for (var i = 0; i < 4; i++) {
                         var partner = (i + 1) % 4;
-                        var opposing = $"{(i + 2) % 4 + 1}+{(i + 3) % 4 + 1} oppose";
-                        Rows.Add(BuildRow(i, $"Side {i + 1}+{partner + 1} · {SideName(angles[i], angles[partner])}", opposing));
+                        var opposing = $"{ScrewToken((i + 2) % 4)}+{ScrewToken((i + 3) % 4)} oppose";
+                        Rows.Add(BuildRow(i, $"Side {ScrewToken(i)}+{ScrewToken(partner)} · {SideName(angles[i], angles[partner])}", opposing));
                     }
                     break;
 
                 default:
                     for (var i = 0; i < 4; i++) {
-                        Rows.Add(BuildRow(i, $"Screw {i + 1} · {FormatAngle(angles[i])}", $"{(i + 2) % 4 + 1} opposes"));
+                        Rows.Add(BuildRow(i, $"{ScrewName(i)} · {FormatAngle(angles[i])}", $"{ScrewToken((i + 2) % 4)} opposes"));
                     }
                     break;
             }

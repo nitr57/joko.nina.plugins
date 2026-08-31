@@ -94,9 +94,16 @@ namespace TestApp {
                 ?? throw new InvalidOperationException("No active NINA profile could be loaded. Pass --profile-id.");
             Console.WriteLine($"Profile: {activeProfile.Name} ({activeProfile.Id})");
 
-            var starDetectionOptions = new StarDetectionOptions(profileService);
+            // Detector settings come from the harness's LOCAL settings file, not the NINA profile: a
+            // profile-sourced value is mutable machine state nothing records, and the ACTIVE profile can
+            // even be a different telescope between runs. See HarnessSettingsStore.
+            var harnessSettings = HarnessSettingsStore.Resolve(args, profileService, activeProfile);
+            var starDetectionOptions = new StarDetectionOptions(profileService, harnessSettings.Accessor);
             var inspectorOptions = new InspectorOptions(profileService);
-            var autoFocusOptions = new AutoFocusOptions(profileService);
+            // F58(d): the pinned settings FILE, not the active profile -- the detector was pinned one line above
+            // and the FIT was not, which is the asymmetry F58 named in `optimize`.
+            var autoFocusOptions = HarnessSettingsStore.BuildFitOptions(profileService, harnessSettings);
+            Console.WriteLine($"FitInputs: {HarnessFitInputs.From(autoFocusOptions)}");
 
             // Detection params = the inspector's region-6 path: the single options->params source of truth, full
             // sensor (region 6 at SensorROI=1.0), ModelPSF OFF (the AF engine sets isAutoFocus=true). NumberOfAFStars
@@ -119,15 +126,20 @@ namespace TestApp {
             var frames = new List<SensorDetectedStars>();
             DrawingSize imageSize = DrawingSize.Empty;
             foreach (var (path, focuser) in frameFiles) {
-                using var mat = await DiagnosticUtil.LoadFloatMat(path, profileService);
-                imageSize = new DrawingSize(mat.Width, mat.Height);
-                var result = await detector.Detect(mat, detectorParams, progress: null, CancellationToken.None);
+                // IRenderedImage route: the sensor model is fit from the star positions the LIVE detector would
+                // produce (the CFA hotpixel filter + debayer run inside Detect at these params). On a bayered rig
+                // the mosaic's checkerboard sampling shifts per-star measurements, which is exactly the bias the
+                // tilt wizard calibrates from.
+                var rendered = await DiagnosticUtil.LoadRenderedImage(path, profileService);
+                var props = rendered.RawImageData.Properties;
+                imageSize = new DrawingSize(props.Width, props.Height);
+                var result = await detector.Detect(rendered, detectorParams, progress: null, CancellationToken.None);
                 // Order stars by raster position EXACTLY as BuildStarDetectionResult does (HocusFocusStarDetection
                 // line 612). The reference triangles are built onePerPoint=true (order-dependent greedy
                 // consumption), so matching the production star-list order is required to reproduce the live
                 // alignment outcome faithfully.
                 var starList = result.DetectedStars.Select(HocusFocusStarDetection.ToDetectedStar)
-                    .OrderBy(s => s.Position.Y * (long)mat.Width + s.Position.X).ToList();
+                    .OrderBy(s => s.Position.Y * (long)props.Width + s.Position.X).ToList();
                 var hfResult = new HocusFocusStarDetectionResult { StarList = starList, ImageSize = imageSize };
                 frames.Add(new SensorDetectedStars(focuser, hfResult, image: null));
                 Console.WriteLine($"  Focuser {focuser}: {starList.Count} stars");
@@ -136,7 +148,7 @@ namespace TestApp {
             var sortedFocusers = frameFiles.Select(f => (double)f.focuser).OrderBy(x => x).ToList();
             var finalFocusPosition = sortedFocusers[sortedFocusers.Count / 2]; // median; alignment is independent of this
             var stepSize = sortedFocusers.Count > 1 ? (int)Math.Round(sortedFocusers[1] - sortedFocusers[0]) : 100;
-            var focuserSizeMicrons = inspectorOptions.MicronsPerFocuserStep > 0 ? inspectorOptions.MicronsPerFocuserStep : 1.0;
+            var focuserSizeMicrons = inspectorOptions.EffectiveMicronsPerFocuserStep > 0 ? inspectorOptions.EffectiveMicronsPerFocuserStep : 1.0;
             var pixelSize = activeProfile.CameraSettings.PixelSize > 0 ? activeProfile.CameraSettings.PixelSize : 3.76;
 
             var messages = new List<string>();
@@ -172,20 +184,20 @@ namespace TestApp {
             }
             Line();
             Line("Registration messages:");
-            if (messages.Count == 0) Line("  (none — all frames aligned cleanly)");
+            if (messages.Count == 0) Line("  (none -- all frames aligned cleanly)");
             foreach (var m in messages) Line($"  - {m}");
 
             Line();
             Line("================ SENSOR MODEL FIT ================");
             if (sensorFit != null) {
                 Line($"StarsInModel:     {sensorFit.StarsInModel}");
-                Line($"GoodnessOfFit R²: {sensorFit.GoodnessOfFit:F4}");
-                Line($"RMSError (µm):    {sensorFit.RMSErrorMicrons:F3}");
+                Line($"GoodnessOfFit R^2:{sensorFit.GoodnessOfFit:F4}");
+                Line($"RMSError (um):    {sensorFit.RMSErrorMicrons:F3}");
                 Line($"ReducedChiSquared:{sensorFit.ReducedChiSquared:F3}");
-                Line($"Tilt θ (deg):     {sensorFit.Theta * 180.0 / Math.PI:F3}");
+                Line($"Tilt theta (deg):  {sensorFit.Theta * 180.0 / Math.PI:F3}");
                 Line($"Curvature K:      {sensorFit.K:E3}");
             } else {
-                Line("  (no fit — RegisterStarsAndFit did not produce a model)");
+                Line("  (no fit -- RegisterStarsAndFit did not produce a model)");
             }
 
             var outPath = Path.Combine(outDir, "inspect_align.txt");

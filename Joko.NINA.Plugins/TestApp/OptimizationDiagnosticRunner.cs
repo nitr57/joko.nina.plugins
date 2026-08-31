@@ -1,4 +1,4 @@
-#region "copyright"
+﻿#region "copyright"
 
 /*
     Copyright © 2021 - 2026 George Hilios <ghilios+NINA@googlemail.com>
@@ -13,6 +13,7 @@
 using Newtonsoft.Json;
 using NINA.Core.Enum;
 using NINA.Core.Utility;
+using NINA.Image.Interfaces;
 using NINA.Joko.Plugins.HocusFocus.AutoFocus;
 using NINA.Joko.Plugins.HocusFocus.Interfaces;
 using NINA.Joko.Plugins.HocusFocus.StarDetection;
@@ -51,6 +52,36 @@ namespace TestApp {
 
         // Run discovery (attempt-anchored, >=3-position guard) lives in the pure, unit-testable
         // OptimizationRunDiscovery helper. Frame matching uses its ImageFileRegex (kept as the single copy).
+
+        /// <summary>
+        /// Held for the process lifetime once claimed, so a second `optimize` sees it. Never released
+        /// explicitly: process exit releases it, and an abandoned mutex is what the next process wants to see.
+        /// </summary>
+        private static Mutex exclusiveOptimizeMutex;
+
+        /// <summary>
+        /// F55 — is this process alone? Returns <c>"exclusive"</c>, <c>"concurrent"</c> or <c>"unknown"</c>, and
+        /// the third value is not a formality: a check that cannot run must not report the same thing as a check
+        /// that ran and found nothing, because a scorer turns one of them into "this arm is readable".
+        ///
+        /// <para>A named mutex rather than a process-name scan: it does not care what the binary is called, it
+        /// costs nothing, and an ABANDONED mutex — the previous holder died without exiting cleanly — correctly
+        /// reads as "the machine is mine now" rather than as contention.</para>
+        /// </summary>
+        private static string ClaimExclusiveOptimize() {
+            try {
+                exclusiveOptimizeMutex = new Mutex(false, @"Global\NINA.Joko.HocusFocus.TestApp.Optimize");
+                try {
+                    return exclusiveOptimizeMutex.WaitOne(0) ? "exclusive" : "concurrent";
+                } catch (AbandonedMutexException) {
+                    return "exclusive"; // the previous holder died; the wait succeeded and this process owns it
+                }
+            } catch (Exception ex) {
+                // Unsupported platform, denied Global\ namespace, anything else -- say so rather than guess.
+                Logger.Debug($"Could not perform the F55 concurrency check: {ex.Message}");
+                return "unknown";
+            }
+        }
 
         public static async Task Run(string[] args) {
             try {
@@ -120,6 +151,17 @@ namespace TestApp {
             // result is the pre-change objective + detection. Default (no flag) = the new behavior (the "after" pass).
             bool legacyObjective = DiagnosticUtil.HasFlag(args, "--legacy-objective");
 
+            // ── F23 head-to-head knobs (docs/af-recommender-hardening-design.md, wave 1) ──────────────────────
+            // Two candidate false-positive costs are shipped in one binary so the bank can decide between them
+            // without rebuilding per arm (and so "did I build the right arm?" cannot silently corrupt a result):
+            //   (a) --marginal-snr-strength / --marginal-snr-floor : the objective's SMarginalSnr term. Strength 0
+            //       disables it, reproducing the pre-F23 objective exactly.
+            //   (b) --sensitivity-floor : a hard floor on the SEARCHABLE Sensitivity range (OptimizerVariable).
+            // Omitting both = shipping defaults. Values are echoed into the run header so a log identifies its arm.
+            double? marginalSnrStrength = ParseOptionalDouble(args, "--marginal-snr-strength", min: 0.0);
+            double? marginalSnrFloor = ParseOptionalDouble(args, "--marginal-snr-floor", min: 0.0);
+            double? sensitivityFloor = ParseOptionalDouble(args, "--sensitivity-floor", min: 0.0);
+
             // --continue-rounds <0-2> mirrors the wizard's "Continue optimizing" button: after the first optimize,
             // re-seed from the prior best and run again (fresh curated set / step scale) up to this many more times
             // (3 passes total). Validates the chaining headlessly; per-round J is reported.
@@ -131,6 +173,48 @@ namespace TestApp {
                 }
             }
 
+            // F32 — --keep-floor <f>: reject any candidate that keeps less than fraction f of the SEED's accepted
+            // stars (min over runs), as a feasibility test AHEAD of the j > bestJ compare. Absent (the default)
+            // leaves the search bit-identical, so this binary is its own control: the same exe with no flag
+            // reproduces the unconstrained arm exactly.
+            double? keepFloor = null;
+            var keepFloorArg = DiagnosticUtil.GetArg(args, "--keep-floor");
+            if (!string.IsNullOrWhiteSpace(keepFloorArg)) {
+                if (!double.TryParse(keepFloorArg, NumberStyles.Float, CultureInfo.InvariantCulture, out var kf) || kf <= 0.0 || kf > 1.0) {
+                    throw new ArgumentException($"--keep-floor: '{keepFloorArg}' must be a fraction in (0, 1]");
+                }
+                keepFloor = kf;
+            }
+
+            // F35 — --no-min-hfr-seed: skip the MinHFR seeding rule entirely, so the pre-F35 behaviour is reachable
+            // from THIS binary. Without it the only way to produce an F35 control arm is to build the pre-F35
+            // commit, which is precisely the cross-binary comparison F41 says is not a comparison: every merge in
+            // between rides along and is attributed to the seeding rule. Same shape as --keep-floor above — absent,
+            // the run is bit-identical to before this flag existed, so one exe is both arms.
+            bool noMinHfrSeed = DiagnosticUtil.HasFlag(args, "--no-min-hfr-seed");
+
+            // F39(b) — --apply-run-detection-binning: actually RUN each per-run dataset at its detection binning
+            // factor. Today ResolveForRun's answer is written to disk and discarded (a pure write side-effect), so
+            // every optimize and every golden eval over both banks has run at the default of 1 while seven synthetic
+            // datasets record — and were rendered for — a factor of 2.
+            //
+            // Deliberately ONLY the binning. Making the whole per-run Resolved authoritative would let a per-run
+            // settings file shadow the --settings file every arm pins (F42), which would break the comparability of
+            // every arm this project has run.
+            //
+            // ADOPTED AS THE DEFAULT in wave 8. Wave 7 measured it opt-in: overall recall up on 7 of 7 (+0.087 …
+            // +0.146) at precision 1.000, LowSensitivity false negatives collapsing 184 → 4 on the worst case, and
+            // sigma_focus — which is what autofocus is FOR — improving on 7 of 7 by 17% to 95% (D17: 2.65 focuser
+            // steps of uncertainty to 0.12). Seven datasets had been scored for their entire existence at a factor
+            // their own physics says is wrong, and the frames do not move either way (detectionBinning enters no
+            // render input; their exposures were ALREADY derived at binning 2).
+            //
+            // --no-run-detection-binning is the opt-out, and it exists so every arm this project has already run
+            // stays reproducible on a current binary (F41: rebuilding an old commit to get a control arm is not a
+            // control, because every merge in between rides along). --apply-run-detection-binning is still accepted
+            // and is now a no-op, so wave 7's scripts keep working and keep meaning what they said.
+            bool applyRunDetectionBinning = !DiagnosticUtil.HasFlag(args, "--no-run-detection-binning");
+
             var labelsDir = DiagnosticUtil.GetArg(args, "--labels");
 
             // --per-run is a valueless flag: optimize each discovered run INDEPENDENTLY (one optimization, one
@@ -138,6 +222,21 @@ namespace TestApp {
             // when --runs points at a bank of DIFFERENT optical setups, where a joint (N>1 balanced) objective
             // across incompatible cameras/scopes is meaningless.
             bool perRun = args.Any(a => string.Equals(a, "--per-run", StringComparison.OrdinalIgnoreCase));
+
+            // --update-run-folder is F15's opt-in, and the DEFAULT is now "do not touch the bank".
+            //
+            // For thirteen waves `optimize` wrote its landing back into every run's own source folder as well as
+            // into --out, with no way to suppress it. That destroyed `bobp_m101`'s historical settings
+            // mid-investigation (F15), silently re-baselined BOTH banks in wave 3, and is the last thing forcing
+            // whole passes to be serialized against one another: two passes over the same bank collide IN THE
+            // BANK, however carefully their --out directories are kept apart.
+            //
+            // THE INTERACTION THAT MAKES IT SHARPER THAN IT LOOKS, and it is why the capability is kept rather
+            // than deleted: `bank-verify --opt-a/--opt-b` and `golden eval --params optimized` read the RUN
+            // FOLDER copy by default, and `review --runs <same>` auto-discovers it. A prepass and a later
+            // scoring run that were meant to be independent can therefore silently share an arm. Making the
+            // write opt-in does not remove that hazard; it makes it something a command line SAYS.
+            bool updateRunFolder = LandingWriteback.ShouldUpdateRunFolder(args);
 
             // --verbose is a valueless flag that restores TRACE logging for offline inspection. By default the
             // optimize harness runs at INFO so the detector's thousands of per-detection Logger.Trace stage-timing
@@ -148,6 +247,22 @@ namespace TestApp {
             Logger.SetLogLevel(verbose ? LogLevelEnum.TRACE : LogLevelEnum.INFO);
             if (verbose) {
                 Console.WriteLine("Verbose logging enabled (TRACE).");
+            }
+
+            // --cv-threads <n> caps OpenCV's parallel-for pool (0 = restore the default). It exists so the F55
+            // family can be probed WITHOUT an environment variable: wave 9 tried to set the plugin's
+            // Parallel.For degree from WSL and silently measured the SAME configuration five times, because WSL
+            // environment variables do not reach a Windows process unless WSLENV names them -- "an instrument
+            // that is not connected reports perfect agreement". A flag cannot be disconnected that way, and
+            // Cv2.GetNumThreads() is printed with the provenance below as its positive control, whether or not
+            // the flag was passed.
+            var cvThreadsArg = DiagnosticUtil.GetArg(args, "--cv-threads");
+            if (!string.IsNullOrWhiteSpace(cvThreadsArg)) {
+                if (!int.TryParse(cvThreadsArg, NumberStyles.Integer, CultureInfo.InvariantCulture, out var cvThreads)) {
+                    throw new ArgumentException($"--cv-threads expects an integer, got '{cvThreadsArg}'");
+                }
+                Cv2.SetNumThreads(cvThreads);
+                Console.WriteLine($"--cv-threads {cvThreads}: OpenCV parallel-for pool capped.");
             }
 
             // The real ProfileService.ActiveProfile setter writes to Application.Current.Resources, so a
@@ -169,25 +284,65 @@ namespace TestApp {
             Console.WriteLine($"Profile: {activeProfile.Name} ({activeProfile.Id})");
             Logger.Info($"Loaded profile {activeProfile.Name} ({activeProfile.Id})");
 
-            var guid = PluginOptionsAccessor.GetAssemblyGuid(typeof(StarDetectionOptions));
-            if (guid == null) {
-                throw new InvalidOperationException("Could not resolve the HocusFocus plugin assembly GUID");
-            }
-            var accessor = new PluginOptionsAccessor(profileService, guid.Value);
+            // Detector settings come from the harness's LOCAL settings file, never the NINA profile: a
+            // profile-sourced seed is mutable machine state nothing records, and TryLoad("") picks whichever
+            // profile is ACTIVE -- two runs of the same data minutes apart were seeded from different telescopes.
+            var harnessSettings = HarnessSettingsStore.Resolve(args, profileService, activeProfile);
+            // F30: a landing must say which invocation produced it. Without this, `optimize --per-run` writing
+            // back into each run's own folder (F15) leaves a bank holding whichever prepass went last, and the
+            // only way to tell two arms apart is to INFER the arm from a knob — an inference that broke the moment
+            // F23 wave 1 ran three arms differing by more than one flag.
+            // F53: the BUILD, not just the version. `ProducerVersion` cannot tell two builds of one version
+            // apart, which is exactly how wave 8's arm X came to be irreproducible from its own recorded `exe`
+            // -- a later step in the same wave rebuilt that directory and nothing recorded it. The MVID changes
+            // on every build; the detector version says which OUTPUT contract produced the numbers (wave 9's
+            // whole results doc needed a hand-written banner for want of it).
+            var build = OptimizerProvenance.CurrentBuild();
+            var accessor = harnessSettings.Accessor;
             var starDetectionOptions = new StarDetectionOptions(profileService, accessor);
-            var afOptions = new AutoFocusOptions(profileService);
-
+            // F58: the harness accessor, NOT the profile. `new AutoFocusOptions(profileService)` binds a
+            // PluginOptionsAccessor to whichever profile is ACTIVE, so the DETECTOR was pinned by --settings and
+            // the FIT was not -- and the fit reads MaxOutlierRejections, on which this machine's nine profiles
+            // partition 2/7. Concurrent processes each acquire a DIFFERENT profile (NINA holds the .profile file
+            // open, and TryLoad skips a locked one and takes the next by LastUsed), which is how one integer
+            // produced the two discrete "attractors" F55 chased as a floating-point race for two waves. The live
+            // plugin is unchanged: the wizard and the AF engine must keep reading the profile, because there
+            // these ARE the user's settings.
+            var afOptions = new AutoFocusOptions(profileService, accessor);
+            var fitInputs = HarnessFitInputs.From(afOptions);
+            var provenance = new OptimizerProvenance {
+                Producer = "TestApp optimize",
+                CommandLine = string.Join(" ", args ?? Array.Empty<string>()),
+                SettingsFingerprint = HarnessSettingsStore.Fingerprint(harnessSettings),
+                ProducerVersion = (System.Reflection.CustomAttributeExtensions.GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>(
+                    System.Reflection.Assembly.GetEntryAssembly()))?.InformationalVersion,
+                BuildId = build.BuildId,
+                DetectorVersion = build.DetectorVersion,
+                ConcurrencyCheck = ClaimExclusiveOptimize(),
+                // F57: --settings pins the detector knobs and NOT the arm. The active profile moves BaselineJ by
+                // 0.0144 on toml999, so which profile ran is part of a landing's identity.
+                ProfileId = $"{activeProfile.Name} ({activeProfile.Id})",
+                // F58: and WHICH profile is a different question from WHAT it supplied. The values, not a hash.
+                FitInputs = fitInputs.ToString()
+            };
+            Console.WriteLine($"provenance: {provenance}");
+            Console.WriteLine($"OpenCV threads: {Cv2.GetNumThreads()}");
+            if (provenance.ConcurrencyCheck != "exclusive") {
+                Console.WriteLine($"WARNING: concurrency check = {provenance.ConcurrencyCheck}. F55: concurrent " +
+                    "`optimize` moves 44% of LANDINGS and 15% of seed evaluations, so any arm read on landings " +
+                    "is INVALID. The value is recorded in every landing this run writes.");
+            }
             // PixelScale = arcsec/pixel from the profile (pixel size / focal length) × binning, mirroring
             // HocusFocusStarDetection.GetStarDetectorParams. Production reads binning from per-frame metadata
             // (image.RawImageData.MetaData.Camera.BinX, which defaults to 1 when unset); the harness loads raw
             // float Mats with no NINA metadata, so binning = 1 is used (the same value an unbinned/unset frame
             // yields in production). PixelScale only feeds PixelScale-dependent detection gates, not the curve fit.
+            // PixelScale is resolved PER RUN from each run's own frame headers (see PrepareRunAsync). The bank is
+            // other people's data -- true scales span 0.277-5.966 arcsec/px -- so one harness-wide value taken from
+            // the local profile was wrong for nearly every run. This is only the fallback for callers that never
+            // load a frame; every detecting path overwrites it from the frame header.
             const int binning = 1;
-            var pixelScale = MathUtility.ArcsecPerPixel(activeProfile.CameraSettings.PixelSize, activeProfile.TelescopeSettings.FocalLength) * binning;
-            if (double.IsNaN(pixelScale)) {
-                Console.WriteLine("WARNING: PixelScale is NaN (pixel size / focal length not set in the profile). Detection will still run; PixelScale-dependent gates use NaN.");
-                Logger.Warning("PixelScale is NaN; pixel size / focal length not set in the profile");
-            }
+            var pixelScale = MathUtility.ArcsecPerPixel(harnessSettings.PixelSizeMicrons, harnessSettings.FocalLengthMm) * binning;
 
             // Mirror the wizard's seed/baseline split (optimizer default seed + current-settings baseline):
             //  - Seed = fully-DEFAULT params (BuildDefaultStarDetectorParams) — the bundle the optimizer STARTS from,
@@ -201,6 +356,11 @@ namespace TestApp {
                 p.Region = StarDetectionRegion.Full;
                 p.ModelPSF = false;
                 p.SaveIntermediateFilesPath = string.Empty;
+                // Mirrors RunEvaluationLoader: every detection here is an OPTIMIZER evaluation (thousands per run),
+                // and the plugin's BuildStarDetectionResult logs a per-region "Average HFR" INFO line for each. The
+                // flag is output-neutral and excluded from the detection cache key, so results stay byte-identical;
+                // it only stops one optimization from emitting ~10k+ INFO lines. Candidates inherit it via Clone.
+                p.SuppressInfoLogging = true;
                 return p;
             }
             var baseline = ApplyAfContext(HocusFocusStarDetection.BuildStarDetectorParams(starDetectionOptions));
@@ -232,6 +392,33 @@ namespace TestApp {
             Console.WriteLine($"Current (baseline) params: Sensitivity={F(baseline.Sensitivity)}, StarClippingMultiplier={F(baseline.StarClippingMultiplier)}, " +
                 $"NoiseClippingMultiplier={F(baseline.NoiseClippingMultiplier)}, StructureLayers={baseline.StructureLayers}, " +
                 $"MeasurementAverage={starDetectionOptions.MeasurementAverage}");
+            // RULE P16 (F67): the five fields above are a summary, not a diff — they are five of ~45, and the
+            // question is whether `af-fit` and `optimize` build DIFFERENT detectors from one settings file. Both
+            // bundles go out through the SAME formatter af-fit uses, reflectively, so the two printouts cannot
+            // drift and a field added in a later wave is covered on both sides without anyone remembering to.
+            //
+            // Two dumps because there are genuinely two bundles: `baseline` is the user's current settings (the
+            // same BuildStarDetectorParams(options) call af-fit falls back to — this is the apples-to-apples
+            // side, and the only one score_params_w16.py reads) and `seed` is what the search starts from, which
+            // is the fully-default bundle unless --start-from-current makes it the baseline's twin.
+            //
+            // Printed HERE, where the bundles are constructed. Two fields are re-derived per run afterwards and
+            // are logged where that happens: PixelScale (per-run, from the frame headers — inert by proof,
+            // consumed only inside the ModelPSF block, which is false on both paths) and DetectionBinning +
+            // PixelScale together via ApplyRunDetectionBinningIfRequested.
+            //
+            // F69(a) — THIS PARAGRAPH USED TO SAY THE OPPOSITE, AND WAS BELIEVED. It read "only under
+            // --apply-run-detection-binning … Neither the gate nor the P16 probe passes that flag". Every clause
+            // of that was backwards: F39(b) was ADOPTED AS THE DEFAULT in wave 8 (see :205-216), so
+            // ApplyRunDetectionBinningIfRequested runs unless the OPT-OUT --no-run-detection-binning is passed;
+            // --apply-run-detection-binning survives only as an accepted no-op; and the gate and the P16 probe
+            // therefore both ran the mutation. It matters because the mutation happens AFTER the two dumps below,
+            // so DetectionBinning and PixelScale as printed here are the pre-mutation values. Wave 16's RULE P16
+            // compared `optimize`'s params as CONSTRUCTED against `af-fit`'s as DETECTED, excluded
+            // DetectionBinning as a candidate on the strength of this comment, and reached a wrong verdict; wave
+            // 17's RULE C17 found the cause to be exactly that field.
+            ParamsDump.Write(Console.WriteLine, ParamsDump.OptimizeBaseline, baseline);
+            ParamsDump.Write(Console.WriteLine, ParamsDump.OptimizeSeed, seed);
 
             // The fixed AF-detection sigma rejections the wizard's RunEvaluationLoader uses (the
             // HocusFocusDetectionParams class defaults, NOT the live AF path): high = 4.0, low = 3.0. These feed
@@ -263,26 +450,74 @@ namespace TestApp {
 
             var alglibAPI = new AlglibAPI();
             var detector = new StarDetector(alglibAPI);
+            // The plugin's OWN detection facade, so the optimizer drives the same RunEvaluationLoader split detector
+            // the wizard does instead of a harness mirror of its FrameDetectionResult mapping. Only GetInfo() and the
+            // inner StarDetector are exercised on the split path; the remaining dependencies are headless stubs (see
+            // StubFocuserMediator / StubPerFilterStarDetectionStore), and imageStatisticsVM is never touched.
+            var detection = new HocusFocusStarDetection(
+                imageStatisticsVM: null,
+                profileService: profileService,
+                focuserMediator: new StubFocuserMediator(),
+                starDetectionOptions: starDetectionOptions,
+                alglibAPI: alglibAPI,
+                perFilterStore: new StubPerFilterStarDetectionStore(accessor));
             var ctx = new RunDetectionContext {
                 ProfileService = profileService,
+                StarDetectionOptions = starDetectionOptions,
+                HarnessSettings = harnessSettings,
+                Provenance = provenance,
                 AfOptions = afOptions,
+                FitInputs = fitInputs,
                 AlglibAPI = alglibAPI,
                 Detector = detector,
+                Detection = detection,
                 MeasurementAverage = starDetectionOptions.MeasurementAverage,
                 HighSigmaOutlierRejection = highSigmaOutlierRejection,
                 LowSigmaOutlierRejection = lowSigmaOutlierRejection,
                 Seed = seed,
                 Baseline = baseline,
-                Variables = OptimizerVariable.CreateCuratedSet(seed),
+                Variables = OptimizerVariable.CreateCuratedSet(seed, sensitivityFloor),
+                SensitivityFloor = sensitivityFloor,
+                MarginalSnrStrength = marginalSnrStrength,
+                MarginalSnrFloor = marginalSnrFloor,
                 MaxEvals = maxEvals,
                 LabelsDir = labelsDir,
                 AnnotateAll = annotateAll,
                 Inspection = inspection,
                 LegacyObjective = legacyObjective,
-                ContinueRounds = continueRounds
+                ContinueRounds = continueRounds,
+                KeepFloor = keepFloor,
+                NoMinHfrSeed = noMinHfrSeed,
+                ApplyRunDetectionBinning = applyRunDetectionBinning,
+                UpdateRunFolder = updateRunFolder
             };
+            Console.WriteLine(applyRunDetectionBinning
+                ? "detection binning (F39b): each per-run dataset is DETECTED at its own derived binning factor (default; --no-run-detection-binning opts out)"
+                : "--no-run-detection-binning: F39(b) DISABLED -- every run detects at factor 1 (the pre-wave-8 status quo)");
+            // F69(c) — say so when the OPT-IN flag is passed. It is still ACCEPTED, and since wave 8 it has been a
+            // no-op: F39(b) is the default and --no-run-detection-binning is the opt-out. Wave 7's scripts pass it
+            // and are right to keep working; what they must not do is read their own command line as evidence that
+            // the mutation happened only because they asked for it. That inference is exactly F69(a) — a comment in
+            // this file asserted it, was believed for three waves, and cost RULE P16 a wrong verdict.
+            //
+            // ASCII ONLY, and this is measured rather than stylistic: a Unicode character here arrives in a
+            // REDIRECTED log as the single byte 0x1A on this machine's console code page -- and a single non-ASCII
+            // byte anywhere in the file makes GNU grep call the WHOLE log binary, so it reports zero matches for
+            // ASCII strings elsewhere in it. (Wave 23 swept every emitted string in TestApp to ASCII, including the
+            // em dash the --no-run-detection-binning branch above used to carry; TestAppOutputAsciiTests holds it.)
+            if (DiagnosticUtil.HasFlag(args, "--apply-run-detection-binning")) {
+                Console.WriteLine("--apply-run-detection-binning: ACCEPTED NO-OP. F39(b) was adopted as the DEFAULT "
+                    + "in wave 8; the opt-OUT is --no-run-detection-binning. This flag is retained so wave 7's "
+                    + "scripts keep running, and it is not read (F69(c)).");
+            }
+            if (noMinHfrSeed) {
+                Console.WriteLine("--no-min-hfr-seed: F35 MinHFR seeding DISABLED (pre-F35 control arm)");
+            }
+            if (keepFloor is double kfv) {
+                Console.WriteLine($"--keep-floor: candidates keeping < {F(kfv)} of the seed's accepted stars (min over runs) are rejected as infeasible; J is unmodified");
+            }
             if (inspection) {
-                Console.WriteLine("--inspection: aberration-inspection objective (favor more stars, fit bounded vs current σ)");
+                Console.WriteLine("--inspection: aberration-inspection objective (favor more stars, fit bounded vs current sigma)");
             }
             if (continueRounds > 0) {
                 Console.WriteLine($"--continue-rounds: {continueRounds} extra pass(es) after the first ({continueRounds + 1} total)");
@@ -298,14 +533,27 @@ namespace TestApp {
         /// <summary>Shared, run-independent dependencies + tuning settings threaded through the optimize helpers.</summary>
         private sealed class RunDetectionContext {
             public ProfileService ProfileService;
+            /// <summary>The options the optimize actually RAN with. Carried so the settings handoff can record the
+            /// knobs the curated axes do not cover (binning, contamination, PSF, saturation, ...).</summary>
+            public StarDetectionOptions StarDetectionOptions;
             public AutoFocusOptions AfOptions;
+
+            /// <summary>The four values that reach the FIT, read once. See <see cref="HarnessFitInputs"/> — the
+            /// fit and the provenance field are built from this one object so they cannot diverge (F58).</summary>
+            public HarnessFitInputs FitInputs;
             public AlglibAPI AlglibAPI;
             public StarDetector Detector;
+
+            /// <summary>The plugin's detection facade — the optimizer's split detector is the wizard's own
+            /// <c>HocusFocusSplitFrameDetector</c> driven through this, so the two can never drift.</summary>
+            public IHocusFocusStarDetection Detection;
+
             public MeasurementAverageEnum MeasurementAverage;
             public double HighSigmaOutlierRejection;
             public double LowSigmaOutlierRejection;
             public StarDetectorParams Seed;       // optimizer start = fully-default params (wizard's LoadedRun.Seed)
             public StarDetectorParams Baseline;    // current settings = displayed "before" (wizard's LoadedRun.Baseline)
+            public HarnessSettingsStore.Resolved HarnessSettings;  // local settings file; fallback for PixelScale
             public IReadOnlyList<OptimizerVariable> Variables;
             public int? MaxEvals;
             public string LabelsDir;
@@ -313,6 +561,21 @@ namespace TestApp {
             public bool Inspection;     // --inspection: use the aberration-inspection objective
             public bool LegacyObjective; // --legacy-objective: zero the HFR-outlier penalty + coverage reward (A/B "before")
             public int ContinueRounds;  // --continue-rounds: extra chained passes after the first (0-2)
+            public double? KeepFloor;   // --keep-floor: F32 detection-keep feasibility floor (null = unconstrained)
+            public bool NoMinHfrSeed;   // --no-min-hfr-seed: F35 seeding off, so this binary can produce its own control
+            // F39(b), the DEFAULT since wave 8: --no-run-detection-binning is the opt-OUT that makes this false
+            // (=> bit-identical to a pre-F39(b) run); --apply-run-detection-binning is an accepted no-op (F69(c)).
+            public bool ApplyRunDetectionBinning;
+            public bool UpdateRunFolder; // --update-run-folder: F15; write the landing back INTO each run's source folder
+
+            // F30: which invocation is producing these landings. Stamped onto every optimized_settings.json this
+            // run writes, so a bank folder full of prepasses from different arms stops being ambiguous.
+            public OptimizerProvenance Provenance;
+
+            // F23 arm selectors; null ⇒ shipping default. See the flag comments in RunImpl.
+            public double? SensitivityFloor;      // --sensitivity-floor: mechanism (b)
+            public double? MarginalSnrStrength;   // --marginal-snr-strength: mechanism (a); 0 disables
+            public double? MarginalSnrFloor;      // --marginal-snr-floor: mechanism (a) peak-SNR floor, in σ
         }
 
         /// <summary>Outcome of optimizing one set of runs (joint or a single per-run), for the aggregate report.</summary>
@@ -325,6 +588,32 @@ namespace TestApp {
             public List<RunEvaluationResult> PerRunBaseline;   // per-run eval of CURRENT settings (the "before" columns)
             public List<RunEvaluationResult> PerRunBest;
             public List<LoadedHarnessRun> LoadedRuns;
+            public ObjectiveConstants ObjectiveConstants; // the SAME constants the runs were scored with (ExposureRecommender needs NTarget)
+        }
+
+        /// <summary>
+        /// F39(b) — DETECT this run at its own detection-binning factor, instead of writing the factor to disk and
+        /// running at the default of 1. Runs by DEFAULT (adopted in wave 8, see the flag comment in RunImpl); the
+        /// opt-OUT is <c>--no-run-detection-binning</c>, and passing it leaves the run bit-identical to before
+        /// F39(b) existed (F41's one-binary-is-both-arms rule). <c>--apply-run-detection-binning</c> is still
+        /// ACCEPTED and is NOT read: a no-op retained so wave 7's scripts keep working (F69(c)).
+        ///
+        /// <para>Applied through <see cref="DetectionBinningResolver.ApplyFactor"/> rather than by writing
+        /// <c>DetectionBinning</c> directly, because <c>StarDetectorParams.PixelScale</c> carries the factor too
+        /// (<c>HocusFocusStarDetection.ApplyDetectionImageContext</c>: <c>pixelScale * softwareBinning</c>). A raw
+        /// field write would leave every pixel-scale-dependent gate evaluated at half the scale the detector is
+        /// actually analyzing at.</para>
+        /// </summary>
+        private static void ApplyRunDetectionBinningIfRequested(
+            RunDetectionContext ctx, string runFolder, HarnessSettingsStore.Resolved resolvedForRun) {
+            if (!ctx.ApplyRunDetectionBinning) {
+                return;
+            }
+            var factor = HarnessSettingsStore.ResolveRunDetectionBinningFactor(runFolder, resolvedForRun, out var source);
+            DetectionBinningResolver.ApplyFactor(ctx.Seed, factor);
+            DetectionBinningResolver.ApplyFactor(ctx.Baseline, factor);
+            Console.WriteLine($"  detection binning (F39b): {factor} from {source}; "
+                + $"detecting at PixelScale {F(ctx.Seed.PixelScale)} arcsec/binned-px");
         }
 
         // ---- Joint mode (default): optimize ALL discovered runs together (N=1 reduces; N>1 is the balanced blend).
@@ -367,15 +656,58 @@ namespace TestApp {
                 var subDir = Path.Combine(outDir, OptimizationRunDiscovery.SanitizeForFileName(d.RunId));
                 var loadedRuns = new List<LoadedHarnessRun>(1);
                 try {
-                    loadedRuns.Add(await PrepareRunAsync(ctx, d, labelsByRun).ConfigureAwait(false));
+                    var loaded = await PrepareRunAsync(ctx, d, labelsByRun).ConfigureAwait(false);
+                    loadedRuns.Add(loaded);
+                    // PixelScale from THIS run's frames. Per-run mode optimizes each run independently, so each
+                    // carries the scale its data actually has. Joint mode cannot express this (one bundle, many scales).
+                    if (ctx.ApplyRunDetectionBinning) {
+                        // F39(b): normalize any PREVIOUS run's factor out first, so the per-run PixelScale assigned
+                        // just below is the UNBINNED one and this run's factor is applied exactly once. Skipped
+                        // entirely when the flag is absent, so that path cannot move by even a rounding step.
+                        DetectionBinningResolver.ApplyFactor(ctx.Seed, 1);
+                        DetectionBinningResolver.ApplyFactor(ctx.Baseline, 1);
+                    }
+                    if (double.IsFinite(loaded.PixelScale)) {
+                        ctx.Seed.PixelScale = loaded.PixelScale;
+                        ctx.Baseline.PixelScale = loaded.PixelScale;
+                    }
+                    Console.WriteLine($"  {d.RunId}: PixelScale {F(ctx.Seed.PixelScale)} arcsec/px ({loaded.PixelScaleSource})");
+                    // Per-dataset settings, derived from THIS run and recorded beside it.
+                    var runFolder = Path.GetDirectoryName(d.Frames.First().Path);
+                    var resolvedForRun = HarnessSettingsStore.ResolveForRun(
+                        runFolder, ctx.HarnessSettings, loaded.FirstFrameMeta,
+                        HarnessSettingsStore.ReadInFocusHfr(runFolder));
+                    ApplyRunDetectionBinningIfRequested(ctx, runFolder, resolvedForRun);
+                    // F69(b) — the bundle AS DETECTED, printed HERE because this is the first point at which it IS
+                    // the detecting bundle. The two dumps where the bundles are CONSTRUCTED are already past: the
+                    // per-run PixelScale assignment above and ApplyRunDetectionBinningIfRequested (F39(b), ON BY
+                    // DEFAULT) have both rewritten this object since. Wave 16's RULE P16 read the construction-site
+                    // copy, believed a comment that said the mutation only happened under an opt-in flag, and
+                    // excluded the one field that turned out to be the cause. Same shared reflective formatter as
+                    // the other two blocks, same sink (the console, never a summary file — clause W1), so the three
+                    // are field-for-field diffable and a field added by a later wave appears in all three.
+                    //
+                    // BASELINE and not seed, deliberately: optimize/baseline is the apples-to-apples side and the
+                    // only one the wave-16 scorer reads. ApplyFactor mutates BOTH bundles identically, so a later
+                    // wave that wants the seed's post-mutation copy loses nothing by it not being here today.
+                    ParamsDump.Write(Console.WriteLine, ParamsDump.OptimizeDetected, ctx.Baseline);
                     Directory.CreateDirectory(subDir);
                     var outcome = await OptimizeRunSetAsync(ctx, runsDir, subDir, loadedRuns).ConfigureAwait(false);
                     if (!outcome.HardFloorPassed) {
                         anyFailure = true;
                     }
-                    aggregate.Add(BuildAggregateRow(d.RunId, ctx, outcome));
+                    var row = BuildAggregateRow(d.RunId, ctx, outcome);
+                    aggregate.Add(row);
                     Console.WriteLine($"  -> {d.RunId}: currentJ={F(outcome.BaselineJ)} bestJ={F(outcome.Result.BestJ)} " +
                         $"hard-floor {(outcome.HardFloorPassed ? "PASS" : "FAIL")}; outputs in {subDir}");
+                    // F33: always quote the EFFECTIVE gate next to the raw axis. "sensitivity=0.0 (AT FLOOR)" is
+                    // exactly the line that made mccomiskey look like a floor landing when its real gate was 9.81.
+                    var gate = $"     sensitivity={F(row.BrightnessSensitivity)} (effective gate {F(row.EffectiveSensitivityGate)})";
+                    Console.WriteLine(row.SensitivityIsAtFloor && row.ExposureRecommendation?.HasRecommendation == true
+                        ? $"{gate} (AT FLOOR): exposure rec {F(row.ExposureRecommendation.CurrentSeconds)}s -> {F(row.ExposureRecommendation.RecommendedSeconds)}s"
+                        : row.SensitivityIsAtFloor
+                            ? $"{gate} (AT FLOOR): no exposure recommendation (insufficient data)"
+                            : $"{gate} (not at floor)");
                 } catch (Exception ex) {
                     anyFailure = true;
                     Console.Error.WriteLine($"  -> {d.RunId}: FAILED to optimize ({ex.Message}); continuing to next run");
@@ -391,53 +723,89 @@ namespace TestApp {
             }
 
             WriteAggregateSummary(Path.Combine(outDir, "aggregate_summary.txt"), runsDir, ctx, aggregate);
+            // JSON twin of aggregate_summary.txt (same AggregateRow data, including the exposure recommendation) for
+            // scripted consumption -- e.g. checking ExposureRecommendation.RecommendedSeconds across a bank without
+            // parsing the text report.
+            File.WriteAllText(Path.Combine(outDir, "aggregate_summary.json"), JsonConvert.SerializeObject(aggregate, Formatting.Indented));
             Console.WriteLine($"Per-run batch complete: {aggregate.Count(r => r.LoadOk)} optimized, " +
-                $"{aggregate.Count(r => !r.LoadOk)} failed. Wrote aggregate_summary.txt to {outDir}");
+                $"{aggregate.Count(r => !r.LoadOk)} failed. Wrote aggregate_summary.txt and aggregate_summary.json to {outDir}");
             if (anyFailure) {
                 Environment.ExitCode = 3;
             }
         }
 
         /// <summary>
-        /// Loads a discovered run's frames as float Mats once, wires the harness detection delegate, infers the
+        /// Loads a discovered run's frames as IRenderedImages once, wires the plugin's split detector, infers the
         /// fit config, and builds its <see cref="RunEvaluationData"/>. Caller owns disposing the returned run via
         /// <see cref="DisposeRuns"/>, which frees BOTH the <see cref="RunEvaluationData"/>'s cached early-detection
-        /// contexts and the loaded-once frame Mats.
+        /// contexts and the loaded-once frame images.
         /// </summary>
+
+
         private static async Task<LoadedHarnessRun> PrepareRunAsync(
             RunDetectionContext ctx, OptimizationRunDiscovery.DiscoveredRun d,
             Dictionary<string, IReadOnlyList<FrameLabels>> labelsByRun) {
             var frames = new List<RunFrame>(d.Frames.Count);
-            foreach (var frame in d.Frames) {
-                // LoadFloatMat returns a fresh Mat each call; the optimizer detect delegate clones before
-                // detection (Detect mutates its input), so the cached Mat here is never mutated.
-                var mat = await DiagnosticUtil.LoadFloatMat(frame.Path, ctx.ProfileService).ConfigureAwait(false);
+            var runPixelScale = double.NaN;
+            var pixelScaleSource = "unset";
+            NINA.Image.ImageData.ImageMetaData firstFrameMeta = null;
+            // Captured exposure, in seconds, that the run's frames were actually shot with — read off the FIRST
+            // frame's header only (an AF sweep exposes every point identically, mirroring
+            // RunEvaluationLoader.LoadedRun.CapturedExposureSeconds's "first frame only" convention). NaN when the
+            // header carries no exposure keyword; ExposureRecommender.Recommend treats a non-positive/NaN exposure
+            // as "no recommendation", never a guess. Taken off the rendered image this loop already loads, so the
+            // exposure costs no extra read and comes from the same header the detector's frame does.
+            var capturedExposureSeconds = double.NaN;
+            for (var i = 0; i < d.Frames.Count; i++) {
+                var frame = d.Frames[i];
+                // The IRenderedImage the LIVE app detects on (see DiagnosticUtil.LoadRenderedImage). Detection reads
+                // it without mutating it — Detect/BuildDetectionContext build their own source Mat per call — so one
+                // load per frame serves every candidate evaluation. NOTHING is CFA-filtered here: the filter and the
+                // debayer belong inside Detect, at each candidate's own HotpixelThreshold/HotpixelThresholdingEnabled,
+                // which is what keeps those two searched axes meaningful.
+                var rendered = await DiagnosticUtil.LoadRenderedImage(frame.Path, ctx.ProfileService).ConfigureAwait(false);
+                if (i == 0) {
+                    firstFrameMeta = rendered.RawImageData?.MetaData;
+                    runPixelScale = HarnessSettingsStore.PixelScaleForFrame(firstFrameMeta, ctx.HarnessSettings, out pixelScaleSource);
+                    capturedExposureSeconds = firstFrameMeta?.Image?.ExposureTime ?? double.NaN;
+                }
                 frames.Add(new RunFrame {
                     FrameId = frame.Path,
                     FocuserPosition = frame.FocuserPosition,
-                    Image = mat
+                    Image = rendered
                 });
             }
 
             var stepSize = InferStepSize(d.Frames);
             var fitConfig = new RunFitConfig {
                 StepSize = stepSize,
-                UseWeights = ctx.AfOptions.WeightedHyperbolicFitEnabled,
-                MaxOutlierRejections = ctx.AfOptions.MaxOutlierRejections,
-                RejectionConfidence = ctx.AfOptions.OutlierRejectionConfidence,
-                PreferredModel = null
+                // F58: read from ctx.FitInputs, NOT from ctx.AfOptions, so the values that build this fit are the
+                // same object that is rendered into every landing's OptimizerProvenance.FitInputs.
+                UseWeights = ctx.FitInputs.UseWeights,
+                MaxOutlierRejections = ctx.FitInputs.MaxOutlierRejections,
+                RejectionConfidence = ctx.FitInputs.RejectionConfidence,
+                // Was hard-coded null while the wizard's loader passes afOptions.HyperbolicFitModel. Currently
+                // informational (the evaluator always runs the Hybrid best-fit selection), but a silent divergence
+                // from the wizard is exactly what this work exists to remove.
+                PreferredModel = ctx.FitInputs.PreferredModel
             };
 
-            // Split detector: caches the expensive early detection per (frame, early key) and reuses it across the
-            // many candidate evaluations that change only late-stage gate params (the ~2× speedup). The
-            // FrameDetectionResult mapping is the SAME ToFrameDetectionResult the legacy delegate used, so results
-            // are unchanged.
-            var splitDetector = new MatSplitFrameDetector(ctx.Detector, ctx.MeasurementAverage, ctx.HighSigmaOutlierRejection, ctx.LowSigmaOutlierRejection);
+            // Split detector: the WIZARD'S OWN HocusFocusSplitFrameDetector (RunEvaluationLoader), not a harness
+            // mirror of it. It caches the expensive early detection per (frame, early key) and reuses it across the
+            // many candidate evaluations that change only late-stage gate params (the ~2× speedup), and its
+            // FrameDetectionResult mapping is by definition the one the wizard uses. hocusParams mirrors the loader's:
+            // IsAutoFocus with NumberOfAFStars = 0, so every accepted star is scored (no brightest-N trim) and the
+            // sigma rejections stay at the HocusFocusDetectionParams class defaults (high 4.0 / low 3.0).
+            var splitDetector = new RunEvaluationLoader.HocusFocusSplitFrameDetector(
+                ctx.Detection, new HocusFocusDetectionParams { IsAutoFocus = true, NumberOfAFStars = 0 });
 
             var labels = labelsByRun.TryGetValue(d.RunId, out var ls) ? ls : null;
             var data = new RunEvaluationData(d.RunId, frames, splitDetector, ctx.AlglibAPI, fitConfig, labels);
-            Console.WriteLine($"  {d.RunId}: inferred step size {stepSize}" + (labels != null ? $", {labels.Count} labeled position(s)" : ", unlabeled"));
-            return new LoadedHarnessRun { Discovered = d, Data = data, StepSize = stepSize, Frames = frames };
+            var exposureForLog = double.IsFinite(capturedExposureSeconds) ? $"{F(capturedExposureSeconds)}s" : "unrecorded";
+            Console.WriteLine($"  {d.RunId}: inferred step size {stepSize}, exposure {exposureForLog}" + (labels != null ? $", {labels.Count} labeled position(s)" : ", unlabeled"));
+            return new LoadedHarnessRun { Discovered = d, Data = data, StepSize = stepSize, Frames = frames,
+                PixelScale = runPixelScale, PixelScaleSource = pixelScaleSource, FirstFrameMeta = firstFrameMeta,
+                CapturedExposureSeconds = capturedExposureSeconds };
         }
 
         /// <summary>
@@ -451,6 +819,7 @@ namespace TestApp {
             if (ctx.MaxEvals.HasValue) {
                 settings.MaxEvaluations = ctx.MaxEvals.Value;
             }
+            settings.MinDetectionKeepFraction = ctx.KeepFloor;   // F32; null => unconstrained, bit-identical
 
             var variables = ctx.Variables;
 
@@ -481,14 +850,30 @@ namespace TestApp {
                 // excluded from the weighted sum).
                 objectiveConstants.HfrOutlierStrength = 0.0;
                 objectiveConstants.Wcov = 0.0;
+                // F23: also zero the marginal-SNR false-positive proxy, so --legacy-objective stays a true
+                // pre-change arm rather than "pre-change except for the newest term".
+                objectiveConstants.MarginalSnrStrength = 0.0;
             }
+            // F23 arm overrides. Applied HERE — after the constants are built, before the optimizer is constructed —
+            // because this single instance feeds the search, baselineJ, the hard floor, the summary and the exposure
+            // recommendation; mutating it at any later point would cover only some of them.
+            if (ctx.MarginalSnrStrength.HasValue) {
+                objectiveConstants.MarginalSnrStrength = ctx.MarginalSnrStrength.Value;
+            }
+            if (ctx.MarginalSnrFloor.HasValue) {
+                objectiveConstants.MarginalSnrFloor = ctx.MarginalSnrFloor.Value;
+            }
+            Console.WriteLine(
+                $"  objective: marginalSnr strength={F(objectiveConstants.MarginalSnrStrength)} floor={F(objectiveConstants.MarginalSnrFloor)} sigma " +
+                $"threshold={F(objectiveConstants.MarginalSnrThreshold)}; searchable Sensitivity lower bound=" +
+                $"{F(ctx.SensitivityFloor ?? OptimizerVariable.DefaultSensitivityLower)}");
             var optimizer = new StarDetectionOptimizer(objectiveConstants);
 
             var baselineJ = OptimizationObjective.JTotal(
                 perRunBaseline.Select(pr => OptimizationObjective.JRun(pr.Metrics, objectiveConstants)).ToList(), objectiveConstants);
             Console.WriteLine($"Current settings J: {F(baselineJ)}");
             if (ctx.Inspection) {
-                Console.WriteLine($"  inspection objective: reference σ = {F(currentSigma)} (current settings), margin = {F(objectiveConstants.FitGuardMarginFraction)}");
+                Console.WriteLine($"  inspection objective: reference sigma = {F(currentSigma)} (current settings), margin = {F(objectiveConstants.FitGuardMarginFraction)}");
             }
 
             // Trajectory capture (eval-budget analysis): the optimizer reports on the seed + every accepted move, so
@@ -505,8 +890,43 @@ namespace TestApp {
             var buildsBefore = dataList.Sum(d => d.ContextBuilds);
             var reusesBefore = dataList.Sum(d => d.ContextReuses);
 
+            // F35 — seed MinHFR beneath the gate when the pre-search fit says this rig's stars are smaller than it.
+            // perRunBaseline (built above, before the objective was even finalized) already holds the fits, so the
+            // trigger statistic costs nothing extra here. Run 0 is the representative run, matching the wizard.
+            // The seeded value is reported below so a landing never silently differs from its recorded seed.
+            settings.MinHfrSeedFloor = ctx.NoMinHfrSeed
+                ? null
+                : MinHfrSeed.Resolve(
+                    perRunBaseline.Count > 0 ? (perRunBaseline[0].BestFit?.Minimum.Y ?? double.NaN) : double.NaN,
+                    ctx.Seed.MinHFR,
+                    ctx.Seed.DetectionBinning);
+            if (ctx.NoMinHfrSeed) {
+                // Say it per run, not only once at startup: an arm's log is read run by run, and "the seed did not
+                // fire" and "the seed was switched off" are different facts that must not look alike.
+                Console.WriteLine($"  MinHFR seed (F35): SUPPRESSED by --no-min-hfr-seed (fitted vertex HFR "
+                    + $"{F(perRunBaseline.Count > 0 ? (perRunBaseline[0].BestFit?.Minimum.Y ?? double.NaN) : double.NaN)} px, "
+                    + $"gate {F(ctx.Seed.MinHFR)})");
+            }
+            if (settings.MinHfrSeedFloor is double seededMinHfr) {
+                Console.WriteLine($"  MinHFR seed (F35): fitted vertex HFR {F(perRunBaseline[0].BestFit?.Minimum.Y ?? double.NaN)} px "
+                    + $"is at or below the gate {F(ctx.Seed.MinHFR)}; seeding MinHFR -> {F(seededMinHfr)}");
+            }
+
             var sw = System.Diagnostics.Stopwatch.StartNew();
             var result = await optimizer.OptimizeAsync(ctx.Seed, variables, evaluator, settings, progress, CancellationToken.None).ConfigureAwait(false);
+
+            // The seed is a START condition, not a bound: once the first pass has run, MinHFR is the search's to
+            // move. Leaving the floor set would re-stamp it on every continue round and silently undo any upward
+            // move the search had earned.
+            settings.MinHfrSeedFloor = null;
+
+            // F32 — the OPPOSITE treatment for the keep floor, and deliberately so. MinHfrSeedFloor is a start
+            // condition; the keep floor is a bound, and a bound measured against each round's OWN seed compounds:
+            // at 0.5, two continue rounds permit 0.25 of where the user actually started. Pin round 0's seed
+            // totals so every later round is still measured against the original.
+            if (settings.MinDetectionKeepFraction.HasValue && result.SeedRunDetectionTotals != null) {
+                settings.DetectionKeepBaselineTotals = result.SeedRunDetectionTotals;
+            }
 
             // --continue-rounds: chain additional passes, each re-seeded from the prior best with a FRESH curated set
             // (resets the pattern-search step scale, so it can make larger moves again — the point of "Continue").
@@ -515,7 +935,7 @@ namespace TestApp {
             var roundBestJ = new List<double> { result.BestJ };
             for (var roundIdx = 0; roundIdx < ctx.ContinueRounds; roundIdx++) {
                 var seedN = result.BestParams;
-                var variablesN = OptimizerVariable.CreateCuratedSet(seedN);
+                var variablesN = OptimizerVariable.CreateCuratedSet(seedN, ctx.SensitivityFloor);
                 var next = await optimizer.OptimizeAsync(seedN, variablesN, evaluator, settings, progress, CancellationToken.None).ConfigureAwait(false);
                 Console.WriteLine($"Continue round {roundIdx + 1}: bestJ {F(result.BestJ)} -> {F(next.BestJ)}");
                 result = next;
@@ -526,6 +946,20 @@ namespace TestApp {
                 Console.WriteLine($"Per-round J: {string.Join(" -> ", roundBestJ.Select(F))}");
             }
             Console.WriteLine($"Optimization complete: currentJ={F(baselineJ)} -> bestJ={F(result.BestJ)} ({(result.BestJ > baselineJ ? "improved over current" : "no improvement over current")}), evals={result.Evaluations}");
+
+            // F32 — what the landing SPENT, next to what it gained. Printed ALWAYS, because an unconstrained run
+            // is exactly where this number decides something: it says whether a floor would have bound, so a
+            // control arm can be classified without re-running it. F32 spent two waves reconstructing this
+            // quantity by hand from stored landings.
+            if (double.IsFinite(result.LandingKeepFraction)) {
+                Console.WriteLine($"  detections kept vs seed (F32): {F(result.LandingKeepFraction)} (min over runs)");
+            }
+            // The floor line additionally distinguishes "the constraint never bound" (0 rejections) from "the
+            // constraint held the search back" (>0): a landing that never wanted to shed is a different result
+            // from a bounded one, and they are indistinguishable from the landing alone.
+            if (settings.MinDetectionKeepFraction is double keepFloor) {
+                Console.WriteLine($"  keep floor (F32): {F(keepFloor)}; {result.CandidatesRejectedByKeepFloor} candidate(s) rejected as infeasible");
+            }
 
             // Cache-health + wall-clock readout (the early-context build:reuse ratio is the direct measure of how much
             // per-frame early work the staged search / context cache avoids; see the performance-design doc).
@@ -566,13 +1000,15 @@ namespace TestApp {
                 loadedRuns, perRunBaseline, perRunBest, objectiveConstants, focuserMaxStep, ctx.LabelsDir, settings, passed, worstFrameCount, worstRunId);
             WriteCsv(Path.Combine(targetDir, "optimize_result.csv"), loadedRuns, perRunBaseline, perRunBest);
 
-            // Optimized-settings handoff: write the winning snapshot as optimized_settings.json into each focus run's
-            // own source folder (so `review --runs <same>` auto-discovers it) plus a single copy in the --out dir.
-            // Uses the SAME params->DTO mapping the wizard's Apply() uses (OptimizedStarDetectionSettings.FromParams)
-            // so the headless and in-app handoffs can never drift. The source-folder copies each carry that run's OWN
-            // recommended step (StepSizeRecommender, exactly as BuildAggregateRow computes it); the single --out copy
-            // uses the representative (first) run's step in joint mode (see WriteOptimizedSettings).
-            WriteOptimizedSettings(targetDir, loadedRuns, perRunBest, result, baselineJ, focuserMaxStep);
+            // Optimized-settings handoff: a single copy in the --out dir ALWAYS, plus — only with
+            // --update-run-folder (F15) — the winning snapshot written back into each focus run's own source
+            // folder, so `review --runs <same>` auto-discovers it. Uses the SAME params->DTO mapping the wizard's
+            // Apply() uses (OptimizedStarDetectionSettings.FromParams) so the headless and in-app handoffs can
+            // never drift. The source-folder copies each carry that run's OWN recommended step (StepSizeRecommender,
+            // exactly as BuildAggregateRow computes it); the single --out copy uses the representative (first)
+            // run's step in joint mode (see WriteOptimizedSettings).
+            WriteOptimizedSettings(targetDir, loadedRuns, perRunBest, result, baselineJ, focuserMaxStep, ctx.Provenance,
+                ctx.StarDetectionOptions, ctx.KeepFloor, ctx.UpdateRunFolder);
 
             await WriteAnnotatedFrames(targetDir, loadedRuns, result.BestParams, ctx.Detector,
                 ctx.MeasurementAverage, ctx.HighSigmaOutlierRejection, ctx.LowSigmaOutlierRejection, ctx.AnnotateAll).ConfigureAwait(false);
@@ -585,7 +1021,8 @@ namespace TestApp {
                 BaselineJ = baselineJ,
                 PerRunBaseline = perRunBaseline,
                 PerRunBest = perRunBest,
-                LoadedRuns = loadedRuns
+                LoadedRuns = loadedRuns,
+                ObjectiveConstants = objectiveConstants
             };
         }
 
@@ -602,16 +1039,70 @@ namespace TestApp {
         /// is that single run's own subfolder, so "first run" == that run; behavior is unchanged.) A failed write for
         /// one run is logged and skipped — it never aborts the batch.
         /// </summary>
+        /// <summary>
+        /// Writes the landing a SECOND time, as a <see cref="StarDetectionSettingsExport"/> envelope the NINA UI can
+        /// actually load — so a bank run can be replayed in the app with the settings it was optimized at.
+        ///
+        /// <para><b>Why a separate file and not optimized_settings.json.</b> `golden eval --params optimized`,
+        /// `bank-verify`, `review` and `inspect-align` all locate the landing by that EXACT filename and
+        /// deserialize it as a bare <see cref="OptimizedStarDetectionSettings"/>. Handing them an envelope instead
+        /// would bind every curated knob to its CLR default (Sensitivity 0, MinHFR 0, StructureLayers 0) and score a
+        /// completely different detector with no error and no warning. The distinct name is load-bearing, not
+        /// cosmetic.</para>
+        ///
+        /// <para><b>And not metadata.json either.</b> That name is the AF replay path's capture-time record, resolved
+        /// folder-before-run-root, and the real bank already has genuine ones. Writing a landing there would shadow
+        /// a real record with a file the replay prompt describes as "the settings used at capture time".</para>
+        ///
+        /// <para>Best-effort: a failure here is reported and skipped, exactly like its sibling — the landing itself is
+        /// already on disk and no diagnostic depends on this file.</para>
+        /// </summary>
+        private static void WriteSettingsHandoff(
+            string folder, OptimizedStarDetectionSettings dto, StarDetectionOptions baseOptions, string runId) {
+            if (baseOptions == null) {
+                return;   // legacy/test callers that did not thread the options through: no honest snapshot to write
+            }
+            try {
+                var export = StarDetectionSettingsExport.FromOptimizedLanding(baseOptions, dto);
+                var path = Path.Combine(folder, SettingsHandoffFileName);
+                File.WriteAllText(path, export.Serialize());
+                Console.WriteLine($"  wrote {SettingsHandoffFileName} to {path}");
+            } catch (Exception ex) {
+                Console.Error.WriteLine($"  WARNING: failed to write {SettingsHandoffFileName} for run '{runId}': {ex.Message}");
+                Logger.Error(ex, $"Failed to write {SettingsHandoffFileName} for run '{runId}'");
+            }
+        }
+
+        /// <summary>The NINA-loadable settings handoff written beside every landing. Must NEVER be
+        /// "optimized_settings.json" (the bank readers match that name exactly) or "metadata.json" (the AF replay
+        /// record).</summary>
+        internal const string SettingsHandoffFileName = "hocusfocus_star_detection.json";
+
+        /// <summary>F15's policy — the opt-in flag and the displaced-landing backup — lives in
+        /// <see cref="LandingWriteback"/>, outside this WPF-bound file, so it can be unit-tested against a real
+        /// filesystem instead of asserted about.</summary>
+
         private static void WriteOptimizedSettings(
             string targetDir, List<LoadedHarnessRun> loadedRuns, List<RunEvaluationResult> perRunBest,
-            OptimizationResult result, double baselineJ, int? focuserMaxStep) {
+            OptimizationResult result, double baselineJ, int? focuserMaxStep, OptimizerProvenance provenance = null,
+            StarDetectionOptions baseOptions = null, double? keepFloor = null, bool updateRunFolder = false) {
             // Per-run source-folder copies: each run's frame directory gets the winner snapshot with its OWN step.
-            for (int i = 0; i < loadedRuns.Count; i++) {
+            // F15: OPT-IN ONLY. The default leaves the bank exactly as it found it, and SAYS SO — an absent write
+            // has to be visible, because the whole defect was that it was not.
+            if (!updateRunFolder) {
+                Console.WriteLine(
+                    $"  --update-run-folder not given: left {loadedRuns.Count} run folder(s) untouched (F15). " +
+                    "The landing is in the --out dir only. Note that `bank-verify --opt-a/--opt-b`, " +
+                    "`golden eval --params optimized` and `review --runs <same>` read the RUN FOLDER copy, so " +
+                    "they will see whatever was there before this pass.");
+            }
+            for (int i = 0; updateRunFolder && i < loadedRuns.Count; i++) {
                 var run = loadedRuns[i];
                 try {
                     var rec = StepSizeRecommender.Recommend(perRunBest[i].BestFit, run.StepSize, focuserMaxStep);
                     var dto = OptimizedStarDetectionSettings.FromParams(
-                        result.BestParams, loadedRuns.Count, baselineJ, result.BestJ, rec.StepSize, rec.OffsetSteps);
+                        result.BestParams, loadedRuns.Count, baselineJ, result.BestJ, rec.StepSize, rec.OffsetSteps, provenance,
+                        keepFloor, result.LandingKeepFraction);
                     var json = JsonConvert.SerializeObject(dto);
 
                     // The run's source folder is the directory holding its frames (each run's frames live together).
@@ -619,8 +1110,12 @@ namespace TestApp {
                     var runFolder = string.IsNullOrEmpty(firstFramePath) ? null : Path.GetDirectoryName(firstFramePath);
                     if (!string.IsNullOrEmpty(runFolder)) {
                         var runPath = Path.Combine(runFolder, "optimized_settings.json");
+                        var backup = LandingWriteback.SnapshotExistingLanding(runPath);
                         File.WriteAllText(runPath, json);
-                        Console.WriteLine($"  wrote optimized_settings.json to {runPath}");
+                        Console.WriteLine(backup == null
+                            ? $"  wrote optimized_settings.json to {runPath}"
+                            : $"  wrote optimized_settings.json to {runPath} (previous file preserved as {Path.GetFileName(backup)})");
+                        WriteSettingsHandoff(runFolder, dto, baseOptions, run.Discovered.RunId);
                     } else {
                         Console.Error.WriteLine($"  WARNING: could not resolve source folder for run '{run.Discovered.RunId}'; skipped the in-folder optimized_settings.json");
                     }
@@ -638,10 +1133,12 @@ namespace TestApp {
                 try {
                     var rec = StepSizeRecommender.Recommend(perRunBest[0].BestFit, representative.StepSize, focuserMaxStep);
                     var dto = OptimizedStarDetectionSettings.FromParams(
-                        result.BestParams, loadedRuns.Count, baselineJ, result.BestJ, rec.StepSize, rec.OffsetSteps);
+                        result.BestParams, loadedRuns.Count, baselineJ, result.BestJ, rec.StepSize, rec.OffsetSteps, provenance,
+                        keepFloor, result.LandingKeepFraction);
                     var json = JsonConvert.SerializeObject(dto);
                     var outPath = Path.Combine(targetDir, "optimized_settings.json");
                     File.WriteAllText(outPath, json);
+                    WriteSettingsHandoff(targetDir, dto, baseOptions, representative.Discovered.RunId);
                 } catch (Exception ex) {
                     Console.Error.WriteLine($"  WARNING: failed to write optimized_settings.json to --out dir '{targetDir}': {ex.Message}");
                     Logger.Error(ex, $"Failed to write --out optimized_settings.json to '{targetDir}'");
@@ -654,9 +1151,11 @@ namespace TestApp {
                 // Release the per-frame cached early-detection contexts the RunEvaluationData pinned (each holds a
                 // ~244 MB source Mat at 61 MP); a long --per-run batch accumulates them otherwise. Idempotent.
                 r.Data?.Dispose();
-                // Release the cached frame Mats (each RunFrame.Image is a Mat the harness loaded once).
+                // Drop the cached frames (each RunFrame.Image is an IRenderedImage the harness loaded once, holding
+                // the raw ushort[] plus its rendered BitmapSources). Nothing here is IDisposable, so releasing the
+                // references is what frees them; a long --per-run batch would otherwise pin every run's frame set.
                 foreach (var rf in r.Frames) {
-                    (rf.Image as Mat)?.Dispose();
+                    rf.Image = null;
                 }
             }
         }
@@ -676,6 +1175,81 @@ namespace TestApp {
             public double BestSigmaFocus = double.NaN;
             public int RecommendedStep;
             public string ChangedParams = string.Empty;
+
+            // Exposure-time recommendation (T8): the winning run's landed Sensitivity gate, whether it is at the
+            // optimizer's search floor (signal-starved frames, see ExposureRecommender), and — only when it is —
+            // the derived recommendation itself. Left null when SensitivityIsAtFloor is false: the offline report
+            // does not compute or print a recommendation for a healthy run.
+            public double BrightnessSensitivity = double.NaN;
+            public bool SensitivityIsAtFloor;
+            public ExposureRecommendation ExposureRecommendation;
+
+            // F33 — the gate this landing ACTUALLY enforces: max(Sensitivity, PeakResponse x effective StarClip).
+            // Reported alongside BrightnessSensitivity everywhere because the raw axis misclassifies a whole shape
+            // of landing: mccomiskey records Sensitivity 0.0 (which reads as "drove the gate to its floor") while
+            // enforcing 9.81 and shedding 3606 detections down to 43.
+            public double EffectiveSensitivityGate = double.NaN;
+
+            // F19 (wave 9) — the PER-FRAME table the run-level exposure statistic is a median over. See
+            // FrameDiagnostic. Computed UNCONDITIONALLY, from the same `bestM` metrics ExposureRecommendation is
+            // derived from, so the two describe one population. Null only when the run carries no per-frame data.
+            public List<FrameDiagnostic> FrameDiagnostics;
+        }
+
+        /// <summary>
+        /// One frame's contribution to the exposure statistic, plus where that frame sits on the sweep.
+        ///
+        /// <para><b>F19, wave 9.</b> <c>ExposureRecommender</c>'s S_now is a MEDIAN ACROSS FRAMES of each frame's
+        /// <c>NTarget</c>-th-brightest accepted-star SNR. On a rich field that median is dominated by the
+        /// near-focus frames, and wave 8's arm X measured it saturating at 991.8–2308.8 against a target of 10 —
+        /// RISING with exposure — on a run whose σ_focus improves 44 % at 16× that exposure. The hypothesis is that
+        /// the frames the fit's precision actually rests on are the WINGS, which that median cannot see. This
+        /// table is what lets the hypothesis be tested rather than argued: it exposes the per-frame values the
+        /// median collapses, keyed by distance from the fitted focus in STEP units.</para>
+        ///
+        /// <para><b>Deliberately not gated on anything.</b> Not on <c>SensitivityIsAtFloor</c>, not on
+        /// <c>HasLowStarSignal</c>, not on whether a recommendation exists — gating a measurement on the product's
+        /// own display condition is precisely what made F19 unanswerable until wave 8 (its lesson 4). And note
+        /// what this instrument does if the wing hypothesis is WRONG: it shows wing frames whose statistics are
+        /// indistinguishable from the near-focus frames, which refutes the hypothesis rather than confirming
+        /// it.</para>
+        /// </summary>
+        private sealed class FrameDiagnostic {
+            public int FocuserPosition;
+            public bool IsRecovery;
+
+            /// <summary>Signed distance from the fitted best-focus position in STEP units — the axis "wing" is
+            /// defined on. NaN when the run produced no usable fit (<c>BestFocusPosition</c> NaN) or no step size,
+            /// in which case no wing statistic can be computed for this run and that is reported, not guessed.</summary>
+            public double OffsetSteps = double.NaN;
+
+            /// <summary>Accepted stars on this frame (<c>FrameStarCounts</c>).</summary>
+            public int StarCount;
+
+            /// <summary>This frame's contribution to S_now: its <c>NTarget</c>-th-brightest accepted-star SNR, or
+            /// its FAINTEST survivor when fewer than <c>NTarget</c> survive (the same bounded under-estimate
+            /// <c>ExposureRecommender.PerFrameNthBrightest</c> makes, reproduced here rather than re-derived).
+            /// NaN when nothing survived filtering — which is NOT proof the frame was starved (see
+            /// <c>RunEvaluationMetrics.FrameStarSnrs</c>'s empty-does-not-mean-zero convention).</summary>
+            public double NthBrightestSnr = double.NaN;
+
+            /// <summary>True when the frame had fewer than <c>NTarget</c> usable SNRs, so
+            /// <see cref="NthBrightestSnr"/> is the faintest survivor rather than the true rank.</summary>
+            public bool WasShort;
+
+            /// <summary>The frame's faintest and median accepted-star SNR — the faint end the fit's wings rest on,
+            /// which the <c>NTarget</c>-th rank is deliberately insensitive to. NaN when no SNRs survived.</summary>
+            public double MinSnr = double.NaN;
+
+            public double MedianSnr = double.NaN;
+
+            /// <summary>Sensitivity-gate and flat-topped rejections on this frame. The flat count is the
+            /// sweep-geometry signal (<c>ExposureRecommendation.FlatRejectedCount</c>'s per-frame source): heavily
+            /// defocused stars go flat-topped, so a concentration out here means the sweep outruns the detector —
+            /// "narrow the sweep", never "expose longer".</summary>
+            public int LowSensitivityRejections;
+
+            public int TooFlatRejections;
         }
 
         /// <summary>Builds an aggregate row from a per-run outcome (exactly one run in the set in --per-run mode).
@@ -692,6 +1266,28 @@ namespace TestApp {
                 .Select(v => (v.Name, Cur: v.Read(ctx.Baseline), Best: v.Read(outcome.Result.BestParams)))
                 .Where(t => Math.Abs(t.Cur - t.Best) > 1e-9)
                 .ToList();
+
+            // Exposure-time recommendation (T8). Computed for EVERY run, whether or not the landed Sensitivity gate
+            // sits at the optimizer's search floor. Same metrics/constants the run was scored with: bestM is this
+            // run's own RunEvaluationMetrics, outcome.ObjectiveConstants is the objective the optimizer actually
+            // searched against (NTarget included), and run.CapturedExposureSeconds is the exposure its frames were
+            // shot with (NaN when the header carried none -- ExposureRecommender then reports no recommendation).
+            //
+            // F19: this used to be gated on `sensitivityAtFloor`, mirroring the product's own display trigger
+            // (OptimizationSummary.HasLowStarSignal). That made the harness unable to answer the question F19
+            // actually turns on -- "what WOULD the block say on a run where it never fires?" -- because on those
+            // runs the field was null and nothing had been measured. Wave 7's arm E found D02_rich_135mm gaining
+            // 44% of sigma_focus at 8x its derived exposure with Sensitivity landing at 9-49, i.e. the exposure
+            // advice is silent on exactly the population that loses; deciding whether widening the TRIGGER would
+            // publish a true answer or a false one requires the number the trigger was suppressing.
+            // GATE THE DISPLAY, NEVER THE MEASUREMENT. `SensitivityIsAtFloor` is still recorded beside it, so every
+            // consumer that wants the product's trigger semantics still has them, and the report text below is
+            // unchanged in what it CLAIMS -- it now also says what was measured rather than only "n/a".
+            var landedSensitivity = outcome.Result.BestParams.Sensitivity;
+            var sensitivityAtFloor = ExposureRecommender.SensitivityIsAtFloor(landedSensitivity);
+            var exposureRecommendation = ExposureRecommender.Recommend(
+                bestM, outcome.ObjectiveConstants, run.CapturedExposureSeconds, outcome.Result.BestParams);
+
             return new AggregateRow {
                 RunId = runId,
                 LoadOk = true,
@@ -704,8 +1300,79 @@ namespace TestApp {
                 RecommendedStep = rec.StepSize,
                 ChangedParams = changed.Count == 0
                     ? "(none)"
-                    : string.Join("; ", changed.Select(t => $"{t.Name}: {F(t.Cur)}->{F(t.Best)}"))
+                    : string.Join("; ", changed.Select(t => $"{t.Name}: {F(t.Cur)}->{F(t.Best)}")),
+                BrightnessSensitivity = landedSensitivity,
+                SensitivityIsAtFloor = sensitivityAtFloor,
+                ExposureRecommendation = exposureRecommendation,
+                EffectiveSensitivityGate = StarDetector.EffectiveSensitivityGate(outcome.Result.BestParams),
+                FrameDiagnostics = BuildFrameDiagnostics(bestM, outcome.ObjectiveConstants)
             };
+        }
+
+        /// <summary>
+        /// F19 (wave 9) — expands the per-frame values <c>ExposureRecommender</c>'s S_now is a median over. See
+        /// <see cref="FrameDiagnostic"/> for why. Pure, from metrics already plumbed through for other reasons
+        /// (<c>FrameStarCounts</c>, <c>FrameFocuserPositions</c>, <c>BestFocusPosition</c>, <c>FrameStarSnrs</c>,
+        /// <c>FrameIsRecovery</c>, and the two rejection tallies), so it adds no detection work and cannot perturb
+        /// a landing.
+        /// </summary>
+        private static List<FrameDiagnostic> BuildFrameDiagnostics(RunEvaluationMetrics m, ObjectiveConstants c) {
+            var snrsByFrame = m?.FrameStarSnrs;
+            if (snrsByFrame == null || snrsByFrame.Count == 0) {
+                return null;
+            }
+            var nTarget = c?.NTarget ?? 20;
+            var counts = m.FrameStarCounts;
+            var positions = m.FrameFocuserPositions;
+            var recovery = m.FrameIsRecovery;
+            var lowSens = m.FrameLowSensitivityCounts;
+            var tooFlat = m.FrameTooFlatCounts;
+            // The wing axis is |focuser - fitted focus| in STEP units. Both inputs can legitimately be missing (a
+            // run with no usable fit, or a caller that never populated positions), and the honest answer then is
+            // NaN on every frame rather than an offset measured from an invented origin.
+            var haveOffsetAxis = double.IsFinite(m.BestFocusPosition) && m.StepSize > 0.0 && positions != null;
+
+            var rows = new List<FrameDiagnostic>(snrsByFrame.Count);
+            for (var i = 0; i < snrsByFrame.Count; i++) {
+                var row = new FrameDiagnostic {
+                    FocuserPosition = positions != null && i < positions.Count ? positions[i] : 0,
+                    IsRecovery = recovery != null && i < recovery.Count && recovery[i],
+                    StarCount = counts != null && i < counts.Count ? counts[i] : 0,
+                    LowSensitivityRejections = lowSens != null && i < lowSens.Count ? lowSens[i] : 0,
+                    TooFlatRejections = tooFlat != null && i < tooFlat.Count ? tooFlat[i] : 0
+                };
+                if (haveOffsetAxis && i < positions.Count) {
+                    row.OffsetSteps = (positions[i] - m.BestFocusPosition) / m.StepSize;
+                }
+
+                // Same filter ExposureRecommender applies: finite AND positive. A filtered-out entry did not
+                // contribute a real detection, so pooling it here would make this table disagree with the
+                // statistic it exists to explain.
+                var filtered = new List<double>();
+                var frameSnrs = snrsByFrame[i];
+                if (frameSnrs != null) {
+                    for (var k = 0; k < frameSnrs.Count; k++) {
+                        var v = frameSnrs[k];
+                        if (double.IsFinite(v) && v > 0.0) {
+                            filtered.Add(v);
+                        }
+                    }
+                }
+                if (filtered.Count > 0) {
+                    filtered.Sort(); // ascending
+                    row.MinSnr = filtered[0];
+                    var (median, _) = filtered.MedianMAD();
+                    row.MedianSnr = median;
+                    if (filtered.Count >= nTarget) {
+                        row.NthBrightestSnr = filtered[filtered.Count - nTarget];
+                    } else {
+                        row.WasShort = true;
+                        row.NthBrightestSnr = filtered[0];
+                    }
+                }
+                rows.Add(row);
+            }
+            return rows;
         }
 
         /// <summary>
@@ -715,10 +1382,10 @@ namespace TestApp {
         /// </summary>
         private static void WriteAggregateSummary(string path, string runsDir, RunDetectionContext ctx, List<AggregateRow> rows) {
             var sb = new StringBuilder();
-            sb.AppendLine("=== Star Detection Optimizer — per-run aggregate ===");
+            sb.AppendLine("=== Star Detection Optimizer -- per-run aggregate ===");
             sb.AppendLine($"Runs root: {runsDir}");
             sb.AppendLine($"Mode: --per-run (each run optimized independently)");
-            sb.AppendLine($"Labels: {(string.IsNullOrWhiteSpace(ctx.LabelsDir) ? "(none — unlabeled)" : ctx.LabelsDir)}");
+            sb.AppendLine($"Labels: {(string.IsNullOrWhiteSpace(ctx.LabelsDir) ? "(none -- unlabeled)" : ctx.LabelsDir)}");
             sb.AppendLine($"MaxEvaluations: {(ctx.MaxEvals?.ToString(CultureInfo.InvariantCulture) ?? "default")}");
             sb.AppendLine($"Runs: {rows.Count} ({rows.Count(r => r.LoadOk)} optimized, {rows.Count(r => !r.LoadOk)} failed)");
             sb.AppendLine();
@@ -736,14 +1403,68 @@ namespace TestApp {
                 sb.AppendLine($"  sigma_focus : {F(r.BaselineSigmaFocus)} -> {F(r.BestSigmaFocus)}  (current -> optimized)");
                 sb.AppendLine($"  rec. step   : {r.RecommendedStep}");
                 sb.AppendLine($"  changed     : {r.ChangedParams}");
+                AppendExposureRecommendationLines(sb, "  ", r.BrightnessSensitivity, r.EffectiveSensitivityGate, r.SensitivityIsAtFloor, r.ExposureRecommendation);
                 sb.AppendLine();
             }
 
             File.WriteAllText(path, sb.ToString());
         }
 
+        /// <summary>
+        /// Formats the exposure-time recommendation (T8) for one run into <paramref name="sb"/>, shared by the
+        /// joint-mode optimize_summary.txt and the --per-run aggregate_summary.txt so the two never drift. When
+        /// <paramref name="sensitivityIsAtFloor"/> is false, a single line says so — no recommendation is computed
+        /// or printed for a healthy run. When it fired but <see cref="ExposureRecommendation.HasRecommendation"/> is
+        /// false (thin data or an unrecorded exposure), that is reported explicitly rather than silently omitted.
+        /// </summary>
+        /// <param name="effectiveSensitivityGate">
+        /// F33 — <c>max(Sensitivity, PeakResponse x effective StarClip)</c>, the gate the settings actually enforce.
+        /// Printed on the same line as the raw axis because that line, alone, misclassifies a whole shape of
+        /// landing: "sensitivity : 0.0 (AT SEARCH FLOOR)" is what made mccomiskey read as a floor landing when it
+        /// was enforcing 9.81 and had shed 3606 detections down to 43.
+        /// </param>
+        private static void AppendExposureRecommendationLines(StringBuilder sb, string indent, double brightnessSensitivity, double effectiveSensitivityGate, bool sensitivityIsAtFloor, ExposureRecommendation rec) {
+            sb.AppendLine($"{indent}sensitivity : {F(brightnessSensitivity)} (effective gate {F(effectiveSensitivityGate)})"
+                + (sensitivityIsAtFloor ? "  (AT SEARCH FLOOR -- frames may be signal-starved)" : ""));
+            if (!sensitivityIsAtFloor) {
+                // F19: the recommendation is now MEASURED on every run (see BuildAggregateRow), so this line reports
+                // what it says as well as the fact that the product would not surface it. "n/a" alone was the
+                // harness reproducing the product's blind spot instead of measuring it.
+                sb.AppendLine(rec == null || !rec.HasRecommendation
+                    ? $"{indent}exposure rec: not surfaced (Sensitivity is not at the search floor); no recommendation computable"
+                    : $"{indent}exposure rec: NOT SURFACED (Sensitivity is not at the search floor) -- would say "
+                        + $"{F(rec.CurrentSeconds)}s -> {F(rec.RecommendedSeconds)}s (increases={rec.IncreasesExposure}, "
+                        + $"raw={F(rec.RawSeconds)}s, S_now={F(rec.MeasuredSnr)}, notTheLimit={rec.ExposureIsNotTheLimit}, "
+                        + $"starCountIsTheLimit={rec.StarCountIsTheLimit}, exhausted={rec.StarFieldIsExhausted}, capped={rec.WasCapped})");
+                return;
+            }
+            if (rec == null || !rec.HasRecommendation) {
+                sb.AppendLine($"{indent}exposure rec: NO RECOMMENDATION (usable frames={rec?.UsableFrameCount ?? 0}, short frames={rec?.ShortFrameCount ?? 0}, " +
+                    $"current exposure={(rec != null && double.IsFinite(rec.CurrentSeconds) ? $"{F(rec.CurrentSeconds)}s" : "unrecorded")})");
+                return;
+            }
+            sb.AppendLine($"{indent}exposure rec: {F(rec.CurrentSeconds)}s -> {F(rec.RecommendedSeconds)}s " +
+                $"(increases={rec.IncreasesExposure}, raw={F(rec.RawSeconds)}s, S_now={F(rec.MeasuredSnr)}, " +
+                $"capped={rec.WasCapped}{(rec.WasCapped ? $" [byAbsoluteLimit={rec.CappedByAbsoluteLimit}]" : "")}, " +
+                $"usable frames={rec.UsableFrameCount}, short frames={rec.ShortFrameCount})");
+        }
+
+        /// <summary>Parses an optional numeric flag, throwing (rather than silently ignoring) on a malformed or
+        /// out-of-range value — a typo in an arm selector must fail the run, not quietly produce the default arm.</summary>
+        private static double? ParseOptionalDouble(string[] args, string name, double min) {
+            var raw = DiagnosticUtil.GetArg(args, name);
+            if (string.IsNullOrWhiteSpace(raw)) {
+                return null;
+            }
+            if (!double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out var value)
+                || !double.IsFinite(value) || value < min) {
+                throw new ArgumentException($"{name}: '{raw}' must be a finite number >= {min.ToString(CultureInfo.InvariantCulture)}");
+            }
+            return value;
+        }
+
         private static void PrintUsage() {
-            Console.Error.WriteLine("Usage: TestApp optimize --runs <folder> [--per-run] [--profile-id <guid>] [--out <dir>] [--max-evals <int>] [--annotate extremes|all] [--labels <dir>] [--inspection] [--donut] [--start-from-current] [--continue-rounds <0-2>] [--verbose]");
+            Console.Error.WriteLine("Usage: TestApp optimize --runs <folder> [--per-run] [--profile-id <guid>] [--out <dir>] [--max-evals <int>] [--annotate extremes|all] [--labels <dir>] [--inspection] [--donut] [--start-from-current] [--continue-rounds <0-2>] [--verbose] [--cv-threads <n>]");
             Console.Error.WriteLine("  --runs       (required) folder of saved AF runs. Runs are 'attempt*' folders (recursively, <=4 deep) with >=3 focuser positions; or --runs itself.");
             Console.Error.WriteLine("  --per-run    (optional) optimize each discovered run INDEPENDENTLY into its own subfolder + an aggregate_summary.txt (use for a multi-setup bank).");
             Console.Error.WriteLine("  --profile-id (default active) NINA profile id to load (settings + PixelScale).");
@@ -751,12 +1472,16 @@ namespace TestApp {
             Console.Error.WriteLine("  --max-evals  (optional) override the optimizer's MaxEvaluations budget.");
             Console.Error.WriteLine("  --annotate   (default extremes) annotate only min/max-focuser frames, or 'all' frames.");
             Console.Error.WriteLine("  --labels     (optional) folder of label JSON files; activates the recall/precision objective term.");
-            Console.Error.WriteLine("  --inspection (optional) use the aberration-inspection objective (favor more stars; fit bounded relative to current σ).");
+            Console.Error.WriteLine("  --inspection (optional) use the aberration-inspection objective (favor more stars; fit bounded relative to current sigma).");
             Console.Error.WriteLine("  --donut      (optional) force the DefocusAwareDonutDetection MASTER on so the optimizer explores the donut/spike recovery axes.");
             Console.Error.WriteLine("  --start-from-current (optional) seed the optimizer from the current settings instead of the defaults (never regresses below current J).");
             Console.Error.WriteLine("  --legacy-objective (optional) disable the HFR-outlier penalty + region-coverage reward + saturated-HFR exclusion (the pre-change 'before' for an A/B).");
             Console.Error.WriteLine("  --continue-rounds (optional, 0-2) extra chained passes after the first, each re-seeded from the prior best (3 total).");
             Console.Error.WriteLine("  --verbose    (optional) restore TRACE logging (default INFO). Slower: serializes per-detection stage timings to the NINA log.");
+            Console.Error.WriteLine("  --cv-threads (optional) cap OpenCV's parallel-for pool (0 = default). F55/F58 probes; the effective value is always printed.");
+            Console.Error.WriteLine("  --marginal-snr-strength (optional) override ObjectiveConstants.MarginalSnrStrength (F23 false-positive proxy). 0 disables the term.");
+            Console.Error.WriteLine("  --marginal-snr-floor    (optional) override ObjectiveConstants.MarginalSnrFloor, the absolute peak-SNR floor in sigma (default 6).");
+            Console.Error.WriteLine("  --sensitivity-floor     (optional) floor the SEARCHABLE Sensitivity range (F23 mechanism (b)). <=1.5 is provably inert at shipped defaults.");
         }
 
         // ---- Run / frame discovery -------------------------------------------------------------------------
@@ -767,19 +1492,30 @@ namespace TestApp {
             public OptimizationRunDiscovery.DiscoveredRun Discovered;
             public RunEvaluationData Data;
             public int StepSize;
-            public List<RunFrame> Frames; // the loaded-once frame Mats, retained for disposal
+            public List<RunFrame> Frames; // the loaded-once frame images, retained for release
+            // PixelScale (arcsec/binned-px) from this run's OWN first frame header, and that frame's metadata for
+            // the per-dataset settings derivation. NaN when neither frame nor settings file supplies one.
+            public double PixelScale = double.NaN;
+            public string PixelScaleSource = "unset";
+            public NINA.Image.ImageData.ImageMetaData FirstFrameMeta;
+
+            // The exposure, in seconds, the run's frames were captured with (first frame's header; NaN when
+            // unrecorded) — see PrepareRunAsync. Feeds ExposureRecommender.Recommend's currentExposureSeconds.
+            public double CapturedExposureSeconds = double.NaN;
         }
 
         /// <summary>
         /// Infers the AF step size from the frames exactly as <c>AutoFocusEngine.LoadSavedAttemptImpl</c> does:
         /// the absolute difference of the two smallest DISTINCT focuser positions. 0 when fewer than 2 positions.
+        /// Internal (widened from private) so <c>SynthValidateRunner</c> (workstream V1) can load a scenario
+        /// round's rendered frames exactly as `optimize` does, without a second copy of this logic.
         /// </summary>
-        private static int InferStepSize(List<OptimizationRunDiscovery.FrameRef> frames) {
+        internal static int InferStepSize(List<OptimizationRunDiscovery.FrameRef> frames) {
             var positions = frames.Select(f => f.FocuserPosition).Distinct().OrderBy(x => x).Take(2).ToList();
             return positions.Count > 1 ? Math.Abs(positions[0] - positions[1]) : 0;
         }
 
-        // ---- HFR aggregation + split detector now live in HarnessDetection / MatSplitFrameDetector
+        // ---- Detection + HFR aggregation live in the PLUGIN: RunEvaluationLoader.HocusFocusSplitFrameDetector
         //      (TestApp/HarnessSplitDetector.cs), shared with the tilt-calibration harness so the two can never drift.
 
         // ---- Labels ----------------------------------------------------------------------------------------
@@ -945,10 +1681,10 @@ namespace TestApp {
             ObjectiveConstants c, int? focuserMaxStep, string labelsDir, OptimizerSettings settings,
             bool passed, int worstFrameCount, string worstRunId) {
             var sb = new StringBuilder();
-            sb.AppendLine("=== Star Detection Optimizer — headless harness ===");
+            sb.AppendLine("=== Star Detection Optimizer -- headless harness ===");
             sb.AppendLine($"Runs root: {runsDir}");
             sb.AppendLine($"Runs: {runs.Count} ({string.Join(", ", runs.Select(r => r.Discovered.RunId))})");
-            sb.AppendLine($"Labels: {(string.IsNullOrWhiteSpace(labelsDir) ? "(none — unlabeled)" : labelsDir)}");
+            sb.AppendLine($"Labels: {(string.IsNullOrWhiteSpace(labelsDir) ? "(none -- unlabeled)" : labelsDir)}");
             sb.AppendLine($"MaxEvaluations: {settings.MaxEvaluations}; evaluator calls: {result.Evaluations}");
             sb.AppendLine("Optimizer seed: fully-default params; improvement is measured vs the user's CURRENT settings (matches the wizard).");
             sb.AppendLine();
@@ -958,21 +1694,30 @@ namespace TestApp {
             sb.AppendLine($"Best J    : {F(result.BestJ)}  ({(result.BestJ > baselineJ ? "improved over current" : "no improvement over current")})");
             sb.AppendLine();
 
-            sb.AppendLine("--- Per-run σ_focus (current -> optimized) and recommended step size ---");
+            sb.AppendLine("--- Per-run sigma_focus (current -> optimized) and recommended step size ---");
             for (int i = 0; i < runs.Count; i++) {
                 var run = runs[i];
                 var baselineM = perRunBaseline[i].Metrics;
                 var bestM = perRunBest[i].Metrics;
                 var rec = StepSizeRecommender.Recommend(perRunBest[i].BestFit, run.StepSize, focuserMaxStep);
                 sb.AppendLine($"  {run.Discovered.RunId}:");
-                sb.AppendLine($"    σ_focus       : {F(baselineM.SigmaFocus)} -> {F(bestM.SigmaFocus)}");
-                sb.AppendLine($"    R²            : {F(baselineM.RSquared)} -> {F(bestM.RSquared)}");
-                sb.AppendLine($"    reducedχ²     : {F(baselineM.ReducedChiSquared)} -> {F(bestM.ReducedChiSquared)}");
+                sb.AppendLine($"    sigma_focus   : {F(baselineM.SigmaFocus)} -> {F(bestM.SigmaFocus)}");
+                sb.AppendLine($"    R^2           : {F(baselineM.RSquared)} -> {F(bestM.RSquared)}");
+                sb.AppendLine($"    reducedChi^2  : {F(baselineM.ReducedChiSquared)} -> {F(bestM.ReducedChiSquared)}");
                 sb.AppendLine($"    current step  : {run.StepSize}");
                 sb.AppendLine($"    recommended   : step {rec.StepSize}, offset {rec.OffsetSteps} per side (half-width {F(rec.HalfWidth)})");
                 if (bestM.Recall.HasValue || bestM.Precision.HasValue) {
                     sb.AppendLine($"    recall/prec   : {F(bestM.Recall ?? double.NaN)} / {F(bestM.Precision ?? double.NaN)}");
                 }
+                // Exposure-time recommendation (T8): result.BestParams is the JOINT winner shared by every run in
+                // this set, so its Sensitivity is the same landed value for each row; bestM/run.CapturedExposureSeconds
+                // are this run's own metrics/exposure, and c is the same ObjectiveConstants the runs were scored with.
+                var sensitivityIsAtFloor = ExposureRecommender.SensitivityIsAtFloor(result.BestParams.Sensitivity);
+                var exposureRec = sensitivityIsAtFloor
+                    ? ExposureRecommender.Recommend(bestM, c, run.CapturedExposureSeconds, result.BestParams)
+                    : null;
+                AppendExposureRecommendationLines(sb, "    ", result.BestParams.Sensitivity,
+                    StarDetector.EffectiveSensitivityGate(result.BestParams), sensitivityIsAtFloor, exposureRec);
             }
             sb.AppendLine();
 
@@ -1088,11 +1833,13 @@ namespace TestApp {
                 }
 
                 foreach (var frame in toAnnotate) {
-                    // Reuse the already-loaded float Mat (it is never mutated — detection always clones it). This
-                    // also sidesteps re-loading .xisf/.fits, which would need the profile again.
-                    var srcFloat = (Mat)frame.Image;
-                    using var detectClone = srcFloat.Clone();
-                    var result = await detector.Detect(detectClone, optimizedParams, null, CancellationToken.None).ConfigureAwait(false);
+                    // Reuse the already-loaded rendered image (detection never mutates it). This also sidesteps
+                    // re-loading .xisf/.fits, which would need the profile again. The PNG background is a
+                    // display-only Mat (debayered luminance for an OSC frame, never CFA-filtered); star boxes are
+                    // full-frame pixel coordinates, which the debayer preserves.
+                    var rendered = (IRenderedImage)frame.Image;
+                    var result = await detector.Detect(rendered, optimizedParams, null, CancellationToken.None).ConfigureAwait(false);
+                    using var srcFloat = RenderedImageLoading.ToDebayeredLuminanceMat(rendered);
 
                     var fileName = $"{SanitizeFileName(run.Discovered.RunId)}_Focuser{frame.FocuserPosition}_optimized.png";
                     var outPath = Path.Combine(outDir, fileName);

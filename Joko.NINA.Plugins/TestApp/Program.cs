@@ -184,6 +184,33 @@ namespace TestApp {
                 return;
             }
 
+            // Settings-handoff backfill: `TestApp bank-export-settings --runs <bank-root> [--apply]`. Converts each
+            // run folder's existing optimized_settings.json into the NINA-importable
+            // hocusfocus_star_detection.json envelope IN PLACE, with no optimizer run — so folders landed before
+            // that handoff shipped become importable without a re-optimize pass, which per F15 would rewrite every
+            // run's stored settings and re-baseline the bank as a side effect.
+            if (args.Length > 0 && args[0].Equals("bank-export-settings", StringComparison.OrdinalIgnoreCase)) {
+                BankExportSettingsRunner.Run(args);
+                return;
+            }
+
+            // Synthetic AF-bank generator: `TestApp synth-bank --spec <json> --out <bank-root> ...`. Renders the
+            // checked-in dataset matrix (TestApp/SynthBank/synthetic-bank-spec.json) into a fresh on-disk bank via
+            // the real simulator, with exact per-star ground truth (docs/synthetic-af-bank-design.md, workstream G).
+            if (args.Length > 0 && args[0].Equals("synth-bank", StringComparison.OrdinalIgnoreCase)) {
+                await TestApp.SynthBank.SynthBankRunner.Run(args);
+                return;
+            }
+
+            // Synthetic-bank convergence driver: `TestApp synth-validate --spec <json> --out <dir> ...`. Per
+            // (dataset, scenario), deliberately starts the optimizer's bootstrap wrong and measures whether the
+            // step-size/exposure/detection-binning recommendations walk it back toward the dataset's physics-derived
+            // expected-optimal (docs/synthetic-af-bank-design.md, workstream V1). Writes synth_validate_report.{json,md}.
+            if (args.Length > 0 && args[0].Equals("synth-validate", StringComparison.OrdinalIgnoreCase)) {
+                await TestApp.SynthBank.SynthValidateRunner.Run(args);
+                return;
+            }
+
             // Headless aberration-inspector alignment reproducer: `TestApp inspect-align --runs <folder> ...`.
             // Drives the real SensorModel.RegisterStarsAndFit RANSAC alignment and reports the reference frame,
             // per-frame triangle counts, frames aligned, and every registration warning.
@@ -214,6 +241,23 @@ namespace TestApp {
                     Console.Error.WriteLine("Usage: TestApp golden tiles|eval --runs <dir> ...");
                     Environment.ExitCode = 2;
                 }
+                return;
+            }
+
+            // Headless wavelet benchmark: `TestApp bench-wavelet [--sizes WxH,...] [--layers 4,6,8] ...`.
+            // Times the legacy dense-SepFilter2D à trous residual against AtrousWaveletFast (Mat-level and
+            // optional --detect end-to-end A/B on a synthetic star field). Needs no profile and no images.
+            if (args.Length > 0 && args[0].Equals("bench-wavelet", StringComparison.OrdinalIgnoreCase)) {
+                await BenchWaveletRunner.Run(args);
+                return;
+            }
+
+            // Headless synthetic-camera render benchmark: `TestApp bench-simrender [--field dense,sparse] ...`.
+            // Reports the render's per-phase cost and PSF kernel-cache cardinality on a real ASTAP star field.
+            // `--kernel-ladder` times kernel generation alone and needs no catalog; `--census` counts stars and
+            // kernels without timing anything.
+            if (args.Length > 0 && args[0].Equals("bench-simrender", StringComparison.OrdinalIgnoreCase)) {
+                await BenchSimRenderRunner.Run(args);
                 return;
             }
 

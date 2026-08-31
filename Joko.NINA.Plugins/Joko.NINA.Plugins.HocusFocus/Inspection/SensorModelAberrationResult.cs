@@ -275,7 +275,8 @@ namespace NINA.Joko.Plugins.HocusFocus.Inspection {
             double focuserStepSizeMicrons,
             double finalFocusPosition,
             SensorModel.RegisteredStar[] registeredStars,
-            double acceptableRSquaredMin) {
+            double acceptableRSquaredMin,
+            int focuserSign = 1) {
             ImageSize = imageSize;
             FRatio = fRatio;
             PixelSizeMicrons = pixelSizeMicrons;
@@ -312,7 +313,7 @@ namespace NINA.Joko.Plugins.HocusFocus.Inspection {
 
             AnalysisResults.Clear();
             AnalyzeSensorModelFit(sensorModel, acceptableRSquaredMin);
-            AnalyzeCurvature(CurvatureRadiusMillimeters, CurvatureEffectMicrons, criticalFocusMicrons);
+            AnalyzeCurvature(CurvatureRadiusMillimeters, CurvatureEffectMicrons, criticalFocusMicrons, focuserSign);
             AnalyzeTilt(TiltEffectMicrons, Tilt, criticalFocusMicrons);
             AnalyzeCentering(sensorModel, pixelSizeMicrons);
 
@@ -389,8 +390,15 @@ namespace NINA.Joko.Plugins.HocusFocus.Inspection {
             AnalysisResults.Add(result);
         }
 
-        private void AnalyzeCurvature(double curvatureRadius, double curvatureElevationMicrons, double criticalFocus) {
-            var direction = curvatureElevationMicrons > 0 ? "REMOVING" : "ADDING";
+        /// <summary>
+        /// The spacer advice. The ACCEPTABLE verdict and the reported magnitude are pure z-space and never read
+        /// <paramref name="focuserSign"/>; only the REMOVING/ADDING word does. A positive curvature effect means
+        /// the outer field focuses above the centre, which calls for REMOVING spacers only when a higher focuser
+        /// position means "farther from the objective" — hence sign(k)·E_z &gt; 0, which at the default k = +1 is
+        /// the previous unconditional test (docs/focuser-direction-convention-design.md §3, site 5).
+        /// </summary>
+        private void AnalyzeCurvature(double curvatureRadius, double curvatureElevationMicrons, double criticalFocus, int focuserSign) {
+            var direction = focuserSign * curvatureElevationMicrons > 0 ? "REMOVING" : "ADDING";
             var result = new SensorModelAnalysisResult() {
                 Name = "Curvature",
                 Value = $"{curvatureRadius:0.} mm",
@@ -456,9 +464,14 @@ namespace NINA.Joko.Plugins.HocusFocus.Inspection {
             var bottomLeftFocuser = centerFocuser + sensorModel.TiltAt(x: -width / 2.0, y: height / 2.0) / focuserStepSizeMicrons;
             var bottomRightFocuser = centerFocuser + sensorModel.TiltAt(x: width / 2.0, y: height / 2.0) / focuserStepSizeMicrons;
 
+            // pixelSizeMicrons is the pitch of one pixel of THIS frame (HocusFocusStarDetection already
+            // multiplies the camera's metadata pixel size by the capture binning), and it is what `width`/
+            // `height` above were built from. Carrying it on the model makes TiltPlaneModel.A/B invertible
+            // back to a physical gradient by anyone holding the model alone — see TiltPlaneModel.PixelSizeMicrons.
             return TiltPlaneModel.Create(imageSize: imageSize, fRatio: fRatio,
                 focuserStepSizeMicrons: focuserStepSizeMicrons, centerFocuser: centerFocuser,
-                topLeftFocuser: topLeftFocuser, topRightFocuser: topRightFocuser, bottomLeftFocuser: bottomLeftFocuser, bottomRightFocuser: bottomRightFocuser);
+                topLeftFocuser: topLeftFocuser, topRightFocuser: topRightFocuser, bottomLeftFocuser: bottomLeftFocuser, bottomRightFocuser: bottomRightFocuser,
+                pixelSizeMicrons: pixelSizeMicrons);
         }
     }
 }

@@ -40,7 +40,9 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection {
         // re-detect. The version is stamped onto HocusFocusStarDetectionResult.DetectorVersion and folded into
         // HocusFocusStarDetectionResult.CacheKey, so a later reuse-side task can reject any saved
         // _star_detection_result.json that was produced by a different detector version (or different params).
-        public const int StarDetectorVersion = 1;
+        // v2: the structure-removal wavelet swapped from dense zero-padded Cv2.SepFilter2D kernels to
+        // AtrousWaveletFast (sparse 5-tap) — equivalent to float rounding (≤3e-8) but not bit-identical.
+        public const int StarDetectorVersion = 2;
 
         private readonly IAlglibAPI alglibAPI;
 
@@ -606,17 +608,21 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection {
                     // donut master is on we apply a default structure boost EVEN IF the explicit DefocusAwareStructure
                     // axis is off (the optimizer can raise it further via that axis). Gated by the master ⇒
                     // bit-identical when off.
-                    int effectiveStructureLayers;
-                    if (p.DefocusAwareStructure) {
-                        effectiveStructureLayers = Math.Max(1, p.StructureLayers + p.StructureLayerBoost);
-                    } else if (p.DefocusAwareDonutDetection) {
-                        effectiveStructureLayers = Math.Max(1, p.StructureLayers + DonutDefaultStructureLayerBoost);
+                    var effectiveStructureLayers = EffectiveStructureLayers(p);
+                    // Deliberately NOT passing the cancellation token to the wavelet: the two noise-estimate
+                    // tasks started above are still running and read srcImage/noiseReducedImage, and a cancellation
+                    // unwind from inside the wavelet would dispose those Mats under the tasks (native
+                    // use-after-free). This window stays non-cancellable (it is ~100 ms); the token is honored
+                    // again at the points after the task awaits.
+                    if (string.IsNullOrEmpty(p.SaveIntermediateFilesPath)) {
+                        // Fused: residual + subtract + clamp in one final pass, no residual Mat.
+                        AtrousWaveletFast.ComputeResidualAndSubtractInPlace(structureMap, effectiveStructureLayers);
                     } else {
-                        effectiveStructureLayers = p.StructureLayers;
-                    }
-                    using (var residualLayer = ComputeResidualAtrousB3SplineDyadicWaveletLayer(structureMap, effectiveStructureLayers)) {
-                        MaybeSaveIntermediateImage(residualLayer, p, "04-structure-wavelet-residual.tif");
-                        CvImageUtility.SubtractInPlace(structureMap, residualLayer);
+                        // Debug-intermediate path: materialize the residual so it can be saved before subtracting.
+                        using (var residualLayer = AtrousWaveletFast.ComputeResidual(structureMap, effectiveStructureLayers)) {
+                            MaybeSaveIntermediateImage(residualLayer, p, "04-structure-wavelet-residual.tif");
+                            CvImageUtility.SubtractInPlace(structureMap, residualLayer);
+                        }
                     }
 
                     MaybeSaveIntermediateImage(structureMap, p, "04-structure-wavelet-subtracted.tif");
@@ -1490,6 +1496,88 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection {
         }
 
         /// <summary>
+        /// The SMALLEST value <see cref="EffectiveClipMultiplier"/> can return for <paramref name="p"/> across every
+        /// possible candidate size — the donut-capped value when the master can cap at all, else the multiplier
+        /// verbatim. Candidate-size-INDEPENDENT by construction, which is what makes
+        /// <see cref="InertSensitivityBound"/> a property of the SETTINGS rather than of one candidate. Keep in
+        /// lockstep with <see cref="EffectiveClipMultiplier"/>: same predicate, minus the size test.
+        /// </summary>
+        public static double MinEffectiveClipMultiplier(StarDetectorParams p) {
+            if (p.DefocusAwareDonutDetection && p.DefocusDistortionSizeReference > 0.0) {
+                return Math.Min(p.StarClippingMultiplier, DonutClipMultiplierCap);
+            }
+            return p.StarClippingMultiplier;
+        }
+
+        /// <summary>
+        /// Strict lower bound on the Sensitivity-gate statistic for every candidate that reaches the gate. A
+        /// <see cref="StarDetectorParams.Sensitivity"/> at or below this rejects <b>nothing</b>, so
+        /// <see cref="StarDetectorMetrics.LowSensitivity"/> is then identically 0 and its value carries no
+        /// information about the frame at all (followup F28). 0.75 × 2.0 = <b>1.5</b> at shipped defaults.
+        ///
+        /// <para><b>Derivation.</b> Every clip survivor satisfies <c>raw − background &gt; clipMargin =
+        /// EffectiveClipMultiplier · σ</c>, so <c>meanFlux</c> — the mean over exactly those survivors — exceeds it
+        /// too; <c>peak</c> is the max over the same set, so <c>peak ≥ meanFlux</c>; hence
+        /// <c>NormalizedBrightness = peak − (1 − PeakResponse)·meanFlux = (peak − meanFlux) + PeakResponse·meanFlux
+        /// ≥ PeakResponse·meanFlux</c>. Dividing by the same σ the gate divides by gives
+        /// <c>sensitivity &gt; PeakResponse × EffectiveClipMultiplier</c>. The donut branch takes
+        /// <c>max(perPixel, integrated)</c>, so it can only raise the statistic and the bound survives.</para>
+        ///
+        /// <para><b>Not a constant.</b> <see cref="StarDetectorParams.PeakResponse"/> and
+        /// <see cref="StarDetectorParams.StarClippingMultiplier"/> are both searched optimizer axes, so a caller
+        /// must compute this from the params the run was actually evaluated with. Hard-coding 1.5 would be wrong
+        /// for exactly the landings this matters on — F23 wave 1 measured configurations at StarClip 6.25 and
+        /// 6.75, where the bound is over 4×.</para>
+        /// </summary>
+        public static double InertSensitivityBound(StarDetectorParams p) =>
+            p == null ? double.NaN : p.PeakResponse * MinEffectiveClipMultiplier(p);
+
+        /// <summary>
+        /// The gate a set of detector settings ACTUALLY enforces:
+        /// <c>max(Sensitivity, InertSensitivityBound)</c>. Report this wherever a landing's
+        /// <see cref="StarDetectorParams.Sensitivity"/> is quoted (followup F33).
+        ///
+        /// <para><b>Why the raw axis misleads.</b> Sensitivity below
+        /// <see cref="InertSensitivityBound"/> rejects nothing, so the structure/clip stage — not the Sensitivity
+        /// knob — is what is culling stars. A landing can therefore read <c>Sensitivity 0.0</c>, which looks like
+        /// the synthetic bank's "the optimizer drove the gate to its floor" pathology, while enforcing a gate
+        /// several times the shipped default. The real-bank <c>mccomiskey</c> run is the case that motivated this:
+        /// Sensitivity 0.0 with PeakResponse 0.98 × StarClip 10.0 ⇒ an effective gate of <b>9.81</b>, and
+        /// detections collapsing 3606 → 43. Read as a floor landing it says the opposite of what it does.</para>
+        ///
+        /// <para>Two more landings in the same arm are misread the same way (<c>caboose</c> at 5.05 on the real
+        /// bank; D11 at 2.36 and D12 at 2.10 on the synthetic one), so this is a systematic reading error rather
+        /// than one odd run.</para>
+        /// </summary>
+        public static double EffectiveSensitivityGate(StarDetectorParams p) =>
+            p == null ? double.NaN : Math.Max(p.Sensitivity, InertSensitivityBound(p));
+
+        /// <summary>
+        /// The wavelet layer count the structure-removal residual is ACTUALLY computed at — <see cref="StarDetectorParams.StructureLayers"/>
+        /// plus whichever defocus boost is in force. The single source of truth for that rule: step 4 of
+        /// <c>Detect</c> uses it, and so does the optimizer's cost readout, so the two cannot drift.
+        ///
+        /// <para><b>History.</b> Under the legacy dense-SepFilter2D wavelet this number was also the dominant
+        /// COST term (~2× wall per layer, F52: 27/46/117/254/526 s for layers 4…8 on the synthetic bank), which
+        /// is why the optimizer's cost readout consumed it. The sparse <see cref="Utility.AtrousWaveletFast"/>
+        /// implementation made per-layer cost nearly flat (52/81/107 ms at 26 MP for layers 4/6/8; whole-detect
+        /// 648/670/738 ms), so the layer count is now a behavioural knob, not a wall-clock one, and the F52
+        /// cost note was retired.</para>
+        /// </summary>
+        public static int EffectiveStructureLayers(StarDetectorParams p) {
+            if (p == null) {
+                return 0;
+            }
+            if (p.DefocusAwareStructure) {
+                return Math.Max(1, p.StructureLayers + p.StructureLayerBoost);
+            }
+            if (p.DefocusAwareDonutDetection) {
+                return Math.Max(1, p.StructureLayers + DonutDefaultStructureLayerBoost);
+            }
+            return p.StructureLayers;
+        }
+
+        /// <summary>
         /// Companion to <see cref="ComputeEffectiveMaxDistortion"/> for the NotCentered gate. Computes the
         /// effective StarCenterTolerance the centering check uses for a candidate of bbox max-dimension
         /// <paramref name="candidateSize"/> (= max(bbox.Width, bbox.Height), the SAME defocus proxy the distortion
@@ -1818,7 +1906,10 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection {
                 MeanBrightness = starCandidate.TotalFlux / starCandidate.PixelCount,
                 StarBoundingBox = starBounds,
                 PeakBrightness = starCandidate.Peak,
-                RelaxationAdmitted = relaxationAdmitted
+                RelaxationAdmitted = relaxationAdmitted,
+                // Informational only — the exact `sensitivity` scalar the gate above just compared against
+                // p.Sensitivity (donut branch already applied, if taken). No new computation.
+                MeasuredSensitivity = sensitivity
             };
 
             // Measure HFR, and discard if we couldn't calculate it

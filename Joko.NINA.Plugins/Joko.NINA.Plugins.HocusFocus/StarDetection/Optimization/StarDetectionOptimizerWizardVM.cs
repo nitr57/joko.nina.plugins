@@ -11,24 +11,25 @@
 #endregion "copyright"
 
 using CommunityToolkit.Mvvm.Input;
+using NINA.Core.Enum;
 using NINA.Core.Model;
 using NINA.Core.Model.Equipment;
 using NINA.Core.MyMessageBox;
 using NINA.Core.Utility;
 using NINA.Core.Utility.Notification;
+using NINA.Core.Utility.WindowService;
 using NINA.Equipment.Interfaces.Mediator;
-using NINA.Image.FileFormat.FITS;
-using NINA.Image.FileFormat.XISF;
 using NINA.Image.Interfaces;
 using NINA.Joko.Plugins.HocusFocus.AutoFocus;
 using NINA.Joko.Plugins.HocusFocus.Interfaces;
+using NINA.Joko.Plugins.HocusFocus.StarDetection.PerFilter;
 using NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization.Review;
 using NINA.Joko.Plugins.HocusFocus.Utility;
 using NINA.Profile.Interfaces;
-using OpenCvSharp;
 using OxyPlot.Series;
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.IO;
@@ -184,6 +185,93 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             }
         }
 
+        /// <summary>
+        /// The per-frame exposure time (seconds) the run this summary describes was captured with — a Live sweep's
+        /// own exposure, a Replay run's recorded header value, or the profile's auto-focus exposure as a last
+        /// resort. <see cref="double.NaN"/> when none of those yielded a positive number, in which case
+        /// <see cref="ExposureAdvice"/> carries no derived seconds (a factor scaled off an unknown base is worse
+        /// than no recommendation). Read by the body copy to name the base when
+        /// <see cref="RunExposureIsAssumed"/>.
+        /// </summary>
+        public double RunExposureSeconds { get; set; } = double.NaN;
+
+        /// <summary>
+        /// True when <see cref="RunExposureSeconds"/> came from the PROFILE's auto-focus exposure rather than from
+        /// the run itself — i.e. the saved frames recorded no exposure, so the whole derivation rests on an
+        /// assumption about how these frames were captured. The body copy states this outright: a derived number
+        /// computed off an assumed input must not read as a measurement of the frames.
+        /// </summary>
+        public bool RunExposureIsAssumed { get; set; }
+
+        /// <summary>
+        /// The Sensitivity (BrightnessSensitivity) gate THIS VARIANT's settings use — the optimized value on the
+        /// Optimized/Feedback views, the user's CURRENT value on the Current view. Named for the variant rather
+        /// than for the optimizer precisely because of that second case. It must follow the variant for the same
+        /// reason <see cref="MeasuredInFocusHfr"/> does: the variant is what Accept applies, so a Current view
+        /// whose OWN hand-set gate sits at the floor has to say so rather than report the optimizer's.
+        /// </summary>
+        public double VariantSensitivity { get; set; } = double.NaN;
+
+        /// <summary>The CURRENT-settings equivalent, carried so the Current variant's summary can be built from
+        /// this one (see <c>BuildCurrentSummary</c>) without re-evaluating the runs — exactly as
+        /// <see cref="BaselineMeasuredInFocusHfr"/> is.</summary>
+        public double BaselineSensitivity { get; set; } = double.NaN;
+
+        /// <summary>
+        /// The minimum-HFR gate THIS VARIANT's settings use, in BINNED detection pixels. Follows the variant for
+        /// the same reason <see cref="VariantSensitivity"/> does: on the Current view the gate is the user's own
+        /// hand-set value, and that is exactly the case F20 exists to report.
+        /// </summary>
+        public double VariantMinHfr { get; set; } = double.NaN;
+
+        /// <summary>The CURRENT-settings equivalent, carried for <c>BuildCurrentSummary</c>.</summary>
+        public double BaselineMinHfr { get; set; } = double.NaN;
+
+        /// <summary>
+        /// F20 — whether this rig's in-focus stars measure at or below the minimum-HFR gate, so the detector is
+        /// rejecting them through the middle of the sweep.
+        ///
+        /// <para>Delegates to <see cref="MinHfrSeed.IsBelowGate"/> rather than re-deriving the comparison, so the
+        /// message and the seed cannot drift apart — and so the captured-vs-binned conversion (F38) is applied in
+        /// exactly one place. <see cref="MeasuredInFocusHfr"/> is in CAPTURED pixels;
+        /// <see cref="VariantMinHfr"/> is in BINNED ones.</para>
+        /// </summary>
+        public bool HasUndersampledStars =>
+            MinHfrSeed.IsBelowGate(MeasuredInFocusHfr, VariantMinHfr, RunDetectionBinning);
+
+        /// <summary>The exposure-time recommendation derived from THIS VARIANT's accepted-star SNRs (see
+        /// <see cref="ExposureRecommender"/>). Null when the summary was built without one (every pre-feature
+        /// construction, and every unit test that does not exercise this block).</summary>
+        public ExposureRecommendation ExposureAdvice { get; set; }
+
+        /// <summary>The CURRENT-settings equivalent, carried for <c>BuildCurrentSummary</c> — the baseline
+        /// counterpart to <see cref="ExposureAdvice"/>, mirroring the <see cref="BaselineMeasuredInFocusHfr"/>
+        /// pair.</summary>
+        public ExposureRecommendation BaselineExposureAdvice { get; set; }
+
+        /// <summary>
+        /// Whether this variant's detector is running on a floored acceptance gate — the condition the "Star
+        /// signal" block exists to report. Named for the FINDING, not for the block's contents: it deliberately
+        /// does NOT mean "an exposure recommendation exists" (that is
+        /// <see cref="ExposureRecommendation.HasRecommendation"/> on <see cref="ExposureAdvice"/>, which can be
+        /// false while this is true).
+        ///
+        /// <para>This is the SENSITIVITY GATE ALONE — deliberately NOT additionally gated on the derived exposure
+        /// factor being large, on the star counts, or on <see cref="ExposureAdvice"/> having produced a number. A
+        /// Sensitivity that landed at its search floor means the detector had to admit essentially anything above
+        /// the noise to find stars at all, and that is worth saying out loud EVEN WHEN a longer exposure is not the
+        /// answer: the sub-states carry that nuance (<see cref="ExposureRecommendation.ExposureIsNotTheLimit"/>
+        /// says exposure is not what is limiting the run; a missing recommendation says only the diagnosis can be
+        /// given). Gating the whole block on "we have a big number to show" would silently hide the one finding the
+        /// user most needs — that the focus result rests on low-confidence detections — in exactly the cases where
+        /// nothing can be done about it.</para>
+        ///
+        /// <para>NaN (the default, i.e. a summary built before this feature or by a test that does not set it)
+        /// is false: <c>NaN &lt;= threshold</c> is false, so the block stays hidden rather than firing on
+        /// "unknown".</para>
+        /// </summary>
+        public bool HasLowStarSignal => ExposureRecommender.SensitivityIsAtFloor(VariantSensitivity);
+
         /// <summary>For the feedback variant only: σ(focus) of the optimized-WITHOUT-feedback result, so the
         /// results header can show how much the feedback round tightened focus relative to the plain optimization.
         /// Null for the current/optimized summaries.</summary>
@@ -207,11 +295,106 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
         /// <see cref="StepSizeRecommender.MaxHalfWidthSampledHalfSpanMultiple"/>).</summary>
         public bool StepSizeWasCapped { get; set; }
 
+        /// <summary>True when the sweep's own HFRs prove the 3x band was never sampled and the fitted half-width
+        /// came back INSIDE the sampled span, so the step was widened to the most this sweep supports — see
+        /// <see cref="StepSizeRecommendation.WasBandFloored"/>. Mutually exclusive with
+        /// <see cref="StepSizeWasCapped"/> by construction, and carried separately so a reader can tell which of the
+        /// two bounds produced the partial step.</summary>
+        public bool StepSizeWasBandFloored { get; set; }
+
+        /// <summary>The HFR dynamic range this sweep MEASURED (max/min), or NaN — see
+        /// <see cref="StepSizeRecommendation.SampledHfrRange"/>.</summary>
+        public double StepSizeSampledHfrRange { get; set; } = double.NaN;
+
+        /// <summary>The exact factor the next capped run will multiply the step by, or NaN — see
+        /// <see cref="StepSizeRecommendation.CappedGrowthRatio"/>.</summary>
+        public double StepSizeCappedGrowthRatio { get; set; } = double.NaN;
+
+        /// <summary>
+        /// Why the step size is a HELD value rather than a measured one, or null when it was measured — see
+        /// <see cref="StepSizeRecommendation.DegenerateReason"/>.
+        ///
+        /// <para><b>Why this is on the summary and on the page.</b> When the recommender cannot use the fit it
+        /// hands back the CURRENT step size, and that number was previously written into
+        /// <see cref="RecommendedStepSize"/> and shown as "Recommended step size: 21" — a number meaning "I held
+        /// what you already had", in the same field and with the same authority as a measurement. Carrying the
+        /// reason through to <see cref="StepSizeText"/> is what makes a non-measurement visible as one.</para>
+        /// </summary>
+        public string StepSizeDegenerateReason { get; set; }
+
+        /// <summary>True when the recommended step size is a held value rather than a measurement.</summary>
+        public bool StepSizeIsDegenerate => !string.IsNullOrEmpty(StepSizeDegenerateReason);
+
+        /// <summary>Plain-language rendering of <see cref="StepSizeDegenerateReason"/>; the raw token is kept in
+        /// parentheses so a log or a support thread can be matched to the exit that produced it.</summary>
+        private string StepSizeDegenerateExplanation {
+            get {
+                switch (StepSizeDegenerateReason) {
+                    case StepSizeRecommender.DegenerateReasonNoFit:
+                        return "no focus curve could be fitted to this run";
+
+                    case StepSizeRecommender.DegenerateReasonNonFiniteVertex:
+                        return "the fitted curve has no usable best-focus point";
+
+                    case StepSizeRecommender.DegenerateReasonHalfWidthUnresolved:
+                        return $"the fitted curve never reaches {StepSizeRecommender.HfrThresholdMultiple:F0}x its " +
+                               "minimum HFR, which is the band the step is sized from";
+
+                    default:
+                        return "this run could not be measured";
+                }
+            }
+        }
+
         /// <summary>Plain-language step-size readout: "{current} → {recommended}" when changed, else
-        /// "{recommended} (unchanged)", with a capped note when the sweep could not support the full move.</summary>
-        public string StepSizeText => StepSizeWasCapped
-            ? FormatRecommendation(CurrentStepSize, RecommendedStepSize) + " (capped by this sweep's width; re-run auto-focus to refine)"
-            : FormatRecommendation(CurrentStepSize, RecommendedStepSize);
+        /// "{recommended} (unchanged)", with a capped note when the sweep could not support the full move.
+        ///
+        /// <para><b>F49(c).</b> The old note said only "capped by this sweep's width; re-run auto-focus to
+        /// refine". A field session took that instruction four times — 100 → 214 → 459 → 474 → 482, at 30–120
+        /// minutes a run — and experienced it as a runaway, because nothing on the page said what the number was
+        /// converging TOWARD, that the cap makes this a deliberate partial step, or that it terminates. It does
+        /// terminate, geometrically: while the cap binds each run multiplies the step by exactly
+        /// <see cref="StepSizeRecommendation.CappedGrowthRatio"/> until the sweep reaches
+        /// <see cref="StepSizeRecommender.HfrThresholdMultiple"/>x the minimum HFR, and then the cap stops
+        /// binding. That last session's runs 3 and 4 asked +3 % and +5 %, i.e. it HAD converged.</para>
+        ///
+        /// <para><b>What is quoted and what is not.</b> The sampled range and the growth ratio are both
+        /// MEASURED — the first from the sweep's own HFRs, the second from the algorithm's arithmetic — and each
+        /// clause is dropped when its quantity is unavailable rather than filled with a guess. A projected run
+        /// COUNT is deliberately not offered: it would have to be computed from the extrapolated half-width,
+        /// which is the one quantity the cap exists to distrust.</para></summary>
+        public string StepSizeText {
+            get {
+                // A HELD value is not a recommendation, and it says so BEFORE the capped/measured wording is
+                // reached: the degenerate path never sets WasCapped, so without this branch the page would show a
+                // bare "{n} (unchanged)" that is indistinguishable from a measurement which agreed with the
+                // profile. StepSizeDegenerateReason exists precisely so could-not-look is a separate state.
+                if (StepSizeIsDegenerate) {
+                    return $"{RecommendedStepSize} (NOT measured: {StepSizeDegenerateExplanation}, so your current " +
+                           $"step size was kept [{StepSizeDegenerateReason}])";
+                }
+                var baseText = FormatRecommendation(CurrentStepSize, RecommendedStepSize);
+                // A FLOORED recommendation is the same kind of statement as a capped one and reads the same way:
+                // this sweep did not reach the band the step is sized from, so the number is a deliberate partial
+                // step toward the answer. The existing wording already quotes the sampled range, which on a floored
+                // round is the very quantity that engaged the floor, so nothing else needs to change.
+                if (!StepSizeWasCapped && !StepSizeWasBandFloored) {
+                    return baseText;
+                }
+                var parts = new System.Collections.Generic.List<string>();
+                if (double.IsFinite(StepSizeSampledHfrRange) && StepSizeSampledHfrRange > 0.0) {
+                    parts.Add($"this sweep reaches {StepSizeSampledHfrRange:F1}× its minimum HFR and the step is " +
+                              $"sized from where HFR reaches {StepSizeRecommender.HfrThresholdMultiple:F0}×");
+                } else {
+                    parts.Add($"this sweep is too narrow to contain the {StepSizeRecommender.HfrThresholdMultiple:F0}× " +
+                              "minimum-HFR band the step is sized from");
+                }
+                if (double.IsFinite(StepSizeCappedGrowthRatio) && StepSizeCappedGrowthRatio > 1.0) {
+                    parts.Add($"each run widens by about {StepSizeCappedGrowthRatio:F1}× until it gets there");
+                }
+                return baseText + " (partial step: " + string.Join("; ", parts) + "; re-run auto-focus to refine)";
+            }
+        }
 
         /// <summary>Plain-language offset-steps readout (same before→after / "(unchanged)" convention).</summary>
         public string OffsetStepsText => FormatRecommendation(CurrentOffsetSteps, RecommendedOffsetSteps);
@@ -399,6 +582,12 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
         // Confirms re-running the search at a different detection binning factor. Takes (from, to) so the dialog can
         // name both. Defaults to "yes" so tests and headless paths are not blocked.
         private readonly Func<int, int, bool> confirmReoptimizeAtBinning;
+
+        // Confirms capturing a WHOLE NEW SWEEP at a longer exposure. Takes (from, to) seconds so the dialog can name
+        // both. Same default-to-yes contract as confirmReoptimizeAtBinning: tests and headless paths proceed. This
+        // one matters more than its sibling — the sibling re-reads frames already on disk, this one moves the
+        // focuser and spends minutes of sky time.
+        private readonly Func<double, double, bool> confirmCaptureNewSweep;
         private readonly Func<string> currentFilterName;
         private readonly Func<int?> currentGain;
 
@@ -416,6 +605,15 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
         // store's getters return CLONES: mutating what they hand back persists nothing. Production routes this through
         // PerFilterEditBinder.MutateFilterSettings, which picks the store or the edit buffer as appropriate.
         private readonly Action<string, bool> setFilterDonutDetection;
+
+        // Reads one filter's sweep-geometry override, for the Live confirmation readouts. Null in tests, which
+        // then show the profile values.
+        private readonly Func<string, PerFilterSweepGeometry> getFilterSweepGeometry;
+
+        // Writes the recommended sweep geometry into ONE filter's set. Separate from the getter for the same
+        // reason setFilterDonutDetection is separate from getFilterDetectionOptions: the store hands out clones,
+        // so a caller that mutated what it read would persist nothing.
+        private readonly Action<string, int, int> applySweepGeometryToFilter;
 
         // The last measured in-focus HFR (captured pixels), for the confirmation panel's recommendation. Supplied by
         // the plugin from InFocusHfrRecord; null in tests, which then show the no-measurement copy.
@@ -468,6 +666,18 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
         // the "before" the live readout counts from — so the σ pair shown mid-run matches the results page.
         private double currentBaselineSigma = double.NaN;
 
+        // F35 — the hyperbola vertex HFR (BestFit.Minimum.Y) from the MOST RECENT pre-search analyze pass, which
+        // is the statistic that triggers the MinHFR seed. Captured in AnalyzeWithProgressAsync because every path
+        // that reaches OptimizeAsync runs one first (the seed guard on Start; an explicit warm-up on each
+        // feedback/continue/re-optimize path), and because the fit is thrown away afterwards everywhere else.
+        //
+        // It must come from the WINGS, and it does: far from focus the PSF is large, so those frames are
+        // untouched by the gate and richly populated (D01's four outer frames carry 816-2002 accepted stars each
+        // at the default MinHFR, fitting at R2 = 0.911). The in-focus frames -- the ones F20's original wording
+        // wanted to measure -- are exactly the ones the gate has emptied, which is what made that trigger
+        // circular. NaN when no fit was determinable, which MinHfrSeed treats as "do nothing".
+        private double seedFitVertexHfr = double.NaN;
+
         /// <summary>
         /// MEF/T5 convenience constructor: wires the real collaborators from the plugin singletons + mediators.
         /// The wizard is not MEF-exported (it is created on demand by T5's launch command), so this just supplies
@@ -495,7 +705,8 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
                 // Production review builder: the SHARED FrameReviewBuilder over a real StarDetector + a profile-aware
                 // disk loader (mirrors the TestApp `review` path; single source of truth). Built lazily so the
                 // detector/loader only allocate when the user actually enters Review.
-                frameReviewBuilder: BuildProductionReviewBuilder(profileService, imageDataFactory),
+                frameReviewBuilder: BuildProductionReviewBuilder(profileService, imageDataFactory,
+                    cameraSensorType: () => cameraMediator?.GetInfo()?.SensorType),
                 // Live pre-flight: probe the camera/focuser mediators for the connection check on Start.
                 isCameraConnected: () => cameraMediator?.GetInfo()?.Connected == true,
                 isFocuserConnected: () => focuserMediator?.GetInfo()?.Connected == true,
@@ -540,6 +751,22 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
                     }
                     binder.MutateFilterSettings(name, o => o.DefocusAwareDonutDetection = value);
                 },
+                // Reads the target filter's sweep-geometry override for the Live confirmation readouts, so they
+                // show what the sweep will actually run at rather than the profile's numbers.
+                getFilterSweepGeometry: name => HocusFocusPlugin.PerFilterStarDetection?.GetSweepGeometry(name),
+                // Accept's geometry write in per-filter mode. Unlike applyOptimizedToFilter this does NOT depend on
+                // EditedFilterName being pointed at the target first: MutateFilterSweepGeometry is store-backed.
+                applySweepGeometryToFilter: (name, stepSize, offsetSteps) => {
+                    var binder = HocusFocusPlugin.PerFilterStarDetectionEditBinder;
+                    if (binder == null) {
+                        Logger.Error("Cannot apply the recommended sweep geometry: the per-filter edit binder is unavailable.");
+                        return;
+                    }
+                    binder.MutateFilterSweepGeometry(name, g => {
+                        g.StepSize = stepSize;
+                        g.InitialOffsetSteps = offsetSteps;
+                    });
+                },
                 getMeasuredInFocusHfr: () => HocusFocusPlugin.InFocusHfr?.HfrPixels ?? double.NaN,
                 recordMeasuredInFocusHfr: hfr => HocusFocusPlugin.InFocusHfr?.Record(hfr, DateTime.UtcNow, "optimization wizard live sweep"),
                 // The summary already gave the reason and the button named the action, so this only has to cover what
@@ -547,6 +774,13 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
                 confirmReoptimizeAtBinning: (from, to) => MyMessageBox.Show(
                     DescribeReoptimizeAtBinning(from, to),
                     "Detection Binning",
+                    System.Windows.MessageBoxButton.YesNo,
+                    System.Windows.MessageBoxResult.Yes) == System.Windows.MessageBoxResult.Yes,
+                // Unlike the binning re-run, this one takes new exposures and moves the focuser, so the dialog has to
+                // say so — the summary's copy and the button name the action, not its cost.
+                confirmCaptureNewSweep: (from, to) => MyMessageBox.Show(
+                    DescribeCaptureNewSweep(from, to),
+                    "Capture New Sweep",
                     System.Windows.MessageBoxButton.YesNo,
                     System.Windows.MessageBoxResult.Yes) == System.Windows.MessageBoxResult.Yes) {
         }
@@ -569,6 +803,44 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             + "Nothing is saved until you Accept the new result.\n"
             + "\n"
             + "Optimize again now?";
+
+        /// <summary>
+        /// The "capture a new sweep at a longer exposure" confirmation body.
+        ///
+        /// <para>The DELIBERATE INVERSE of <see cref="DescribeReoptimizeAtBinning"/>'s reassurance. That action
+        /// re-reads frames already on disk, so its body promises "no new exposures, no focuser movement". This one
+        /// does the opposite on every count — it exposes again, it drives the focuser through a full sweep, and at
+        /// the longer exposure it costs proportionally more sky time — so the body has to say all three. The
+        /// summary's copy said WHY and the button said WHAT; this is the only place the COST appears.</para>
+        ///
+        /// <para>The cost is stated as a RATIO rather than a wall-clock estimate on purpose: the absolute figure
+        /// needs the sweep's point count and frames-per-point, which are profile state this pure function does not
+        /// (and should not) reach for, and the confirmation panel's own
+        /// <see cref="SweepEstimatedDurationText"/> already carries the absolute number for the sweep the user
+        /// configured. "About Nx as long as the last one" is derivable from the two exposures alone and is the
+        /// comparison the user is actually making at this moment.</para>
+        ///
+        /// <para>Line breaks are TYPESETTING, not paragraphing — see <see cref="DescribeReoptimizeAtBinning"/> for
+        /// why (MyMessageBox does not wrap, so the longest line sets the dialog's width). Keep every line under
+        /// <see cref="MaxDialogLineLength"/>; the widths are guarded by a test that sweeps the interpolated
+        /// magnitudes.</para>
+        /// </summary>
+        internal static string DescribeCaptureNewSweep(double from, double to) {
+            var text =
+                $"Sweep exposure {from:0.##} s → {to:0.##} s.\n"
+                + "\n"
+                + $"This captures a NEW sweep at {to:0.##} s per frame: fresh\n"
+                + "exposures, and the focuser moves.\n";
+            // A non-positive "from" cannot produce a ratio (the sweep exposure is validated positive in the UI, but
+            // this is a pure function and an "∞x as long" line would be worse than no line at all).
+            if (from > 0.0) {
+                text += $"Expect it to take about {to / from:0.#}x as long as the last one.\n";
+            }
+            return text
+                + "Nothing is saved until you Accept the new result.\n"
+                + "\n"
+                + "Capture and optimize now?";
+        }
 
         /// <summary>The line-width budget for <see cref="MyMessageBox"/> bodies, in characters. At NINA's dialog
         /// face (~8.2 px/char) 60 characters puts the window near 525px and each button near 245px — an ordinary
@@ -593,6 +865,7 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             IAutoFocusOptions autoFocusOptions = null,
             Func<bool> confirmRoughFocus = null,
             Func<int, int, bool> confirmReoptimizeAtBinning = null,
+            Func<double, double, bool> confirmCaptureNewSweep = null,
             Func<string> currentFilterName = null,
             Func<int?> currentGain = null,
             Func<bool> perFilterEnabled = null,
@@ -603,6 +876,8 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             Func<string, IStarDetectionOptions> getFilterDetectionOptions = null,
             Action<string, OptimizedStarDetectionSettings> applyOptimizedToFilter = null,
             Action<string, bool> setFilterDonutDetection = null,
+            Func<string, PerFilterSweepGeometry> getFilterSweepGeometry = null,
+            Action<string, int, int> applySweepGeometryToFilter = null,
             Func<double> getMeasuredInFocusHfr = null,
             Action<double> recordMeasuredInFocusHfr = null) {
             this.profileService = profileService ?? throw new ArgumentNullException(nameof(profileService));
@@ -623,6 +898,7 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             // tests and headless callers proceed without a dialog.
             this.confirmRoughFocus = confirmRoughFocus ?? (() => true);
             this.confirmReoptimizeAtBinning = confirmReoptimizeAtBinning ?? ((from, to) => true);
+            this.confirmCaptureNewSweep = confirmCaptureNewSweep ?? ((from, to) => true);
             this.currentFilterName = currentFilterName;
             this.currentGain = currentGain;
             this.perFilterEnabled = perFilterEnabled ?? (() => false);
@@ -633,6 +909,8 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             this.getFilterDetectionOptions = getFilterDetectionOptions;
             this.applyOptimizedToFilter = applyOptimizedToFilter;
             this.setFilterDonutDetection = setFilterDonutDetection;
+            this.getFilterSweepGeometry = getFilterSweepGeometry;
+            this.applySweepGeometryToFilter = applySweepGeometryToFilter;
             if (this.perFilterEnabled()) {
                 // Default the target to the currently-loaded wheel filter, else the first profile filter.
                 var current = this.getCurrentFilterName?.Invoke();
@@ -641,9 +919,11 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
 
             sourcePaths = new ObservableCollection<string> { null };
             applyRecommendedStepSize = true;
-            // Seed the Live sweep's editable exposure from the profile's current AF exposure, and its save folder from
-            // the persisted AF SavePath (both are just starting points the user can change on the confirmation screen).
-            liveExposureSeconds = profileService.ActiveProfile.FocuserSettings.AutoFocusExposureTime;
+            // Seed the Live sweep's editable exposure from whatever the target filter will ACTUALLY focus at (its
+            // own AF exposure when it sets one, else the profile's), and its save folder from the persisted AF
+            // SavePath. Both are starting points the user can change on the confirmation screen. This runs after
+            // targetFilterName is resolved above, which is what makes the per-filter value reachable.
+            liveExposureSeconds = EffectiveAutoFocusExposureSeconds;
             saveFolderPath = autoFocusOptions?.SavePath;
 
             BrowseSourceCommand = new RelayCommand<object>(BrowseSource);
@@ -652,12 +932,14 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             CancelCommand = new RelayCommand(Cancel);
             AcceptCommand = new RelayCommand(Accept, CanAccept);
             OptimizeAgainAtRecommendedBinningCommand = new AsyncRelayCommand(() => OptimizeAgainAtRecommendedBinningAsync(CancellationToken.None), () => CanOptimizeAgainAtRecommendedBinning && !IsBusy);
+            CaptureNewSweepCommand = new AsyncRelayCommand(() => CaptureNewSweepAsync(CancellationToken.None), () => CanCaptureNewSweep && !IsBusy);
             BackCommand = new RelayCommand(Back, () => CurrentStep == WizardStep.Summary && !IsBusy);
             CloseCommand = new RelayCommand(() => RequestClose?.Invoke(this, EventArgs.Empty));
             ReviewCommand = new AsyncRelayCommand(EnterReviewAsync, CanEnterReview);
             BackToSummaryCommand = new RelayCommand(BackToSummary, () => CurrentStep == WizardStep.Review && !IsBusy);
             ReOptimizeCommand = new AsyncRelayCommand(() => ReOptimizeWithLabelsAsync(CancellationToken.None), () => HasLabels && !IsBusy);
             ContinueOptimizationCommand = new AsyncRelayCommand(() => ContinueOptimizationAsync(CancellationToken.None), () => CanContinueOptimization);
+            ImportRunSettingsCommand = new AsyncRelayCommand(ImportRunSettingsAsync, () => CanImportRunSettings);
 
             // Start enables/disables as the per-run paths are filled in (Saved Auto-Focus), so re-evaluate its
             // CanExecute whenever a path is set or the run count changes.
@@ -690,6 +972,12 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
                     ContinueOptimizationCommand.NotifyCanExecuteChanged();
                     RaisePropertyChanged(nameof(CanContinueOptimization));
                     RaisePropertyChanged(nameof(RoundsSummaryText));
+            RaisePropertyChanged(nameof(ContinueOptimizingAdviceText));
+            RaisePropertyChanged(nameof(HasContinueOptimizingAdvice));
+                    // F32 — the restart advice turns on the SAME two things RoundsSummaryText does (the selected
+                    // variant and how many rounds remain), so it is re-raised wherever that is.
+                    RaisePropertyChanged(nameof(ContinueOptimizingAdviceText));
+                    RaisePropertyChanged(nameof(HasContinueOptimizingAdvice));
                     RaisePropertyChanged(nameof(HasRoundsSummary));
                 }
             }
@@ -727,6 +1015,13 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
                     RaisePropertyChanged();
                     RaisePropertyChanged(nameof(IsOptimizeMode));
                     RaisePropertyChanged(nameof(IsUseCurrentMode));
+                    // Both recommendation blocks branch on the mode — the binning block's button visibility and
+                    // body, and the Star signal block's capture row and body. The radio buttons live on the Select
+                    // Source step, so today the mode cannot change while a Summary is on screen and these are
+                    // re-raised on the way back anyway; that is an ordering accident, and an un-notified dependency
+                    // on a mutable field is the bug class the variant-switch notification test exists to catch.
+                    RaiseDetectionBinningBlockChanged();
+                    RaiseExposureBlockChanged();
                 }
             }
         }
@@ -822,7 +1117,9 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             }
         }
 
-        private SourceMode sourceMode = SourceMode.Replay;
+        // Default to Live: the wizard is most often reached with no saved run on disk, and Live captures its own
+        // frames rather than requiring the user to go and produce one first (owner's decision, 2026-08-11).
+        private SourceMode sourceMode = SourceMode.Live;
 
         public SourceMode SourceMode {
             get => sourceMode;
@@ -858,14 +1155,26 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             get => targetFilterName;
             set {
                 if (targetFilterName != value) {
+                    // Captured BEFORE the change so "has the user typed their own exposure?" is judged against the
+                    // filter that was selected while they had the chance to.
+                    bool exposureUntouched = Math.Abs(liveExposureSeconds - EffectiveAutoFocusExposureSeconds) < 1e-6;
                     targetFilterName = value;
                     RaisePropertyChanged();
+                    // Re-seed the editable sweep exposure from the newly targeted filter, since a filter that
+                    // already carries its own AF exposure is a far better starting point than the profile's. Only
+                    // when the box still holds the previous target's value, so a hand-typed exposure survives.
+                    if (exposureUntouched) {
+                        LiveExposureSeconds = EffectiveAutoFocusExposureSeconds;
+                    }
                     // The sweep readouts (filter/gain) reflect the target filter while per-filter is on.
                     RaiseSweepReadoutsChanged();
                     // So does the donut master: it is read from the target filter's set, so re-targeting changes it.
                     RaisePropertyChanged(nameof(DefocusAwareDonutDetection));
                     RaisePropertyChanged(nameof(SummaryFilterName));
                     RaisePropertyChanged(nameof(HasSummaryFilter));
+                    // The summary's exposure row and the Apply toggle now compare against the TARGET FILTER's
+                    // effective exposure, so re-targeting changes both.
+                    RaiseExposureRowChanged();
                 }
             }
         }
@@ -873,6 +1182,26 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
         /// <summary>True while per-filter star detection is enabled: shows the target-filter picker (both
         /// modes) and routes baseline/capture/Accept through the target filter's settings set.</summary>
         public bool IsPerFilterEnabled => perFilterEnabled();
+
+        /// <summary>
+        /// The auto-focus exposure that will ACTUALLY be used for the target filter: NINA core's own per-filter
+        /// override (<c>FilterInfo.AutoFocusExposureTime &gt; -1</c>, honored in <c>AutoFocusEngine.TakeExposure</c>)
+        /// when one is set, otherwise the profile's.
+        ///
+        /// <para>Every "did the exposure change?" comparison goes through here. Comparing against the profile while
+        /// Accept writes the filter would make the summary's "(unchanged)" and the Apply checkbox's enablement both
+        /// lie whenever the target filter already carries its own exposure.</para>
+        /// </summary>
+        private double EffectiveAutoFocusExposureSeconds {
+            get {
+                var profileExposure = profileService?.ActiveProfile?.FocuserSettings?.AutoFocusExposureTime ?? 0.0;
+                if (!UsesTargetFilterSettings) {
+                    return profileExposure;
+                }
+                var filter = resolveFilterByName?.Invoke(TargetFilterName);
+                return filter != null && filter.AutoFocusExposureTime > -1 ? filter.AutoFocusExposureTime : profileExposure;
+            }
+        }
 
         /// <summary>The active profile's filter names, for the target-filter picker.</summary>
         public IReadOnlyList<string> AvailableFilterNames => getFilterNames();
@@ -908,14 +1237,52 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
                     saveFolderPath = value;
                     RaisePropertyChanged();
                     StartCommand.NotifyCanExecuteChanged();
+                    // The summary's capture action saves to the same folder, so it is gated on this too. Unguarded,
+                    // like the StartCommand line above: the constructor seeds the FIELD, so this setter is only
+                    // ever reached after both commands exist.
+                    RaisePropertyChanged(nameof(CanCaptureNewSweep));
+                    CaptureNewSweepCommand.NotifyCanExecuteChanged();
                 }
             }
         }
 
         // Read-only capture summary shown on the Live confirmation panel. All derive from the profile / AF filter and
         // do not change during the wizard, so they need no change notifications beyond the initial bind.
-        public int SweepStepSize => profileService.ActiveProfile.FocuserSettings.AutoFocusStepSize;
-        public int SweepOffsetSteps => profileService.ActiveProfile.FocuserSettings.AutoFocusInitialOffsetSteps;
+        public int SweepStepSize => ResolveSweepGeometryReadout().StepSize;
+
+        public int SweepOffsetSteps => ResolveSweepGeometryReadout().OffsetSteps;
+
+        /// <summary>
+        /// The geometry the sweep will actually use: the target filter's override when per-filter is on and it
+        /// defines one, otherwise the profile. Mirrors <see cref="SweepGain"/>, which already resolves the same way.
+        /// </summary>
+        private (int StepSize, int OffsetSteps) ResolveSweepGeometryReadout() {
+            var focuserSettings = profileService.ActiveProfile.FocuserSettings;
+            if (!UsesTargetFilterSettings || getFilterSweepGeometry == null) {
+                return (focuserSettings.AutoFocusStepSize, focuserSettings.AutoFocusInitialOffsetSteps);
+            }
+            var geometry = getFilterSweepGeometry(TargetFilterName);
+            return (
+                geometry?.HasStepSize == true ? geometry.StepSize : focuserSettings.AutoFocusStepSize,
+                geometry?.HasOffsetSteps == true ? geometry.InitialOffsetSteps : focuserSettings.AutoFocusInitialOffsetSteps);
+        }
+
+        /// <summary>Step size with a note when it comes from the target filter rather than the profile.</summary>
+        public string SweepStepSizeText => DescribeSweepGeometryValue(SweepStepSize, g => g?.HasStepSize == true);
+
+        /// <inheritdoc cref="SweepStepSizeText"/>
+        public string SweepOffsetStepsText => DescribeSweepGeometryValue(SweepOffsetSteps, g => g?.HasOffsetSteps == true);
+
+        private string DescribeSweepGeometryValue(int value, Func<PerFilterSweepGeometry, bool> isOverridden) {
+            if (!UsesTargetFilterSettings || getFilterSweepGeometry == null) {
+                return value.ToString(CultureInfo.CurrentCulture);
+            }
+            // Silence means "from the profile", matching the settings page, where a blank box with a greyed
+            // "profile: N" hint is how inheriting is shown.
+            return isOverridden(getFilterSweepGeometry(TargetFilterName))
+                ? string.Format(CultureInfo.CurrentCulture, "{0} ({1} override)", value, TargetFilterName)
+                : value.ToString(CultureInfo.CurrentCulture);
+        }
 
         /// <summary>The offset-steps-per-side the Live sweep will actually capture: the profile's
         /// <see cref="SweepOffsetSteps"/> plus the session-only <see cref="FocusRecoverySteps"/> recovery steps. Adds 0
@@ -1032,6 +1399,11 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
 
         private void RaiseSweepReadoutsChanged() {
             RaisePropertyChanged(nameof(SweepStepSize));
+            // Both of these became filter-dependent with per-filter sweep geometry; SweepOffsetSteps was
+            // previously constant for the whole wizard and so was never raised.
+            RaisePropertyChanged(nameof(SweepOffsetSteps));
+            RaisePropertyChanged(nameof(SweepStepSizeText));
+            RaisePropertyChanged(nameof(SweepOffsetStepsText));
             RaisePropertyChanged(nameof(SweepEffectiveOffsetSteps));
             RaisePropertyChanged(nameof(SweepPointCount));
             RaisePropertyChanged(nameof(SweepCaptureBinning));
@@ -1040,6 +1412,7 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             RaisePropertyChanged(nameof(SweepGain));
             RaisePropertyChanged(nameof(SweepEstimatedFrames));
             RaisePropertyChanged(nameof(SweepEstimatedDurationText));
+            RaisePropertyChanged(nameof(ApplyRecommendedSettingsLabel));
         }
 
         private string captureContextText;
@@ -1108,6 +1481,7 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
                     // being a plain property, read CanOptimizeAgainAtRecommendedBinning alone and correctly said the
                     // frames were there. A disabled button under copy promising it works.
                     OptimizeAgainAtRecommendedBinningCommand.NotifyCanExecuteChanged();
+                    CaptureNewSweepCommand.NotifyCanExecuteChanged();
                     RaisePropertyChanged(nameof(CanContinueOptimization));
                 }
             }
@@ -1178,6 +1552,27 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
 
         public bool HasError => !string.IsNullOrEmpty(ErrorMessage);
 
+        private string recoveryWidenedNotice;
+
+        /// <summary>
+        /// Set when the guard widened the focus-recovery exemption to make the sweep fittable (see
+        /// <c>SeedFitIsUsableAsync</c>). This is NOT an error — the run proceeds — but it changes WHICH positions
+        /// the curve was fitted from, so it has to be visible rather than silently applied: the user chose the
+        /// step size and the recovery count that produced those empty wings, and they are the ones who can fix it.
+        /// </summary>
+        public string RecoveryWidenedNotice {
+            get => recoveryWidenedNotice;
+            private set {
+                if (recoveryWidenedNotice != value) {
+                    recoveryWidenedNotice = value;
+                    RaisePropertyChanged();
+                    RaisePropertyChanged(nameof(HasRecoveryWidenedNotice));
+                }
+            }
+        }
+
+        public bool HasRecoveryWidenedNotice => !string.IsNullOrEmpty(RecoveryWidenedNotice);
+
         #endregion State
 
         #region Progress
@@ -1228,7 +1623,26 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
         /// meaningless during loading/analysis) is shown only then.</summary>
         public bool IsOptimizing {
             get => isOptimizing;
-            private set { isOptimizing = value; RaisePropertyChanged(); }
+            private set {
+                isOptimizing = value;
+                RaisePropertyChanged();
+                // F52: every one of these reads IsOptimizing, so they must re-evaluate when it flips — otherwise a
+                // finished search leaves "2 h 14 min elapsed" on screen next to the results.
+                if (!isOptimizing) {
+                    progressElapsed = TimeSpan.Zero;
+                    progressSecondsPerEvaluation = double.NaN;
+                    progressSecondsPerCheapEvaluation = double.NaN;
+                    progressSecondsPerExpensiveEvaluation = double.NaN;
+                    progressExpensiveStepsPossible = false;
+                    evaluationFrameCurrent = 0;
+                    evaluationFrameTotal = 0;
+                    ProgressStepIsExpensive = false;
+                }
+                RaisePropertyChanged(nameof(ProgressTimingText));
+                RaisePropertyChanged(nameof(ProgressAbortNote));
+                RaisePropertyChanged(nameof(EvaluationFrameProgressText));
+                RaisePropertyChanged(nameof(HasEvaluationFrameProgress));
+            }
         }
 
         /// <summary>Sets the descriptive phase heading + the determinate count in one shot (raising once each).</summary>
@@ -1269,6 +1683,174 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             private set { progressBestSigma = value; RaisePropertyChanged(); RaisePropertyChanged(nameof(ProgressImprovementText)); }
         }
 
+        private TimeSpan progressElapsed;
+        private double progressSecondsPerEvaluation = double.NaN;
+        private double progressSecondsPerCheapEvaluation = double.NaN;
+        private double progressSecondsPerExpensiveEvaluation = double.NaN;
+        private bool progressExpensiveStepsPossible;
+
+        private bool progressStepIsExpensive;
+
+        /// <summary>
+        /// F79 — true while the search is inside a step that rebuilds every frame's detection context from
+        /// scratch (an EARLY-axis probe) rather than re-scoring the cached one.
+        ///
+        /// <para>This is the single fact the panel was missing. Such a step costs one to two orders of magnitude
+        /// more than a cache-hit step, and the search runs them in blocks, so the counter stops for minutes at a
+        /// time with nothing on screen distinguishing that from a hang. It drives the phase suffix, the frame
+        /// sub-progress line, and which rate the timing line leads with.</para>
+        /// </summary>
+        public bool ProgressStepIsExpensive {
+            get => progressStepIsExpensive;
+            private set {
+                if (progressStepIsExpensive != value) {
+                    progressStepIsExpensive = value;
+                    RaisePropertyChanged();
+                    RaisePropertyChanged(nameof(Phase));
+                    RaisePropertyChanged(nameof(HasEvaluationFrameProgress));
+                }
+            }
+        }
+
+        private int evaluationFrameCurrent;
+        private int evaluationFrameTotal;
+
+        /// <summary>F79 — "analyzing frame 6 / 11" while an expensive step is in flight. Empty otherwise: a
+        /// cache-hit step finishes in well under a second and a counter racing through eleven frames several times
+        /// a second is noise, not information.</summary>
+        public string EvaluationFrameProgressText =>
+            HasEvaluationFrameProgress
+                ? $"analyzing frame {evaluationFrameCurrent} / {evaluationFrameTotal}"
+                : string.Empty;
+
+        public bool HasEvaluationFrameProgress =>
+            IsOptimizing && progressStepIsExpensive && evaluationFrameTotal > 0;
+
+        /// <summary>Records one frame's completion inside the current evaluation. Raises only while an expensive
+        /// step is showing, so the cheap steps' reports cost a field write and nothing else.</summary>
+        private void ReportEvaluationFrame(int current, int total) {
+            evaluationFrameCurrent = current;
+            evaluationFrameTotal = total;
+            if (progressStepIsExpensive) {
+                RaisePropertyChanged(nameof(EvaluationFrameProgressText));
+                RaisePropertyChanged(nameof(HasEvaluationFrameProgress));
+            }
+        }
+
+        /// <summary>
+        /// F52 — what each search step is COSTING, and an upper bound on what is left.
+        ///
+        /// <para><b>Deliberately does NOT repeat the elapsed clock.</b> <see cref="ProgressCountElapsedText"/>
+        /// already renders "X / Y (M:SS)" one line above and re-raises every second, so elapsed is covered. What
+        /// was missing is the RATE — "300 / 500" says nothing about whether that took five minutes or ninety, and
+        /// a real field session spent <b>two hours</b> on one search with no way, from the UI or the log, to tell
+        /// whether it was nearly done or merely expensive.</para>
+        ///
+        /// <para><b>F79 — no duration is projected while an expensive step can still occur, and that is the
+        /// point.</b> The line used to read "at most N more, usually much less", computed from ONE blended mean
+        /// over both step classes. That is not an upper bound and cannot be made into one by arithmetic: the
+        /// search opens with a seed and a coarse grid that are all cache hits, so the mean is small for as long as
+        /// it takes the first EARLY stage to arrive, at which point the true remaining cost jumps by an order of
+        /// magnitude and the figure labelled "at most" is exceeded. Nor is the mix knowable in advance — how many
+        /// early stages run, and how many sweeps each takes, is decided by whether the landscape keeps improving.
+        /// So the line states what IS known — each class's measured cost, and how many steps are left — and stops
+        /// there. It does not spell out that the rest is unpredictable: showing a rate and a count while offering
+        /// no duration already says that, and the sentence saying it aloud read as an apology.</para>
+        ///
+        /// <para>A search with NO early axes — reachable through the narrowed feedback path — genuinely has a
+        /// uniform step cost, and there the bounded form is honest and is kept.</para>
+        /// </summary>
+        public string ProgressTimingText =>
+            !IsOptimizing
+                ? string.Empty
+                : BuildProgressTimingText(
+                    progressExpensiveStepsPossible,
+                    progressSecondsPerEvaluation,
+                    progressSecondsPerCheapEvaluation,
+                    progressSecondsPerExpensiveEvaluation,
+                    Math.Max(0, ProgressTotal - ProgressCurrent));
+
+        /// <summary>The timing line's copy, as a pure function of what has been measured, so every shape of it is
+        /// testable without a rig. See <see cref="ProgressTimingText"/> for why the projection is withheld.</summary>
+        internal static string BuildProgressTimingText(
+                bool expensiveStepsPossible, double blendedSeconds, double cheapSeconds, double expensiveSeconds, int remaining) {
+            remaining = Math.Max(0, remaining);
+
+            if (!expensiveStepsPossible) {
+                // Uniform cost: the old bounded form, which this case has always been entitled to.
+                if (!double.IsFinite(blendedSeconds) || blendedSeconds <= 0.0) {
+                    return string.Empty;
+                }
+                var uniformRate = FormatStepRate(blendedSeconds);
+                return remaining <= 0
+                    ? uniformRate
+                    : $"{uniformRate} · at most {FormatDurationCoarse(TimeSpan.FromSeconds(remaining * blendedSeconds))} more, usually much less";
+            }
+
+            var rates = FormatSplitRates(cheapSeconds, expensiveSeconds);
+            if (rates.Length == 0) {
+                return string.Empty;
+            }
+            return remaining <= 0
+                ? rates
+                : $"{rates} · {remaining} step{(remaining == 1 ? "" : "s")} left";
+        }
+
+        /// <summary>Both measured costs when both classes have been seen, else whichever one has. Naming them
+        /// ("fast" / "slow") is what makes a single figure interpretable — 38 s per step is alarming until you can
+        /// see that most steps take 3.</summary>
+        private static string FormatSplitRates(double cheapSeconds, double expensiveSeconds) {
+            var haveCheap = double.IsFinite(cheapSeconds) && cheapSeconds > 0.0;
+            var haveExpensive = double.IsFinite(expensiveSeconds) && expensiveSeconds > 0.0;
+            if (haveCheap && haveExpensive) {
+                return $"fast steps {FormatStepCost(cheapSeconds)} · slow steps {FormatStepCost(expensiveSeconds)}";
+            }
+            if (haveExpensive) {
+                return FormatStepRate(expensiveSeconds);
+            }
+            if (haveCheap) {
+                return FormatStepRate(cheapSeconds);
+            }
+            return string.Empty;
+        }
+
+        /// <summary>The phase heading with the slow-step suffix appended when one is in flight. Pure + internal so
+        /// the copy is testable; see <see cref="Phase"/>.</summary>
+        internal static string DecorateExpensivePhase(string phase, bool stepIsExpensive) =>
+            string.IsNullOrEmpty(phase) || !stepIsExpensive
+                ? phase
+                : $"{phase} — slow step (re-analyzing every frame)";
+
+        private static string FormatStepCost(double seconds) =>
+            seconds >= 1.0 ? $"{seconds:0.#} s" : $"{seconds * 1000.0:0} ms";
+
+        private static string FormatStepRate(double seconds) =>
+            seconds >= 1.0 ? $"{seconds:0.#} s per step" : $"{seconds * 1000.0:0} ms per step";
+
+        private static string FormatDurationCoarse(TimeSpan span) =>
+            span.TotalHours >= 1.0
+                ? $"{span.TotalHours:0.#} h"
+                : span.TotalMinutes >= 1.0
+                    ? $"{Math.Ceiling(span.TotalMinutes):0} min"
+                    : $"{Math.Ceiling(span.TotalSeconds):0} s";
+
+        // F52's ProgressCostNote ("searching N structure layers deeper costs roughly 2^N x") used to live here;
+        // retired when the sparse AtrousWaveletFast swap made per-layer cost nearly flat. The F52(c) abort-and-
+        // re-expose ADVICE remains blocked on F19 (the shipped exposure statistic reports "exposure is not the
+        // limit" on exactly the rich fields that gain most from a longer exposure — measured on D02_rich_135mm:
+        // 20th-brightest S/N 991.8 vs target 10, derived ask 0.000 s, while σ_focus improves 44% at 8×).
+
+        /// <summary>
+        /// F52 — what cancelling costs, stated while the user is deciding rather than left to be guessed.
+        /// Deliberately factual and symmetric: it names what is preserved, not what they should do.
+        /// </summary>
+        public string ProgressAbortNote =>
+            IsOptimizing
+                ? (lastRunWasLive
+                    ? "Cancel stops the search only. Nothing is written to your profile unless you click Accept, and the frames already captured stay on disk."
+                    : "Cancel stops the search only. Nothing is written to your profile unless you click Accept.")
+                : string.Empty;
+
         /// <summary>The J the live readout must beat before it claims anything: the stricter of this pass's own
         /// baseline (<see cref="ProgressSeedJ"/>) and the user's current settings (currentBaselineJ).
         ///
@@ -1289,8 +1871,11 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
 
         private string phase;
 
+        /// <summary>The descriptive heading above the progress bar. While the search is inside a context-rebuilding
+        /// step it carries a suffix naming that, because a frozen counter with no explanation is the thing users
+        /// read as a hang.</summary>
         public string Phase {
-            get => phase;
+            get => DecorateExpensivePhase(phase, progressStepIsExpensive && IsOptimizing);
             private set { phase = value; RaisePropertyChanged(); }
         }
 
@@ -1357,6 +1942,59 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
         /// <summary>True while another "Continue optimizing" pass is allowed (an Optimized variant exists, the cap
         /// hasn't been reached, and nothing is running). Drives the Continue button's enabled state.</summary>
         public bool CanContinueOptimization => !IsBusy && IsSummary && HasOptimized && RoundsCompleted < MaxOptimizationRounds;
+
+        /// <summary>
+        /// F32 — the keep fraction below which a landing counts as having taken the SHEDDING CORNER: it kept less
+        /// than half the stars its own seed did.
+        ///
+        /// <para>This is wave 5's recommended keep floor (φ = 0.50) reused as a DIAGNOSTIC rather than as a
+        /// constraint, which is the one role wave 9's confirmation arm supports. As a constraint it failed three
+        /// pre-registered rules — most sharply R1(c), where it degraded σ_focus by a factor of 2000 on
+        /// <c>vsn07</c>. As a description of "this search fell into the greedy trap", the same threshold is
+        /// exactly what wave 5 selected it for.</para>
+        /// </summary>
+        internal const double SheddingLandingKeepFraction = 0.5;
+
+        /// <summary>
+        /// F32 — one sentence telling the user that another optimization pass is likely to IMPROVE this result,
+        /// shown only when the landing took the shedding corner and another pass is actually allowed.
+        ///
+        /// <para><b>Why this exists, and why it is a note rather than a constraint.</b> F32 found that the
+        /// optimizer's shedding landings are substantially a GREEDY TRAP rather than a rational trade: a
+        /// constrained search can beat the unconstrained one, which a true global maximum could not allow. Wave 5
+        /// proposed fixing that with a feasibility floor (<c>MinDetectionKeepFraction</c>). Wave 9's confirmation
+        /// arm — both full banks, sequential, both controls passing — <b>refuted the floor as a default</b> and
+        /// found the alternative strictly better: over the binding runs, simply RESTARTING the search recovered
+        /// <b>228 %</b> of the floor's median gain, where wave 6 had measured only 0–36 % on a 7-run subset.</para>
+        ///
+        /// <para>So the mechanism ships as the affordance the user already has. <b>"Continue optimizing" is a
+        /// restart</b> — each pass re-seeds from the prior best with a fresh curated set, resetting the pattern
+        /// search's stride — and it was always on screen; nothing told the user when it was worth pressing. This
+        /// note is that missing half, and it names a control that is present and enabled
+        /// (<see cref="CanContinueOptimization"/>), per the house rule at
+        /// <see cref="ShowOptimizeAgainAtRecommendedBinning"/>.</para>
+        ///
+        /// <para>It promises a DIRECTION, never a magnitude: restarts helped on most binding runs but not all, and
+        /// the gain is a fourth-decimal `J` move whose value is in the star list rather than the objective. Empty
+        /// whenever the landing did not shed, no round remains, or no keep fraction was measured — a note that
+        /// always fires says nothing.</para>
+        /// </summary>
+        public string ContinueOptimizingAdviceText {
+            get {
+                if (!CanContinueOptimization || selectedVariant != OptimizationVariant.Optimized) {
+                    return string.Empty;
+                }
+                var keep = optimizedResult?.LandingKeepFraction ?? double.NaN;
+                if (!double.IsFinite(keep) || keep >= SheddingLandingKeepFraction) {
+                    return string.Empty;
+                }
+                return $"This result keeps only {keep:P0} of the stars your current settings detect. Searches that "
+                    + "shed stars like this often stop short of the best result rather than at it — clicking "
+                    + "\"Continue optimizing\" restarts the search from here and frequently finds a better one.";
+            }
+        }
+
+        public bool HasContinueOptimizingAdvice => ContinueOptimizingAdviceText.Length > 0;
 
         /// <summary>Header shown above the Changed-parameters table once more than one optimization pass has run:
         /// e.g. "3 rounds  •  J: 0.940 → 0.985 → 0.990". Empty for a single round (no chain to summarize).</summary>
@@ -1627,7 +2265,20 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             RaisePropertyChanged(nameof(RoundsSummaryText));
             RaisePropertyChanged(nameof(HasRoundsSummary));
             RaisePropertyChanged(nameof(FocusPrecisionText));
-            RaiseDetectionBinningBlockChanged();
+            // The Star signal block reads the SELECTED summary's own Sensitivity gate and advice, so it has to be
+            // re-raised on every variant switch exactly like the detection-binning block above — a user toggling to
+            // Current must see the gate THOSE settings use, not the one the previous variant reported.
+            // (This call replaced a second, redundant RaiseDetectionBinningBlockChanged() that sat here.)
+            RaiseExposureBlockChanged();
+            // The capture box is re-seeded HERE, with the block it belongs to, and not merely once per run: the
+            // recommended-exposure ROW follows the selected variant, so a box that did not would disagree with the
+            // row printed directly above it. That is reachable and expensive — when the optimizer cannot beat the
+            // current settings the page OPENS on Current (whose healthy gate hides the block, leaving the box on
+            // its fallback), and the user then clicks Optimized to find the row asking for 11 s beside a box still
+            // reading 5 s. Clicking would spend a whole sweep at the exposure that just starved.
+            // The trade: a manual edit made BEFORE a variant switch is discarded. That is the correct side to err
+            // on — the recommendation the edit was relative to has itself changed.
+            SeedRecaptureExposure();
             AcceptCommand.NotifyCanExecuteChanged();
             BackCommand.NotifyCanExecuteChanged();
             ContinueOptimizationCommand.NotifyCanExecuteChanged();
@@ -1666,6 +2317,17 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
         /// recommended step size and/or offset steps actually differ from the current profile values. The
         /// checkbox binds its IsEnabled here so an unchanged recommendation can't be "applied".</summary>
         public bool CanApplyRecommendedStepSize => (Summary?.StepSizeOrOffsetChanged ?? false) || ExposureChangedForLiveRun;
+
+        /// <summary>
+        /// Label for the "apply these auto-focus settings" checkbox. Names the target filter in per-filter mode,
+        /// because that is where Accept writes the geometry — saying "to my profile" there would be untrue. Only
+        /// the filter NAME is interpolated: the recommended numbers are already shown in the rows above, and
+        /// numbers baked into an action label go stale.
+        /// </summary>
+        public string ApplyRecommendedSettingsLabel =>
+            UsesTargetFilterSettings
+                ? string.Format(CultureInfo.CurrentCulture, "Apply these auto-focus settings to the '{0}' filter when I click Accept", TargetFilterName)
+                : "Apply these auto-focus settings to my profile when I click Accept";
 
         /// <summary>Whether the summary shows the detection-binning block at all. Hidden when the baseline fit
         /// was degenerate: there is no measured HFR to reason from, and the bad curve is already on the chart.</summary>
@@ -1741,6 +2403,273 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
         /// confirms the run's factor — the row already says everything.</summary>
         public bool HasDetectionBinningBody => !string.IsNullOrEmpty(DetectionBinningBodyText);
 
+        /// <summary>Whether the summary shows the "Star signal" block at all — i.e. whether the selected variant's
+        /// Sensitivity gate landed at (or near) its search floor. See
+        /// <see cref="OptimizationSummary.HasLowStarSignal"/> for why this is the gate ALONE and not
+        /// additionally conditioned on there being a number to show.</summary>
+        public bool HasExposureBlock => SelectedSummary?.HasLowStarSignal ?? false;
+
+        /// <summary>
+        /// The one italic sentence rendered directly above the focus-curve chart when the gate is floored; empty
+        /// otherwise.
+        ///
+        /// <para>It exists because Accept lives in the footer OUTSIDE the ScrollViewer and is always visible, so a
+        /// user looking at a plausible-shaped curve can accept the run without ever scrolling to the Star signal
+        /// block below the fold. This is the page's only colored element, and it is a warning, not an error: the
+        /// result is usable, it is just built on low-confidence detections.</para>
+        ///
+        /// <para>It states the GATE, not the signal, and states it WITHOUT AGENCY. The block below fires on the
+        /// gate alone, and one of its states (<see cref="ExposureRecommendation.ExposureIsNotTheLimit"/>) is a run
+        /// whose brightest stars measured well above the default gate — so a note claiming the stars "barely
+        /// cleared the noise" would be flatly false exactly there, and would then be contradicted by the block it
+        /// points at. "The detector HAD TO drop its gate" is wrong for the same family of reason: the note follows
+        /// the selected variant, and on the Current view the gate is the user's own hand-set value, which nothing
+        /// compelled.</para>
+        /// </summary>
+        public string LowSignalChartNote => HasExposureBlock ? LowSignalChartNoteText : string.Empty;
+
+        /// <summary>The chart note's wording, as a constant so a test can pin it without duplicating the string.</summary>
+        internal const string LowSignalChartNoteText =
+            "This run's star acceptance gate sits at the bottom of its range, so the result below is built from low-confidence detections; see Star signal.";
+
+        /// <summary>
+        /// F20 part 1 — the entry's actual title: "nothing in the output says your stars are smaller than the
+        /// minimum HFR". Sits beside <see cref="LowSignalChartNote"/> rather than inside the Star signal block,
+        /// because that block's contract is scoped to the SENSITIVITY gate; this is a different gate with a
+        /// different remedy, and folding it in would make the block say something it does not mean.
+        ///
+        /// <para>Placed above the chart for the same reason its sibling is: Accept lives outside the ScrollViewer,
+        /// so a note below the fold can be missed entirely by a user who accepts a landing built from a gated
+        /// curve.</para>
+        /// </summary>
+        public string UndersampledStarsChartNote {
+            get {
+                var s = SelectedSummary;
+                if (s == null || !s.HasUndersampledStars) {
+                    return string.Empty;
+                }
+                var binned = s.MeasuredInFocusHfr / Math.Max(1, s.RunDetectionBinning);
+                var binningClause = s.RunDetectionBinning > 1
+                    ? $" ({s.MeasuredInFocusHfr:0.00} px at {s.RunDetectionBinning}x{s.RunDetectionBinning} detection binning)"
+                    : string.Empty;
+                return $"This rig's in-focus stars measure {binned:0.00} px{binningClause}, at or below the "
+                    + $"{s.VariantMinHfr:0.00} px Minimum HFR gate, so the detector rejected them through the middle "
+                    + "of the sweep. Lower Minimum HFR for this optical train, or reduce detection binning.";
+            }
+        }
+
+        /// <summary>Whether the undersampled-stars note has anything to say.</summary>
+        public bool HasUndersampledStarsNote => !string.IsNullOrEmpty(UndersampledStarsChartNote);
+
+        /// <summary>The recommended-exposure row's value (see <see cref="StarSignalCopy.DescribeExposureRow"/>).</summary>
+        public string RecommendedExposureText => StarSignalCopy.DescribeExposureRow(SelectedSummary);
+
+        /// <summary>Whether the recommended-exposure row has a derived number to show. False when the run could not
+        /// support one (too few usable frames, no per-star SNRs, or no known exposure to scale from) — the block
+        /// still renders, carrying only its diagnosis, rather than showing a labelled row with nothing beside it.</summary>
+        public bool HasRecommendedExposure => !string.IsNullOrEmpty(RecommendedExposureText);
+
+        /// <summary>The body paragraph under the recommended-exposure row.</summary>
+        public string ExposureBodyText => StarSignalCopy.DescribeExposureRecommendation(SelectedSummary, lastRunWasLive, IsUseCurrentMode);
+
+        /// <summary>The recommended-exposure row's TOOLTIP: the arithmetic behind the number, and which cap (if
+        /// any) trimmed it. Background belongs in a tooltip, not in the paragraph — the sibling detection-binning
+        /// block sets the same rule, and the sweep page's own binning row already carries a bound detail tooltip
+        /// (<c>SweepDetectionBinningRecommendationDetail</c>) as the precedent for a per-run one.</summary>
+        public string ExposureDerivationDetail => StarSignalCopy.DescribeExposureDerivation(SelectedSummary);
+
+        /// <summary>Whether the block has a body paragraph to show. Always true while the block is visible (the
+        /// diagnosis sentence is unconditional), but bound anyway so the block degrades to the row alone rather
+        /// than to a blank gap if that ever stops holding.</summary>
+        public bool HasExposureBody => !string.IsNullOrEmpty(ExposureBodyText);
+
+        private double recaptureExposureSeconds;
+
+        /// <summary>
+        /// The exposure the "Capture a new sweep and optimize" action will capture at. Pre-filled from the selected
+        /// variant's recommendation each time a run settles (see <c>SeedRecaptureExposure</c>), then EDITABLE — the
+        /// recommendation is a derived extrapolation, and the user knows things about their sky that it does not.
+        ///
+        /// <para>Session-only and deliberately NOT persisted: it exists for the duration of one summary. What DOES
+        /// persist is <see cref="LiveExposureSeconds"/> — which this writes on capture, and which Accept can then
+        /// write to the profile — so a value that survived the wizard would silently re-arm a later sweep with an
+        /// exposure derived from a run the user never accepted.</para>
+        /// </summary>
+        public double RecaptureExposureSeconds {
+            get => recaptureExposureSeconds;
+            set {
+                if (recaptureExposureSeconds != value) {
+                    recaptureExposureSeconds = value;
+                    RaisePropertyChanged();
+                    // The capture refuses to run at a non-positive exposure, so the button follows this box.
+                    RaisePropertyChanged(nameof(CanCaptureNewSweep));
+                    CaptureNewSweepCommand.NotifyCanExecuteChanged();
+                }
+            }
+        }
+
+        /// <summary>
+        /// Whether the Star signal block's capture action row is SHOWN: this run was a Live sweep and there is a
+        /// longer exposure to capture at.
+        ///
+        /// <para>Deliberately the same condition the body copy uses to promise the action, exactly as
+        /// <see cref="ShowOptimizeAgainAtRecommendedBinning"/> is for its own button — see that property for the
+        /// bug that rule exists to prevent. Branches on
+        /// <see cref="ExposureRecommendation.IncreasesExposure"/>, never on
+        /// <see cref="ExposureRecommendation.HasRecommendation"/>: a run whose current exposure already exceeds the
+        /// absolute cap keeps <c>HasRecommendation</c> true while the recommendation collapses onto the current
+        /// value, and re-capturing at the exposure you just used is a no-op that costs a sweep.</para>
+        ///
+        /// <para>The two MODE conditions are here rather than in <see cref="CanCaptureNewSweep"/>, matching
+        /// <see cref="ShowOptimizeAgainAtRecommendedBinning"/>. REPLAY has no rig to re-capture from. "Use current
+        /// settings" has nothing to re-tune — it skips the search entirely, so a fresh sweep would spend the sky
+        /// time and land back on the same current settings. Both are decided on the Select Source step and are
+        /// FIXED for the life of this Summary, so a button disabled by either would sit dead for the whole run
+        /// with nothing on screen explaining why; the body copy names the mode to switch to instead (see
+        /// <see cref="StarSignalCopy.DescribeExposureRecommendation"/>). Only conditions that can CHANGE while the
+        /// user reads the summary belong in <c>Can</c>.</para>
+        ///
+        /// <para><b>One deliberate asymmetry with the copy, which otherwise tracks this property exactly.</b> When
+        /// a detection-binning change is ALSO on offer, <c>RemedyFor</c>'s top-ranked remedy displaces the capture
+        /// sentence with "change the factor first and let the next run re-measure the exposure" — while this stays
+        /// true, so the capture button remains on screen with no sentence naming it. That is intentional, and it is
+        /// NOT the failure mode the house rule above guards against (copy promising an action whose control is
+        /// hidden — the reverse). Both buttons are visible in that state and the paragraph says which to use first,
+        /// so the user keeps the choice; hiding the capture action instead would silently overrule a user who has
+        /// reason to re-expose before touching the factor.</para>
+        ///
+        /// <para><b>F51 — this is no longer gated on the Star signal block, nor on the exposure alone.</b> It used
+        /// to read <c>HasExposureBlock &amp;&amp; … &amp;&amp; IncreasesExposure</c>, which hid the re-run button in
+        /// exactly the two situations that most need it:
+        /// <list type="number">
+        /// <item><b>When F19 misfires.</b> A field session's run 2 had the gate floored at
+        /// 0.000, was Live, was in Optimize mode — and <c>IncreasesExposure</c> was false because the exposure row
+        /// read <i>"2 s (unchanged; measured star S/N 1438.6; target 10)"</i>. F19's saturation does not merely
+        /// silence a RECOMMENDATION; it removed the BUTTON.</item>
+        /// <item><b>When only the STEP SIZE wants to change.</b> <c>HasExposureBlock</c> is
+        /// <c>HasLowStarSignal</c> — Sensitivity ≤ 1.0 — so on a healthy-gate run with a step recommendation the
+        /// whole block, button included, was hidden. That was runs 1, 3 and 4 of the same session (100 → 214,
+        /// 459 → 474, 459 → 482), none of which had any re-run affordance at all.</item>
+        /// </list>
+        /// The user's actual cost: they had to <b>Accept a landing they did not want, twice</b>, to re-run with a
+        /// wider sweep — and run 2's Accept is how <c>Sensitivity 0.000</c> reached their profile in the first
+        /// place. <b>Re-capturing is not adopting</b>, and it must not require Accept to reach.</para>
+        ///
+        /// <para>So the condition is now "this run was Live, the mode can re-tune, and SOMETHING material is
+        /// recommended" — exposure or step geometry. <see cref="OptimizationSummary.StepSizeOrOffsetChanged"/> is
+        /// the same predicate the Apply toggle is enabled by, so the button appears exactly when there is
+        /// something for the re-capture to carry.</para>
+        ///
+        /// <para>The house rule (never describe an action whose control is hidden) is preserved in BOTH
+        /// directions: the row now lives in the Auto-focus block rather than inside the Star signal block, so it
+        /// no longer disappears with a block whose visibility is about something else, and
+        /// <see cref="StarSignalCopy"/>'s Live sentence that names it still has its referent on the same page.</para>
+        /// </summary>
+        public bool ShowCaptureNewSweep =>
+            lastRunWasLive
+            && !IsUseCurrentMode
+            && ((SelectedSummary?.ExposureAdvice?.IncreasesExposure ?? false)
+                || (SelectedSummary?.StepSizeOrOffsetChanged ?? false));
+
+        /// <summary>
+        /// F51(b) — the one sentence above the re-capture row saying WHAT the next sweep will be taken at, so the
+        /// user is not left to infer it from a button label.
+        ///
+        /// <para><b>Why this had to be said rather than assumed.</b> The re-capture used to override the exposure
+        /// and nothing else, taking the step size from the profile — so on the field session it silently re-shot
+        /// the SAME too-narrow sweep the step recommender was asking to widen, run after run. F51's next step
+        /// offered two acceptable answers, "carry the step size" or "say plainly that it will not"; this carries
+        /// it AND says so, because a sweep geometry the user cannot see is how that defect stayed invisible.</para>
+        ///
+        /// <para>Empty when the row is hidden, so the bound TextBlock never renders a stray line. It quotes the
+        /// step size and offset but NOT the exposure — the editable box directly below is the authority on that,
+        /// and a quoted number would contradict it the moment the user types (the same rule that keeps the button
+        /// label free of seconds).</para>
+        /// </summary>
+        public string CaptureNewSweepCarriesText {
+            get {
+                if (!ShowCaptureNewSweep) {
+                    return string.Empty;
+                }
+                var s = SelectedSummary;
+                if (s == null || s.RecommendedStepSize == s.CurrentStepSize) {
+                    // Exposure-only: the box below already carries the number, and nothing else changes.
+                    return "The new sweep uses the exposure below; the step size stays as it is. "
+                        + "Nothing is written to your profile — Accept still does that.";
+                }
+                // The STEP only. The recommended offset is deliberately not carried (see ApplyRecaptureGeometry),
+                // so promising it here would describe a sweep the re-capture does not take.
+                return $"The new sweep uses the recommended step size {s.CurrentStepSize} → {s.RecommendedStepSize}, "
+                    + "at the exposure below. Nothing is written to your profile — Accept still does that.";
+            }
+        }
+
+        /// <summary>
+        /// Whether the capture can actually proceed. It drives a real auto-focus sweep, so it needs an engine, a
+        /// connected camera and focuser, and somewhere to save the frames — the same pre-flight
+        /// <see cref="ValidateSourceBeforeStart"/> applies to a Live Start, re-checked here because any of them can
+        /// change while the user reads the summary. That transience is exactly what earns them a place here rather
+        /// than in <see cref="ShowCaptureNewSweep"/>: a disabled button that comes back to life when the camera
+        /// reconnects is informative, whereas one that can never come back is just a dead control.
+        ///
+        /// <para>The exposure is checked HERE rather than trusted from the UI, for the same reason
+        /// <see cref="DescribeCaptureNewSweep"/> guards its own divisor: the XAML
+        /// <c>GreaterThanZeroRule</c> only refuses to push a bad value to the source — it cannot stop
+        /// <see cref="RecaptureExposureSeconds"/> being set to zero from anywhere else, and this is the command
+        /// that spends real sky time. A zero-second sweep is the one failure this must not merely log.</para>
+        /// </summary>
+        public bool CanCaptureNewSweep =>
+            ShowCaptureNewSweep
+            && RecaptureExposureSeconds > 0.0
+            && autoFocusEngine != null
+            && isCameraConnected()
+            && isFocuserConnected()
+            && !string.IsNullOrWhiteSpace(SaveFolderPath);
+
+        /// <summary>
+        /// Pre-fills <see cref="RecaptureExposureSeconds"/> from the SELECTED variant's recommendation. Called from
+        /// <see cref="RaiseSelectedVariantDependents"/>, which is the single point that both every run path and
+        /// every variant switch pass through once the selection has settled — so the box tracks the row it sits
+        /// under, rather than only the run it was produced by. (Seeding once per run was not enough: see the call
+        /// site for the Current-then-Optimized route that left a stale 5 s in the box beside a row asking for 11.)
+        ///
+        /// <para>Falls back to the exposure the run was captured with when there is no derived number, so the box
+        /// never shows a bare 0 in the window between the block appearing and the user typing.</para>
+        /// </summary>
+        private void SeedRecaptureExposure() {
+            var advice = SelectedSummary?.ExposureAdvice;
+            var recommended = advice?.RecommendedSeconds ?? double.NaN;
+            if (advice != null && advice.HasRecommendation && double.IsFinite(recommended) && recommended > 0.0) {
+                RecaptureExposureSeconds = recommended;
+                return;
+            }
+            RecaptureExposureSeconds = capturedLiveExposureSeconds > 0.0 ? capturedLiveExposureSeconds : LiveExposureSeconds;
+        }
+
+
+        private void RaiseExposureBlockChanged() {
+            RaisePropertyChanged(nameof(HasExposureBlock));
+            RaisePropertyChanged(nameof(LowSignalChartNote));
+            // F20 — follows the selected variant, so it re-evaluates on the same toggle its sibling does. The
+            // Current view's gate is the user's own, and that is precisely the case worth reporting.
+            RaisePropertyChanged(nameof(HasUndersampledStarsNote));
+            RaisePropertyChanged(nameof(UndersampledStarsChartNote));
+            RaisePropertyChanged(nameof(RecommendedExposureText));
+            RaisePropertyChanged(nameof(HasRecommendedExposure));
+            RaisePropertyChanged(nameof(ExposureBodyText));
+            RaisePropertyChanged(nameof(HasExposureBody));
+            RaisePropertyChanged(nameof(ExposureDerivationDetail));
+            // The capture action's visibility and runnability read the same selected-summary state the copy above
+            // does, so they are re-raised with it — the binning block's sibling call is right below, and the bug
+            // that motivates both is documented on OptimizeAgainAtRecommendedBinningCommand's notification there.
+            RaisePropertyChanged(nameof(ShowCaptureNewSweep));
+            RaisePropertyChanged(nameof(CanCaptureNewSweep));
+            // F51 — the row's own sentence follows its visibility, and the visibility now also turns on the STEP
+            // recommendation, so both are re-raised wherever the selected variant settles.
+            RaisePropertyChanged(nameof(CaptureNewSweepCarriesText));
+            CaptureNewSweepCommand?.NotifyCanExecuteChanged();
+        }
+
         private void RaiseDetectionBinningBlockChanged() {
             RaisePropertyChanged(nameof(HasDetectionBinningBlock));
             RaisePropertyChanged(nameof(HasDetectionBinningBody));
@@ -1767,6 +2696,32 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
         // passes tag the same outer frames as recovery even if the UI box is later edited. 0 for Replay => inert.
         private int capturedRecoveryStepsPerSide;
 
+        /// <summary>
+        /// F51(b) — the sweep GEOMETRY a "Capture a new sweep and optimize" re-capture should use, set by
+        /// <see cref="CaptureNewSweepAsync"/> from the selected summary and consumed once by
+        /// <see cref="RunLiveAttemptAsync"/>. 0 ⇒ no override, which is what an ordinary Live Start leaves it at,
+        /// so that path stays byte-identical.
+        ///
+        /// <para><b>Why this exists.</b> The re-capture used to override ONLY
+        /// <see cref="AutoFocusEngineOptions.OverrideAutoFocusExposureTime"/> and take everything else from
+        /// <c>autoFocusEngine.GetOptions()</c> — i.e. the PROFILE's step size. So the one recommendation that was
+        /// asking to change on every run of the field session (100 → 214 → 459 → 474 → 482) was the one the
+        /// re-capture could not carry, and the ONLY way to re-run at the recommended step was to Accept the
+        /// landing first. That Accept is how <c>Sensitivity 0.000</c> reached the user's profile.</para>
+        ///
+        /// <para>Set to the recommendation, never to the profile: a re-capture that silently used the old geometry
+        /// would look like the fix and reproduce the same sweep.</para>
+        ///
+        /// <para><b>The STEP SIZE only — the offset steps are deliberately NOT carried, and a test caught the
+        /// first version that did.</b> <see cref="StepSizeRecommender"/> derives its step from the desired
+        /// half-width over the CURRENT points-per-side, so the recommended step already expresses the whole
+        /// geometry change at the existing offset; applying the recommended offset on top would widen the sweep
+        /// twice. It also collides with <see cref="ApplyFocusRecovery"/>, which owns that axis and adds to
+        /// whatever offset it is handed — the failing assertion was a re-capture widening to 5 where the recovery
+        /// snapshot alone should have given 1.</para>
+        /// </summary>
+        private int recaptureStepSize;
+
         private bool LastRunWasLive {
             get => lastRunWasLive;
             set {
@@ -1786,7 +2741,7 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
         /// alongside the recommended step size/offset.</summary>
         public string SweepExposureChangeText {
             get {
-                var current = profileService?.ActiveProfile?.FocuserSettings?.AutoFocusExposureTime ?? 0.0;
+                var current = EffectiveAutoFocusExposureSeconds;
                 return Math.Abs(current - capturedLiveExposureSeconds) < 1e-6
                     ? $"{capturedLiveExposureSeconds:0.##} s (unchanged)"
                     : $"{current:0.##} s → {capturedLiveExposureSeconds:0.##} s";
@@ -1800,8 +2755,7 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
                 if (!lastRunWasLive || capturedLiveExposureSeconds <= 0) {
                     return false;
                 }
-                var current = profileService?.ActiveProfile?.FocuserSettings?.AutoFocusExposureTime ?? 0.0;
-                return Math.Abs(current - capturedLiveExposureSeconds) > 1e-6;
+                return Math.Abs(EffectiveAutoFocusExposureSeconds - capturedLiveExposureSeconds) > 1e-6;
             }
         }
 
@@ -1809,6 +2763,11 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             RaisePropertyChanged(nameof(CanApplyExposureTime));
             RaisePropertyChanged(nameof(CanApplyRecommendedStepSize));
             RaisePropertyChanged(nameof(SweepExposureChangeText));
+            // The Star signal BODY is Live-vs-Replay dependent (ExposureBodyText reads lastRunWasLive), and this is
+            // the one place that flag changes. Today the summary is always rebuilt afterwards, so the block would
+            // be re-raised anyway — but that is an ordering accident, and an un-notified dependency of a mutable
+            // field is exactly the bug class the variant-switch notification test exists to catch.
+            RaiseExposureBlockChanged();
         }
 
         /// <summary>The changed-parameters rows shown on the summary: the optimized detector params, plus — only
@@ -1926,6 +2885,11 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
         /// <summary>Summary page: re-run the search at the measured recommended factor, on the frames already on
         /// disk. Writes nothing — see <see cref="OptimizeAgainAtRecommendedBinningAsync"/>.</summary>
         public AsyncRelayCommand OptimizeAgainAtRecommendedBinningCommand { get; }
+
+        /// <summary>Summary page (Live runs only): capture a FRESH sweep at <see cref="RecaptureExposureSeconds"/>
+        /// and re-optimize on it. Writes nothing — see <see cref="CaptureNewSweepAsync"/>.</summary>
+        public AsyncRelayCommand CaptureNewSweepCommand { get; }
+
         public RelayCommand BackCommand { get; }
         public RelayCommand CloseCommand { get; }
 
@@ -1944,6 +2908,10 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
         /// seeded from the current best (fresh step scale), updating the Optimized variant in place and appending a
         /// stage to the trajectory. Enabled only while <see cref="CanContinueOptimization"/> (≤ 3 total passes).</summary>
         public AsyncRelayCommand ContinueOptimizationCommand { get; }
+
+        /// <summary>Loads the star-detection settings a previous optimize pass saved beside this run's frames and
+        /// applies them to the current settings, after showing the same diff an Import shows.</summary>
+        public AsyncRelayCommand ImportRunSettingsCommand { get; }
 
         #endregion Commands
 
@@ -2047,6 +3015,13 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             }
 
             ErrorMessage = null;
+            // Belongs to the run that raised it, so a fresh Start clears it alongside the error.
+            RecoveryWidenedNotice = null;
+            // Same ownership for the F43 rescue: both the notice and the floor it reports describe THIS sweep, and
+            // a stale floor would silently re-gate the next one (the wave-3 seed-leak shape).
+            MinHfrRescueNotice = null;
+            minHfrRescueFloor = null;
+            rescuedSeed = null;
             // A fresh run always uses the PERSISTED factor: any pending optimize-again factor from a previous
             // summary was abandoned when the user came back here.
             pendingDetectionBinning = null;
@@ -2345,7 +3320,23 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             CaptureContextText = null;
             CaptureExposureText = null;
             ExposureProgressMax = 0;
-            var options = autoFocusEngine.GetOptions();
+            // Per-filter runs sweep on EXACTLY the chosen target filter: pass it as the imaging filter and set
+            // UseExactImagingFilter so the engine skips the designated-AF-filter substitution. The wheel moves
+            // as part of the sweep and stays on the target afterward.
+            // ValidateSourceBeforeStart already refused an unresolvable target; this is the last line of defense —
+            // a null filter here would make the engine fall back to the designated AF filter (or not move at all),
+            // so fail loudly rather than sweep the wrong filter and attribute the result to the target.
+            // Resolved BEFORE GetOptions so the sweep also picks up that filter's per-filter sweep geometry — an
+            // ordinary Live Start targeting Ha sweeps at Ha's step size, not the profile's.
+            FilterInfo sweepFilter = null;
+            if (IsPerFilterEnabled) {
+                sweepFilter = resolveFilterByName?.Invoke(TargetFilterName);
+                if (sweepFilter == null) {
+                    throw new InvalidOperationException($"Filter '{TargetFilterName}' was not found in the profile's filter wheel settings.");
+                }
+            }
+
+            var options = autoFocusEngine.GetOptions(imagingFilter: sweepFilter, useExactImagingFilter: sweepFilter != null);
             options.Save = true;                        // frames must land on disk so we can load them like a replay
             options.SavePath = SaveFolderPath;          // honor the folder chosen on the confirmation screen
             // Use the exposure the user set on the confirmation screen (they can lengthen it for faint/narrowband stars).
@@ -2353,20 +3344,15 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             capturedLiveExposureSeconds = LiveExposureSeconds;   // remember what we captured with, for the Summary write-back
             RaiseExposureRowChanged();
 
-            // Per-filter runs sweep on EXACTLY the chosen target filter: pass it as the imaging filter and set
-            // UseExactImagingFilter so the engine skips the designated-AF-filter substitution. The wheel moves
-            // as part of the sweep and stays on the target afterward.
-            // ValidateSourceBeforeStart already refused an unresolvable target; this is the last line of defense —
-            // a null filter here would make the engine fall back to the designated AF filter (or not move at all),
-            // so fail loudly rather than sweep the wrong filter and attribute the result to the target.
-            FilterInfo sweepFilter = null;
-            if (IsPerFilterEnabled) {
-                sweepFilter = resolveFilterByName?.Invoke(TargetFilterName);
-                if (sweepFilter == null) {
-                    throw new InvalidOperationException($"Filter '{TargetFilterName}' was not found in the profile's filter wheel settings.");
-                }
-                options.UseExactImagingFilter = true;
-            }
+            // Only a per-filter run pins the exact filter; otherwise the engine keeps its normal
+            // designated-AF-filter substitution, so this path stays byte-identical to before.
+            options.UseExactImagingFilter = sweepFilter != null;
+
+            // F51(b) — a RE-CAPTURE also carries the recommended sweep GEOMETRY, not just the exposure. Applied
+            // BEFORE ApplyFocusRecovery so recovery still widens whatever offset this leaves behind, exactly as it
+            // widens the profile's on an ordinary Start. Both fields are 0 on a normal Live Start, so that path is
+            // byte-identical. Cleared by the caller after the sweep so a later Start cannot inherit them.
+            ApplyRecaptureGeometry(options, recaptureStepSize);
 
             // Widen the captured sweep by the snapshotted recovery steps (never the live box) so the widened capture and
             // the tagged evaluation use the identical N, and scale the per-run timeout so the longer sweep doesn't time
@@ -2400,6 +3386,37 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
         /// out. Never touches the persisted profile offset or timeout seconds. A no-op at <paramref name="recoverySteps"/>
         /// &lt;= 0 (or null options), so the Live path stays byte-identical when recovery is off. Internal + static so the
         /// widening is directly unit-testable.</summary>
+        /// <summary>F51(b) — applies a re-capture's recommended sweep geometry to <paramref name="options"/>: the
+        /// AF step size and the offset steps, each only when strictly positive. Internal + static so the override
+        /// is directly unit-testable without a rig.
+        ///
+        /// <para>A no-op at 0 (or null options), which is what an ordinary Live Start passes, so the normal
+        /// capture path is byte-identical to before this existed. Unlike
+        /// <see cref="ApplyFocusRecovery"/> — which widens the RANGE and deliberately leaves
+        /// <see cref="AutoFocusEngineOptions.AutoFocusStepSize"/> alone because recovery widens rather than
+        /// refines — this is precisely a step-size change, because that is the recommendation being carried.</para>
+        ///
+        /// <para><b>It touches the step size and NOTHING else</b> — in particular not
+        /// <see cref="AutoFocusEngineOptions.AutoFocusInitialOffsetSteps"/>, which an earlier version of this
+        /// method did set from the recommendation. Two independent reasons, and a test caught it:
+        /// <list type="number">
+        /// <item><see cref="StepSizeRecommender"/> derives its step from the desired half-width over the CURRENT
+        /// points-per-side, so the recommended STEP already expresses the whole geometry change at the existing
+        /// offset. Applying the recommended offset as well widens the sweep twice.</item>
+        /// <item><see cref="ApplyFocusRecovery"/> owns the offset axis and ADDS to whatever it is handed, so the
+        /// two compose in a way no page describes —
+        /// <c>CaptureNewSweep_UsesTheSnapshottedRecoverySteps_NotTheLiveBox</c> failed with a re-capture widened
+        /// to 5 where the recovery snapshot alone should have given 1.</item>
+        /// </list>
+        /// The per-run timeout therefore needs no scaling here either: the point count does not change, and
+        /// <see cref="ApplyFocusRecovery"/> still scales it for its own widening.</para></summary>
+        internal static void ApplyRecaptureGeometry(AutoFocusEngineOptions options, int stepSize) {
+            if (options == null || stepSize <= 0) {
+                return;
+            }
+            options.AutoFocusStepSize = stepSize;
+        }
+
         internal static void ApplyFocusRecovery(AutoFocusEngineOptions options, int recoverySteps) {
             if (options == null || recoverySteps <= 0) {
                 return; // N<=0 keeps the Live path byte-identical
@@ -2459,28 +3476,287 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             }
 
             var results = await AnalyzeWithProgressAsync(runs, guardParams, token).ConfigureAwait(true);
-            var anyUsable = false;
-            foreach (var eval in results) {
-                // Gate on the NON-recovery positions: with recovery frames the raw PooledPointCount is trivially >= 3, so
-                // a starless-near-focus run could pass on recovery positions alone. RecoveryStepsPerSide == 0 =>
-                // NonRecoveryPooledPointCount == PooledPointCount, so Replay/N=0 behavior is unchanged.
-                if (double.IsFinite(eval.Metrics.SigmaFocus) && eval.NonRecoveryPooledPointCount >= MinPositionsForFit) {
-                    anyUsable = true;
-                    break;
+            if (AnyRunIsFittable(results, MinPositionsForFit)) {
+                return true;
+            }
+
+            // Not fittable as configured. Before refusing, try WIDENING the focus-recovery exemption: on a wide
+            // sweep the far wings can be too defocused for any settings to find stars, and one starless position
+            // contributes a NaN HFR that poisons the fit for the whole run. Exempting the starless wings hands the
+            // fit the interior positions, which is usually a clean curve. See
+            // RunEvaluationData.RecoveryStepsToExcludeStarlessWings.
+            //
+            // Deliberately widened only to what the FIT needs, not to what the objective's per-frame hard floor
+            // wants. Star counts depend on the detection params, so a position sitting just under the floor at the
+            // seed may clear it once the search moves the gate -- that is the search's job, and exempting those
+            // positions up front would discard the very evidence it needs. This guard only answers "is a curve
+            // determinable at all", which is what it was always for.
+            if (SourceMode == SourceMode.Live) {
+                var widened = WidenedRecoveryStepsForStarlessWings(results);
+                if (widened > capturedRecoveryStepsPerSide) {
+                    var previous = capturedRecoveryStepsPerSide;
+                    // Field, not local: every reload path stamps runs from it (see LoadRunStampedAsync), so the
+                    // optimize pass and any continue/re-optimize see the same exemption this guard validated.
+                    capturedRecoveryStepsPerSide = widened;
+                    foreach (var run in runs) {
+                        if (run?.Data != null) {
+                            run.Data.RecoveryStepsPerSide = widened;
+                        }
+                    }
+                    results = await AnalyzeWithProgressAsync(runs, guardParams, token).ConfigureAwait(true);
+                    if (AnyRunIsFittable(results, MinPositionsForFit)) {
+                        Logger.Info($"Star detection optimizer: focus-recovery exemption widened {previous} -> {widened} " +
+                                    "steps/side; the sweep's outermost positions yielded no stars at the seed settings, " +
+                                    "and exempting them makes the focus curve fittable.");
+                        RecoveryWidenedNotice =
+                            $"The sweep's outermost {widened} position(s) per side found no stars, so they were excluded " +
+                            "from the focus curve. Optimization continued on the remaining positions. A smaller step size " +
+                            "would put those frames to better use.";
+                        return true;
+                    }
+                    capturedRecoveryStepsPerSide = previous; // widening did not help; report against the real setting
+                    foreach (var run in runs) {
+                        if (run?.Data != null) {
+                            run.Data.RecoveryStepsPerSide = previous;
+                        }
+                    }
                 }
             }
 
-            if (!anyUsable) {
-                ErrorMessage = SourceMode == SourceMode.Live
-                    ? "The captured sweep does not produce a usable focus curve even at the default detection settings: " +
-                      "too few focuser positions yielded detectable stars to fit a curve. Increase the exposure and run the sweep again."
-                    : "The selected auto-focus run(s) do not produce a usable focus curve at the current settings: " +
-                      "too few focuser positions yielded detectable stars to fit a curve. Pick a run with stars across " +
-                      "most frames, or re-acquire with a longer exposure before optimizing.";
-                CurrentStep = WizardStep.SelectSource;
-                return false;
+            // F43 — LAST RESORT BEFORE REFUSING: probe a LOWERED MinHFR gate.
+            //
+            // Refusing here because the DEFAULT settings cannot build a curve is circular: this wizard exists to
+            // find settings that can, and the guard was testing exactly one point of a space in which MinHFR alone
+            // spans [0.1, 5.0] against a default of 1.2. On an undersampled short-focal-length rig the gate deletes
+            // precisely the frames the vertex is fitted from -- measured on the bank's 40 mm dataset, the in-focus
+            // frame yields ZERO stars at 1.2 while the wings yield ~1700 each, and lowering the gate is the ONLY
+            // axis that recovers it (MinimumStarBoundingBoxSize changes nothing; fewer StructureLayers is worse).
+            //
+            // F35's seeding does not reach this case. It runs INSIDE OptimizeAsync -- after this guard -- and
+            // triggers off BestFit.Minimum.Y, a fitted vertex that by definition does not exist once the gate has
+            // destroyed the fit. F35 handles "the vertex sits under the gate"; this handles "the gate destroyed
+            // the vertex", which is the strictly worse case and the one users hit.
+            // LIVE ONLY, like the recovery widening above. Replay gates on the user's CURRENT settings on purpose:
+            // a saved run exists because those settings could already focus, and SeedGuard_ReplayMode_GatesOnBaseline
+            // locks that. Probing the SEED there would quietly convert replay into a seed-gated path, which is a
+            // different product decision than the one this entry is about. Whether replay deserves the same rescue
+            // is left open in F43 rather than changed as a side effect.
+            if (SourceMode == SourceMode.Live) {
+                var rescue = await TryRescueSeedAsync(runs, token).ConfigureAwait(true);
+                if (rescue != null) {
+                    return true;
+                }
             }
-            return true;
+
+            ErrorMessage = SourceMode == SourceMode.Live
+                ? "The captured sweep does not produce a usable focus curve at the default detection settings, and " +
+                  "excluding its outermost positions does not help. Frames without stars in the middle of the sweep, " +
+                  "or too few positions overall, both cause this. Try a smaller step size so more positions land near " +
+                  "focus, a longer exposure, or the recommended detection binning."
+                : "The selected auto-focus run(s) do not produce a usable focus curve at the current settings: " +
+                  "too few focuser positions yielded detectable stars to fit a curve. Pick a run with stars across " +
+                  "most frames, or re-acquire with a longer exposure before optimizing.";
+            CurrentStep = WizardStep.SelectSource;
+            return false;
+        }
+
+        /// <summary>
+        /// F43 — re-runs the fit guard with <see cref="StarDetectorParams.MinHFR"/> lowered, and returns the first
+        /// value that makes the sweep fittable (null when none does, i.e. the refusal stands).
+        ///
+        /// <para><b>The ladder is read from the SEARCH SPACE, not written here.</b> It probes
+        /// <see cref="MinHfrSeed.SeedFloor"/> and then the curated variable's own lower bound, so the guard can
+        /// never admit a rig on a gate the optimizer is not allowed to reach — and never refuses one it could have
+        /// rescued because a constant drifted. Ordered least-aggressive first, so a run rescued at 0.30 is not
+        /// dragged to 0.10 for no reason.</para>
+        ///
+        /// <para><b>Determinability only.</b> The probe asks the same question the guard always asked — "is a
+        /// curve determinable at all" — and not "are the counts comfortable". The rescue is genuinely thin on the
+        /// rigs it exists for (6 stars on the in-focus frame of the 40 mm dataset, against NHard = 3), so any
+        /// richer bar would re-reject exactly the population this is for. Moving the counts up from there is the
+        /// SEARCH's job, which is the whole point of letting it start.</para>
+        ///
+        /// <para>Probes are evaluated on a CLONE of each run's seed. Callers reuse one
+        /// <see cref="StarDetectorParams"/> across runs, and an in-place write here would leak the probed gate
+        /// into every later run — the wave-3 seed leak, which took a whole bank to the floor off one firing.</para>
+        /// </summary>
+        private async Task<StarDetectorParams> TryRescueSeedAsync(IReadOnlyList<LoadedRun> runs, CancellationToken token) {
+            const int MinPositionsForFit = 3;
+            if (runs == null || runs.Count == 0 || runs[0]?.Seed == null) {
+                return null;
+            }
+
+            foreach (var (probe, label) in SeedRescueLadder(runs[0].Seed)) {
+                token.ThrowIfCancellationRequested();
+                var results = await AnalyzeWithProgressAsync(
+                    runs, r => ApplyRescue(r.Seed, probe), token).ConfigureAwait(true);
+                if (!AnyRunIsFittable(results, MinPositionsForFit)) {
+                    continue;
+                }
+                // A FITTABLE CURVE IS NOT ENOUGH — it must also be SCORABLE. Measured on a 40 mm f/2 sweep: with
+                // only the MinHFR gate relaxed the curve fits, but frames still fall under the objective's NHard
+                // floor, so J is identically 0 and 80 evaluations cannot move off it (F20's plateau, one axis
+                // out). Handing the search that seed is indistinguishable to the user from refusing outright.
+                if (!(JOfSeedProbe(results) > 0.0)) {
+                    continue;
+                }
+
+                minHfrRescueFloor = probe.MinHFR;
+                rescuedSeed = probe;
+                Logger.Info($"Star detection optimizer: the default detection settings could not produce a scorable " +
+                            $"focus curve; rescue probe '{label}' did, so the search is seeded there (F43).");
+                MinHfrRescueNotice =
+                    $"The default detection settings found no usable focus curve on this sweep — {label}. The optimizer " +
+                    "was started from those relaxed settings instead, and is free to tighten them again. This is normal " +
+                    "on short focal lengths and short exposures, where in-focus stars are only a pixel or two across " +
+                    "and sit close to the noise.";
+                return probe;
+            }
+            return null;
+        }
+
+        /// <summary>Applies a rescue probe's relaxed gates to a CLONE of a run's seed. Never mutates the caller's
+        /// params: callers reuse one <see cref="StarDetectorParams"/> across runs, and an in-place write is the
+        /// wave-3 seed leak, which took a whole bank to the floor off one firing.</summary>
+        private static StarDetectorParams ApplyRescue(StarDetectorParams seed, StarDetectorParams probe) {
+            var p = seed.Clone();
+            p.MinHFR = probe.MinHFR;
+            p.Sensitivity = probe.Sensitivity;
+            p.NoiseClippingMultiplier = probe.NoiseClippingMultiplier;
+            return p;
+        }
+
+        /// <summary>
+        /// The objective of a probe's evaluation, aggregated exactly as the optimizer aggregates it, so "the search
+        /// has something to climb" is decided by the SAME number the search maximizes rather than by a proxy.
+        /// </summary>
+        private double JOfSeedProbe(IReadOnlyList<RunEvaluationResult> results) {
+            if (results == null || results.Count == 0) {
+                return 0.0;
+            }
+            var perRunJ = results.Select(r => OptimizationObjective.JRun(r.Metrics, objectiveConstants)).ToList();
+            return OptimizationObjective.JTotal(perRunJ, objectiveConstants);
+        }
+
+        /// <summary>
+        /// The seed relaxations the rescue tries, LEAST AGGRESSIVE FIRST, each with a plain-language label for the
+        /// notice. Bounds are read from the curated search variables rather than written as constants here, so the
+        /// guard can never admit a rig on settings the optimizer is not allowed to reach — nor refuse one it could
+        /// have rescued because a constant drifted.
+        ///
+        /// <para>The ladder relaxes two DIFFERENT failure modes in order. <b>Size</b> first: at 19 arcsec/px an
+        /// in-focus star is about one pixel, so <c>MinHFR</c> deletes precisely the frames the vertex is fitted
+        /// from. Then <b>signal</b>: on a short exposure the acceptance gate and noise-clipping threshold reject
+        /// nearly everything. Measured on a 40 mm f/2 sweep at 4 s, relaxing size alone moved the in-focus frame
+        /// from 0 stars to 14 — fittable but still unscorable — while also relaxing signal took the whole sweep to
+        /// 20–1413 stars per frame and the optimizer converged immediately.</para>
+        /// </summary>
+        private static IEnumerable<(StarDetectorParams Probe, string Label)> SeedRescueLadder(StarDetectorParams seed) {
+            var vars = OptimizerVariable.CreateCuratedSet(seed);
+            double LowerOfVar(string name, double fallback) =>
+                vars.FirstOrDefault(v => string.Equals(v.Name, name, StringComparison.Ordinal))?.Lower ?? fallback;
+
+            var minHfrLower = Math.Min(MinHfrSeed.SeedFloor, LowerOfVar(nameof(StarDetectorParams.MinHFR), MinHfrSeed.SeedFloor));
+            var sensLower = LowerOfVar(nameof(StarDetectorParams.Sensitivity), 0.0);
+            var noiseClipLower = LowerOfVar(nameof(StarDetectorParams.NoiseClippingMultiplier), seed.NoiseClippingMultiplier);
+
+            StarDetectorParams With(double minHfr, double sens, double noiseClip) {
+                var p = seed.Clone();
+                p.MinHFR = Math.Min(seed.MinHFR, minHfr);
+                p.Sensitivity = Math.Min(seed.Sensitivity, sens);
+                p.NoiseClippingMultiplier = Math.Min(seed.NoiseClippingMultiplier, noiseClip);
+                return p;
+            }
+
+            // 1-2: size only — the smallest intervention that can rescue an undersampled rig.
+            yield return (With(MinHfrSeed.SeedFloor, seed.Sensitivity, seed.NoiseClippingMultiplier),
+                $"the minimum-HFR gate was lowered to {Math.Min(seed.MinHFR, MinHfrSeed.SeedFloor):0.##} px");
+            yield return (With(minHfrLower, seed.Sensitivity, seed.NoiseClippingMultiplier),
+                $"the minimum-HFR gate was lowered to {Math.Min(seed.MinHFR, minHfrLower):0.##} px");
+            // 3: + the acceptance gate, for a signal-starved sweep.
+            yield return (With(minHfrLower, sensLower, seed.NoiseClippingMultiplier),
+                $"the minimum-HFR gate was lowered to {Math.Min(seed.MinHFR, minHfrLower):0.##} px and the star " +
+                $"acceptance gate to {Math.Min(seed.Sensitivity, sensLower):0.##}");
+            // 4: + noise clipping, the last thing standing between a faint sweep and a curve.
+            yield return (With(minHfrLower, sensLower, noiseClipLower),
+                $"the minimum-HFR gate was lowered to {Math.Min(seed.MinHFR, minHfrLower):0.##} px, the star " +
+                $"acceptance gate to {Math.Min(seed.Sensitivity, sensLower):0.##} and noise clipping to " +
+                $"{Math.Min(seed.NoiseClippingMultiplier, noiseClipLower):0.##}");
+        }
+
+        /// <summary>F43 — the relaxed seed the guard had to fall back on, or null when the sweep was scorable as
+        /// configured. Used as the SEED of a fresh optimization pass, so the search starts somewhere it can climb.</summary>
+        private StarDetectorParams rescuedSeed;
+
+        /// <summary>The lower of two optional gate floors, ignoring absent ones. Null only when both are null.</summary>
+        internal static double? LowerOf(double? a, double? b) {
+            if (!a.HasValue) {
+                return b;
+            }
+            if (!b.HasValue) {
+                return a;
+            }
+            return Math.Min(a.Value, b.Value);
+        }
+
+        /// <summary>F43 — the MinHFR the guard had to drop to before a curve could be fitted at all, or null when
+        /// the sweep fitted without help. Read by <see cref="OptimizeAsync"/> as a seed floor.</summary>
+        private double? minHfrRescueFloor;
+
+        private string minHfrRescueNotice;
+
+        /// <summary>
+        /// Set when the guard had to lower the MinHFR gate to obtain a focus curve at all (F43). NOT an error —
+        /// the run proceeds — but it must be visible: the wizard is reporting results from a gate the user did not
+        /// choose, and on a short-focal-length rig that gate is the setting they most need to know about.
+        /// </summary>
+        public string MinHfrRescueNotice {
+            get => minHfrRescueNotice;
+            private set {
+                if (minHfrRescueNotice != value) {
+                    minHfrRescueNotice = value;
+                    RaisePropertyChanged();
+                    RaisePropertyChanged(nameof(HasMinHfrRescueNotice));
+                }
+            }
+        }
+
+        public bool HasMinHfrRescueNotice => !string.IsNullOrEmpty(MinHfrRescueNotice);
+
+        /// <summary>
+        /// Whether ANY run yields a determinable focus curve: a finite σ(focus) backed by ≥
+        /// <paramref name="minPositionsForFit"/> NON-recovery positions. Gating on the non-recovery count matters
+        /// because with recovery frames the raw PooledPointCount is trivially ≥ 3, so a starless-near-focus run
+        /// could otherwise pass on its recovery positions alone. RecoveryStepsPerSide == 0 ⇒
+        /// NonRecoveryPooledPointCount == PooledPointCount, so Replay / N=0 behaviour is unchanged.
+        /// </summary>
+        private static bool AnyRunIsFittable(IReadOnlyList<RunEvaluationResult> results, int minPositionsForFit) {
+            foreach (var eval in results) {
+                if (double.IsFinite(eval.Metrics.SigmaFocus) && eval.NonRecoveryPooledPointCount >= minPositionsForFit) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// The smallest per-side exemption that clears the starless wings on the run that needs the LEAST widening
+        /// — the guard passes when ANY run is fittable, so the cheapest run to rescue is the one to size for.
+        /// 0 when no run has starless wings, or when every run's starless positions are interior (unfixable here).
+        /// </summary>
+        private static int WidenedRecoveryStepsForStarlessWings(IReadOnlyList<RunEvaluationResult> results) {
+            var best = 0;
+            foreach (var eval in results) {
+                var needed = RunEvaluationData.RecoveryStepsToExcludeStarlessWings(
+                    eval.Metrics?.FrameFocuserPositions, eval.Metrics?.FrameStarCounts);
+                if (needed <= 0) {
+                    continue; // -1 unfixable, 0 nothing starless
+                }
+                if (best == 0 || needed < best) {
+                    best = needed;
+                }
+            }
+            return best;
         }
 
         /// <summary>
@@ -2501,6 +3777,11 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
                 var frameProgress = new Progress<RunLoadProgress>(rp => SetProgress(label, rp.Current, rp.Total));
                 results.Add(await run.Data.EvaluateAndFitAsync(paramsSelector(run), frameProgress, token).ConfigureAwait(true));
             }
+            // F35 — stash run 0's fitted vertex HFR for the MinHFR seeding rule. Run 0 is the representative run
+            // everywhere else in this VM (the plotted curve, the binning recommendation, the exposure advice), so
+            // the seed follows the same convention. Recomputed on every analyze pass, so a re-optimize after the
+            // user changes settings re-triggers off the fit those settings produce rather than a stale one.
+            seedFitVertexHfr = results.Count > 0 ? (results[0].BestFit?.Minimum.Y ?? double.NaN) : double.NaN;
             return results;
         }
 
@@ -2532,12 +3813,100 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             // constants are then handed to the optimizer (OptimizeAsync), so the baseline J and BestJ are comparable.
             var currentSigma = sigmaCount > 0 ? sigmaSum / sigmaCount : double.NaN;
             currentBaselineSigma = currentSigma;
+            // F52(c) — the abort/re-expose advice, computed HERE and from the SEED. This runs once, before the
+            // search starts, so a user asking "should I abort?" two hours in gets an answer that was available in
+            // the first minute. That is the whole complaint: the field session spent over two hours in one
+            // optimization and neither the log nor the UI could answer it.
+            UpdateSearchExposureAdvice(metrics, baseline);
             objectiveConstants = OptimizeForAberrationInspection
                 ? ObjectiveConstants.ForAberrationInspection(currentSigma)
                 : new ObjectiveConstants();
 
             var perRunJ = metrics.Select(m => OptimizationObjective.JRun(m, objectiveConstants)).ToList();
             return OptimizationObjective.JTotal(perRunJ, objectiveConstants);
+        }
+
+        private string searchExposureAdvice = string.Empty;
+
+        /// <summary>
+        /// F52(c) — the one sentence under the progress bar that says whether this search is worth waiting for, or
+        /// whether the frames it is searching over are the problem. Empty (and the row hidden) when the sweep's
+        /// wings are healthy, because advice that always fires says nothing.
+        ///
+        /// <para><b>Why this could not ship in wave 8, and why it can now.</b> Wave 8 shipped (a) and (b) — the
+        /// rate, the bound on what is left, which knob made the search expensive, and what Cancel costs — and
+        /// deliberately withheld (c), because advice derived from the exposure statistic of the day *"would tell
+        /// precisely the users who most need a longer exposure that theirs is already fine"*: on the reporting
+        /// user's own rig that statistic read <b>S/N 1438.6 against a target of 10</b>. The separation wave 8 drew
+        /// is kept exactly: <b>facts about COST need no new statistic and are already shown; ADVICE needs
+        /// one</b>.</para>
+        ///
+        /// <para><b>WITHDRAWN in wave 10, and currently always empty.</b> Wave 9 built it on
+        /// <c>ExposureRecommendation.WingIsShedding</c>; wave 10's full-bank population check refuted that
+        /// statistic and removed the verdict, so this advice is withheld again for exactly the reason wave 8
+        /// withheld it. See <see cref="BuildSearchExposureAdvice"/> for the measurement and the successor.</para>
+        ///
+        /// <para><b>It names Cancel, which exists</b> — the house rule at
+        /// <see cref="ShowOptimizeAgainAtRecommendedBinning"/>: never describe an action whose control is hidden.
+        /// And it states what Cancel costs in the same breath, because the reason the user sat through two hours
+        /// was not knowing.</para>
+        ///
+        /// <para>It does NOT quote a recommended exposure. The seed evaluation supports a DIRECTION (the wing probe
+        /// is a probe precisely because the rejected candidates' SNRs are not recorded), and the Summary's own
+        /// exposure row is where a number belongs once the run finishes.</para>
+        /// </summary>
+        public string SearchExposureAdvice {
+            get => searchExposureAdvice;
+            private set {
+                if (searchExposureAdvice != value) {
+                    searchExposureAdvice = value;
+                    RaisePropertyChanged();
+                    RaisePropertyChanged(nameof(HasSearchExposureAdvice));
+                }
+            }
+        }
+
+        public bool HasSearchExposureAdvice => !string.IsNullOrEmpty(SearchExposureAdvice);
+
+        /// <summary>
+        /// Builds <see cref="SearchExposureAdvice"/> from the SEED evaluation's metrics. Internal + static so the
+        /// copy is testable without a rig; the instance wrapper below just assigns it.
+        ///
+        /// <para>Takes the WORST wing fraction across the loaded runs rather than an average: a multi-run
+        /// optimization lands ONE settings bundle on all of them, so a single starved run is enough to make the
+        /// search's answer untrustworthy, and averaging would hide exactly that.</para>
+        /// </summary>
+        internal static string BuildSearchExposureAdvice(
+                IReadOnlyList<RunEvaluationMetrics> seedMetrics, StarDetectorParams seedParams, double currentExposureSeconds) {
+            // ── F52(c) IS WITHHELD AGAIN (wave 10) ──────────────────────────────────────────────────────────
+            //
+            // Wave 8 refused to ship this advice for want of a statistic. Wave 9 shipped it on
+            // ExposureRecommendation.WingIsShedding. Wave 10's full-bank population check refuted that statistic
+            // and withdrew the verdict (see the withdrawal note in ExposureRecommender), so this returns to
+            // wave 8's position for wave 8's reason -- the same decision, made again, on better evidence.
+            //
+            // WHY THIS MATTERED MORE THAN THE EXPOSURE NUMBER. This advice tells the user to CANCEL a running
+            // two-hour optimization, and it is computed from the SEED evaluation, i.e. in the first minute. The
+            // statistic behind it fired on the great majority of bank runs, so the shipped behaviour was to
+            // advise most users to abandon their search before it had done anything. A note that always fires
+            // says nothing; one that always fires AND costs the user their run is worse than nothing.
+            //
+            // The method, its call sites and its tests are kept rather than deleted: the successor statistic
+            // (the wing-to-inner RATIO, pre-registered in the wave-10 design SS1.2a) re-enables this by changing
+            // the condition below and nothing else. Returning empty is a WITHDRAWAL, not a removal.
+            if (seedMetrics == null || seedMetrics.Count == 0 || !(currentExposureSeconds > 0.0)) {
+                return string.Empty;
+            }
+            _ = seedParams; // retained: the successor's condition needs it, exactly as the withdrawn one did
+            return string.Empty;
+        }
+
+        private void UpdateSearchExposureAdvice(IReadOnlyList<RunEvaluationMetrics> seedMetrics, StarDetectorParams seedParams) {
+            // The exposure the frames were actually shot with. Live runs know it exactly; a replay falls back to
+            // the box, and a non-positive value makes ExposureRecommender decline to answer at all, which is the
+            // right outcome -- the advice is about exposure, so an unknown exposure has nothing to say.
+            var exposure = capturedLiveExposureSeconds > 0.0 ? capturedLiveExposureSeconds : LiveExposureSeconds;
+            SearchExposureAdvice = BuildSearchExposureAdvice(seedMetrics, seedParams, exposure);
         }
 
         /// <summary>Runs the pure optimizer off the UI thread; progress posts back via <see cref="IProgress{T}"/>.
@@ -2550,7 +3919,11 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             // All runs share the same camera/optics, so the search starts from the first run's seed (or the override).
             // With StartFromCurrentSettings, seed from the current settings (Baseline) to refine them rather than the
             // fully-default params. The warm-start override (feedback path) always wins.
-            var seed = seedOverride ?? (StartFromCurrentSettings ? runs[0].Baseline : runs[0].Seed);
+            // F43 — a fresh pass starts from the RESCUED seed when the guard had to fall back on one: being allowed
+            // to reach those settings is not enough, because the objective is identically zero at the defaults and
+            // the search has no gradient to follow off it (measured: 80 evaluations, no escape).
+            var seed = seedOverride ?? (seedOverride == null && rescuedSeed != null ? rescuedSeed.Clone()
+                : (StartFromCurrentSettings ? runs[0].Baseline : runs[0].Seed));
             // The master donut toggle is a profile option, NOT an optimizer axis: stamp it onto the seed so the
             // seed's early morph-close runs and CreateCuratedSet includes the defocus axes iff the user enabled it
             // (the default Seed carries master=OFF, so without this the donut feature would never be searched when
@@ -2563,8 +3936,50 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             // on), so it needs more iterations to converge: use the larger budget when enabled, else the standard
             // one. Re-applied each call so toggling the donut master between builds takes effect.
             optimizerSettings.MaxEvaluations = donutMaster ? DonutMaxEvaluations : standardMaxEvaluations;
+            // F35 — seed MinHFR beneath the gate when the pre-search fit says this rig's stars are smaller than it
+            // (F20's cold-start plateau: J is identically 0 across the neighbourhood, so no single-axis step
+            // improves anything and the search never lowers the gate on its own).
+            //
+            // FRESH passes only. Both non-fresh paths supply a seedOverride: "Continue optimizing" seeds from the
+            // prior round's best, and the feedback path seeds from GateRecommender's analytic recommendation --
+            // which owns MinHFR itself for RejectionGate.TooLowHFR. In both cases MinHFR is already the search's
+            // (or the recommender's) to set, and re-stamping the floor would silently undo an upward move that had
+            // been earned. A seed is a START condition, not a bound.
+            //
+            // Assigned unconditionally, including to null, for the same reason MaxEvaluations is re-applied above:
+            // optimizerSettings is a reused field and a value from a prior pass must never leak into this one.
+            //
+            // F43 adds a SECOND source for the same floor: the guard may have had to lower the gate just to obtain
+            // a curve at all, in which case there was no vertex for the rule above to read. Take the LOWER of the
+            // two — both only ever lower the gate, so the minimum is the one that actually admitted stars, and
+            // either being absent leaves the other unchanged.
+            optimizerSettings.MinHfrSeedFloor = seedOverride == null
+                ? LowerOf(MinHfrSeed.Resolve(seedFitVertexHfr, seed.MinHFR, seed.DetectionBinning), minHfrRescueFloor)
+                : null;
+
+            // F32 — pin the keep floor's baseline to the FRESH pass's seed, so a chain of "Continue optimizing"
+            // rounds cannot ratchet through it. Every non-fresh path re-seeds from somewhere the previous pass
+            // arrived at (Continue from the prior best, the feedback path from GateRecommender's analytic
+            // recommendation); measuring the floor against THAT would let each round shed another (1 - floor) of
+            // what remains -- at a floor of 0.5, three rounds reach 0.125 of where the user actually started.
+            // The floor means "of the stars you had when you pressed Start", so it must keep referring there.
+            //
+            // Assigned unconditionally, including to null, for the same reason MinHfrSeedFloor above is: this is
+            // a reused settings object and a value from a prior pass must never leak into a fresh one.
+            //
+            // Guarded on run COUNT because the non-fresh paths re-load their runs: a mismatched list would pair
+            // run i's baseline with a different run's counts, which is worse than not constraining at all.
+            optimizerSettings.DetectionKeepBaselineTotals =
+                seedOverride != null && firstPassSeedDetectionTotals != null && firstPassSeedDetectionTotals.Count == runs.Count
+                    ? firstPassSeedDetectionTotals
+                    : null;
+
             var variables = variablesOverride ?? OptimizerVariable.CreateCuratedSet(seed);
-            var evaluator = RunEvaluationData.CreateEvaluator(runs.Select(r => r.Data).ToList());
+            // F79 — per-frame progress INSIDE an evaluation. The expensive step is one candidate scored against
+            // every frame of every run; without this the whole of it is a single frozen counter tick, which is
+            // exactly what a hang looks like. Only rendered while ProgressStepIsExpensive (see the property).
+            var frameProgress = new Progress<RunLoadProgress>(rp => ReportEvaluationFrame(rp.Current, rp.Total));
+            var evaluator = RunEvaluationData.CreateEvaluator(runs.Select(r => r.Data).ToList(), frameProgress);
 
             ProgressTotal = optimizerSettings.MaxEvaluations;
             var progress = new Progress<OptimizationProgress>(p => {
@@ -2581,6 +3996,17 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
                 ProgressSeedJ = progressBaselineJOverride ?? currentBaselineJ;
                 ProgressSeedSigma = progressBaselineSigmaOverride ?? currentBaselineSigma;
                 Phase = FriendlyPhase(p.Phase);
+                // F52 — timing. Assigned last so the timing text, which reads ProgressCurrent/ProgressTotal
+                // above, is computed from this report's counts rather than the previous one's.
+                progressElapsed = p.Elapsed;
+                progressSecondsPerEvaluation = p.SecondsPerEvaluation;
+                progressSecondsPerCheapEvaluation = p.SecondsPerCheapEvaluation;
+                progressSecondsPerExpensiveEvaluation = p.SecondsPerExpensiveEvaluation;
+                progressExpensiveStepsPossible = p.ExpensiveStepsPossible;
+                // F79 — set AFTER Phase, because Phase's suffix reads it. Setting it also re-raises Phase, so the
+                // heading picks up the change whichever order the two arrive in.
+                ProgressStepIsExpensive = p.StepIsExpensive;
+                RaisePropertyChanged(nameof(ProgressTimingText));
             });
 
             // Hand the optimizer the SAME objective the wizard scored the baseline with (standard, or the
@@ -2588,12 +4014,64 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             var optimizer = new StarDetectionOptimizer(objectiveConstants);
             IsOptimizing = true;
             try {
-                return await Task.Run(
+                var result = await Task.Run(
                     () => optimizer.OptimizeAsync(seed, variables, evaluator, optimizerSettings, progress, token),
                     token).ConfigureAwait(true);
+                if (seedOverride == null) {
+                    // A FRESH pass defines where the user started; every later round measures its keep floor
+                    // against this. Captured even when no floor is in force, so turning one on is a one-line
+                    // change that cannot forget the anchor.
+                    firstPassSeedDetectionTotals = result.SeedRunDetectionTotals;
+                }
+                return result;
             } finally {
                 IsOptimizing = false;
             }
+        }
+
+        /// <summary>F32 — per-run seed star totals of the most recent FRESH optimization pass. The anchor every
+        /// "Continue optimizing" round's keep floor is measured against; see the assignment in
+        /// <see cref="OptimizeAsync"/> for why a per-round anchor would ratchet.</summary>
+        private IReadOnlyList<long> firstPassSeedDetectionTotals;
+
+        private readonly IWindowServiceFactory windowServiceFactory = new WindowServiceFactory();
+
+        /// <summary>The run folder whose saved settings <see cref="ImportRunSettingsCommand"/> would import — the
+        /// first loaded run that actually has a handoff file beside it. Null when no run is loaded or none of them
+        /// carries one (which is the normal case for a run that has never been optimized).</summary>
+        private string RunSettingsSourceFolder {
+            get {
+                var folders = (reoptimizeRunFolders != null && reoptimizeRunFolders.Count > 0)
+                    ? reoptimizeRunFolders
+                    : (IReadOnlyList<string>)loadedRunFolders;
+                foreach (var f in folders) {
+                    if (StarDetectionSettingsIO.ResolveRunFolderSettings(f) != null) {
+                        return f;
+                    }
+                }
+                return null;
+            }
+        }
+
+        /// <summary>True when a loaded run carries saved settings to import. Deliberately a per-call filesystem
+        /// probe rather than cached state: an optimize pass can write the file while the wizard is open.</summary>
+        public bool CanImportRunSettings => !IsBusy && RunSettingsSourceFolder != null;
+
+        /// <summary>
+        /// Applies a run folder's saved settings to the CURRENT settings, on the user's explicit request.
+        ///
+        /// <para>This is the whole reason the wizard does not pick these up automatically. The wizard's baseline —
+        /// what "Current" means, what <c>baselineJ</c> is computed from, and therefore what the headline
+        /// improvement percentage is a percentage OF — is the live profile. Auto-loading a run folder's landing
+        /// would move that anchor with nothing on screen to say it had moved, so the same displayed percentage
+        /// would silently mean something different. Here the user asks, sees the diff, and confirms.</para>
+        /// </summary>
+        private async Task ImportRunSettingsAsync() {
+            var folder = RunSettingsSourceFolder;
+            if (folder == null || starDetectionOptions is not StarDetectionOptions concreteOptions) {
+                return;
+            }
+            await StarDetectionSettingsIO.ImportFromRunFolderAsync(folder, concreteOptions, windowServiceFactory).ConfigureAwait(true);
         }
 
         /// <summary>Maps the optimizer's internal phase identifiers ("Seed"/"CoarseGrid"/"PatternSearch", which
@@ -2648,6 +4126,21 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             // The displayed "before" is the user's CURRENT settings (Baseline), NOT the optimizer's default seed.
             var baseline = runs[0].Baseline;
 
+            // F79 — this stage used to be entirely silent, and it is not cheap: TWO full evaluations per run, and
+            // both are early-context REBUILDS (the search left the cache holding its own winning candidate, and
+            // the baseline and the best generally differ from it and from each other on an early axis). The panel
+            // kept showing "Refining settings" with the counter frozen at its final value for the whole of it,
+            // which is the same "did it hang?" the search itself used to produce. Give it its own heading and a
+            // determinate frame count.
+            var summaryFramesTotal = 2 * runs.Sum(r => r.Data.FrameCount);
+            var summaryFramesDone = 0;
+            SetProgress("Measuring before / after", 0, summaryFramesTotal);
+            IProgress<RunLoadProgress> SummaryFrameProgress() {
+                var offset = summaryFramesDone;
+                return new Progress<RunLoadProgress>(rp =>
+                    SetProgress("Measuring before / after", offset + rp.Current, summaryFramesTotal));
+            }
+
             // Changed-parameters table = current (Baseline) -> optimized (BestParams) over the curated knobs, so it is
             // exactly the diff the user would accept onto their live settings (consistent with the σ/J improvement,
             // which is also measured vs current). This intentionally replaces res.ChangedVariables (default -> best).
@@ -2674,15 +4167,35 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             var measuredFitRSquared = double.NaN;
             var baselineInFocusHfr = double.NaN;
             var baselineFitRSquared = double.NaN;
+            // The exposure-time recommendation, derived from run 0 ONLY — matching the detection-binning precedent
+            // above. With several Replay runs the per-run exposures may legitimately differ, and a single number
+            // covering all of them would be ill-defined; the representative run is the one whose curve is plotted.
+            var (runExposureSeconds, runExposureIsAssumed) = ResolveRunExposureSeconds(runs[0]);
+            ExposureRecommendation exposureAdvice = null, baselineExposureAdvice = null;
             OptimizationCurve currentCurveLocal = null, optimizedCurveLocal = null;
+            // F18 — what the representative run actually DETECTED, per frame, so the step recommendation can be
+            // bounded by detectability and not by curve geometry alone. Same run 0 the fit and the exposure advice
+            // come from; the metrics are already in hand, so this costs no extra evaluation.
+            SweepDetectability representativeDetectability = null;
             for (var i = 0; i < runs.Count; i++) {
                 token.ThrowIfCancellationRequested();
-                var baselineEval = await runs[i].Data.EvaluateAndFitAsync(baseline, token).ConfigureAwait(true);
-                var bestEval = await runs[i].Data.EvaluateAndFitAsync(res.BestParams, token).ConfigureAwait(true);
+                var baselineEval = await runs[i].Data.EvaluateAndFitAsync(baseline, SummaryFrameProgress(), token).ConfigureAwait(true);
+                summaryFramesDone += runs[i].Data.FrameCount;
+                var bestEval = await runs[i].Data.EvaluateAndFitAsync(res.BestParams, SummaryFrameProgress(), token).ConfigureAwait(true);
+                summaryFramesDone += runs[i].Data.FrameCount;
                 if (double.IsFinite(baselineEval.Metrics.SigmaFocus)) { baselineSigmaSum += baselineEval.Metrics.SigmaFocus; baselineSigmaCount++; }
                 if (double.IsFinite(bestEval.Metrics.SigmaFocus)) { bestSigmaSum += bestEval.Metrics.SigmaFocus; bestSigmaCount++; }
                 if (i == 0) {
                     representativeBestFit = bestEval.BestFit;
+                    // The OPTIMIZED variant's counts, matching the fit above: the recommendation describes the
+                    // settings Accept puts into service, so the detectable range must be the one those settings see.
+                    representativeDetectability = new SweepDetectability {
+                        FrameStarCounts = bestEval.Metrics?.FrameStarCounts,
+                        FrameFocuserPositions = bestEval.Metrics?.FrameFocuserPositions,
+                        FrameIsRecovery = bestEval.Metrics?.FrameIsRecovery,
+                        HardFloorStarCount = objectiveConstants.NHard,
+                        RecoveryStepsPerSide = capturedRecoveryStepsPerSide
+                    };
                     // This summary describes the OPTIMIZED variant, so its in-focus HFR comes from the optimized
                     // curve — the one plotted above it and the one Accept puts into service. The current-settings
                     // numbers are carried alongside for BuildCurrentSummary.
@@ -2690,6 +4203,17 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
                     measuredFitRSquared = bestEval.Metrics?.RSquared ?? double.NaN;
                     baselineInFocusHfr = baselineEval.BestFit?.Minimum.Y ?? double.NaN;
                     baselineFitRSquared = baselineEval.Metrics?.RSquared ?? double.NaN;
+                    // Both variants' exposure advice, computed HERE because both RunEvaluationResults are already
+                    // in hand — the recommender only reads Metrics.FrameStarSnrs, so this costs no extra evaluation
+                    // pass. objectiveConstants (not a fresh ObjectiveConstants) so the recommendation inverts the
+                    // SAME NTarget star-count knee the search just optimized against; the aberration-inspection
+                    // profile moves that knee to 60.
+                    // Each variant gets ITS OWN params: the inert-gate bound is PeakResponse x the effective clip
+                    // multiplier and both are searched axes, so the optimized and current settings can have
+                    // different bounds on the same frames (F28). Same pairing rule as VariantSensitivity /
+                    // BaselineSensitivity.
+                    exposureAdvice = ExposureRecommender.Recommend(bestEval.Metrics, objectiveConstants, runExposureSeconds, res.BestParams);
+                    baselineExposureAdvice = ExposureRecommender.Recommend(baselineEval.Metrics, objectiveConstants, runExposureSeconds, baseline);
                     var (baselineCore, baselineRecovery) = PartitionRecoveryPoints(baselineEval);
                     var (bestCore, bestRecovery) = PartitionRecoveryPoints(bestEval);
                     currentCurveLocal = new OptimizationCurve {
@@ -2709,7 +4233,8 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
 
             var currentStepSize = runs[0].AfOptions?.AutoFocusStepSize ?? DefaultCurrentStepSize;
             var currentOffsetSteps = runs[0].AfOptions?.AutoFocusInitialOffsetSteps ?? DefaultCurrentOffsetSteps;
-            var recommendation = StepSizeRecommender.Recommend(representativeBestFit, currentStepSize, GetFocuserMaxStep());
+            var recommendation = StepSizeRecommender.Recommend(
+                representativeBestFit, currentStepSize, GetFocuserMaxStep(), representativeDetectability);
 
             var summary = new OptimizationSummary {
                 ChangedParameters = changed,
@@ -2721,6 +4246,10 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
                 RecommendedStepSize = recommendation.StepSize,
                 RecommendedOffsetSteps = recommendation.OffsetSteps,
                 StepSizeWasCapped = recommendation.WasCapped,
+                StepSizeWasBandFloored = recommendation.WasBandFloored,
+                StepSizeSampledHfrRange = recommendation.SampledHfrRange,
+                StepSizeCappedGrowthRatio = recommendation.CappedGrowthRatio,
+                StepSizeDegenerateReason = recommendation.DegenerateReason,
                 CurrentStepSize = currentStepSize,
                 CurrentOffsetSteps = currentOffsetSteps,
                 ImprovedOverSeed = res.ImprovedOverSeed,
@@ -2730,7 +4259,18 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
                 FitRSquared = measuredFitRSquared,
                 BaselineMeasuredInFocusHfr = baselineInFocusHfr,
                 BaselineFitRSquared = baselineFitRSquared,
-                RecommendedDetectionBinning = DetectionBinningResolver.RecommendFromHfr(measuredInFocusHfr)
+                RecommendedDetectionBinning = DetectionBinningResolver.RecommendFromHfr(measuredInFocusHfr),
+                RunExposureSeconds = runExposureSeconds,
+                RunExposureIsAssumed = runExposureIsAssumed,
+                // This summary describes the OPTIMIZED variant, so the gate it reports is the optimized one — the
+                // gate Accept puts into service. The current-settings gate is carried alongside for
+                // BuildCurrentSummary, exactly as the in-focus HFR pair is.
+                VariantSensitivity = res.BestParams?.Sensitivity ?? double.NaN,
+                BaselineSensitivity = baseline?.Sensitivity ?? double.NaN,
+                VariantMinHfr = res.BestParams?.MinHFR ?? double.NaN,
+                BaselineMinHfr = baseline?.MinHFR ?? double.NaN,
+                ExposureAdvice = exposureAdvice,
+                BaselineExposureAdvice = baselineExposureAdvice
             };
             return (summary, currentCurveLocal, optimizedCurveLocal);
         }
@@ -2762,8 +4302,57 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
                 FitRSquared = optimized.BaselineFitRSquared,
                 BaselineMeasuredInFocusHfr = optimized.BaselineMeasuredInFocusHfr,
                 BaselineFitRSquared = optimized.BaselineFitRSquared,
-                RecommendedDetectionBinning = DetectionBinningResolver.RecommendFromHfr(optimized.BaselineMeasuredInFocusHfr)
+                RecommendedDetectionBinning = DetectionBinningResolver.RecommendFromHfr(optimized.BaselineMeasuredInFocusHfr),
+                // Both variants ran on the same frames, so the exposure — and whether it had to be assumed — is the
+                // same number on either view.
+                RunExposureSeconds = optimized.RunExposureSeconds,
+                RunExposureIsAssumed = optimized.RunExposureIsAssumed,
+                // The Current view keeps the current detector settings, so it reports THEIR gate and the advice
+                // derived from THEIR accepted stars — not the optimizer's. That is what tells a user who hand-set
+                // their own Sensitivity to 0 why this block is on screen at all.
+                VariantSensitivity = optimized.BaselineSensitivity,
+                BaselineSensitivity = optimized.BaselineSensitivity,
+                VariantMinHfr = optimized.BaselineMinHfr,
+                BaselineMinHfr = optimized.BaselineMinHfr,
+                ExposureAdvice = optimized.BaselineExposureAdvice,
+                BaselineExposureAdvice = optimized.BaselineExposureAdvice
             };
+        }
+
+        /// <summary>
+        /// The exposure time (seconds) to scale the exposure recommendation from — <c>t_old</c>. Three sources, in
+        /// order of how directly they describe the frames that were actually scored:
+        ///
+        /// <list type="number">
+        /// <item>a Live sweep's own captured exposure (<see cref="capturedLiveExposureSeconds"/>) — exact, and it
+        /// is what the wizard itself set on the camera;</item>
+        /// <item>a Replay run's <see cref="LoadedRun.CapturedExposureSeconds"/>, read back out of the saved frames'
+        /// headers, since nothing in a saved attempt records it otherwise;</item>
+        /// <item>the profile's auto-focus exposure — a FALLBACK, not a measurement: it is what an auto-focus run
+        /// would use TODAY, which is only the same number if the saved run used the current setting. Called out in
+        /// the Star signal tooltip so the derived figure is not read as a property of the frames.</item>
+        /// </list>
+        ///
+        /// <para>Returns <see cref="double.NaN"/> when none of the three yields a positive number, which makes
+        /// <see cref="ExposureRecommender.Recommend"/> withhold every derived figure and leaves the block showing
+        /// only its diagnosis. Never scale a factor off an unknown base.</para>
+        ///
+        /// <para><c>IsAssumed</c> distinguishes source 3 from sources 1 and 2, so the copy can say the derivation
+        /// rests on an assumption about how the frames were captured rather than on the frames themselves.</para>
+        /// </summary>
+        private (double Seconds, bool IsAssumed) ResolveRunExposureSeconds(LoadedRun run) {
+            if (lastRunWasLive && capturedLiveExposureSeconds > 0.0) {
+                return (capturedLiveExposureSeconds, false);
+            }
+            var recorded = run?.CapturedExposureSeconds ?? double.NaN;
+            if (double.IsFinite(recorded) && recorded > 0.0) {
+                return (recorded, false);
+            }
+            // Last resort for a run that recorded no exposure: what the target filter would focus at today.
+            var assumedExposure = EffectiveAutoFocusExposureSeconds;
+            return double.IsFinite(assumedExposure) && assumedExposure > 0.0
+                ? (assumedExposure, true)
+                : (double.NaN, false);   // nothing at all: not "assumed", just unknown
         }
 
         private const int DefaultCurrentStepSize = 10;
@@ -2863,12 +4452,46 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             // actually used (the sweep fell back to the profile/filter exposure), so writing it would corrupt the profile.
             if (ApplyRecommendedStepSize) {
                 var focuserSettings = profileService?.ActiveProfile?.FocuserSettings;
-                if (focuserSettings != null) {
+                if (IsPerFilterEnabled) {
+                    // Per-filter: the sweep geometry belongs to the filter this run targeted. Writing it to the
+                    // profile is what let optimizing Ha and then L silently replace Ha's recommendation, since the
+                    // detection settings went to the filter while the geometry went to the profile.
+                    if (UsesTargetFilterSettings && applySweepGeometryToFilter != null) {
+                        applySweepGeometryToFilter(TargetFilterName, summary.RecommendedStepSize, summary.RecommendedOffsetSteps);
+                        Logger.Info(
+                            $"Applied recommended AF step size {summary.RecommendedStepSize}, offset steps " +
+                            $"{summary.RecommendedOffsetSteps} to filter '{TargetFilterName}'");
+                    } else {
+                        // Mirrors applyOptimizedToFilter's discipline: refuse rather than silently writing the
+                        // profile, which would be the very cross-filter clobber this change exists to remove.
+                        Logger.Error(
+                            "Per-filter star detection is enabled but no target filter is available; the recommended " +
+                            "sweep geometry was NOT applied.");
+                    }
+                } else if (focuserSettings != null) {
                     focuserSettings.AutoFocusStepSize = summary.RecommendedStepSize;
                     focuserSettings.AutoFocusInitialOffsetSteps = summary.RecommendedOffsetSteps;
                     Logger.Info($"Applied recommended AF step size {summary.RecommendedStepSize}, offset steps {summary.RecommendedOffsetSteps}");
+                }
 
-                    if (lastRunWasLive && capturedLiveExposureSeconds > 0) {
+                // The exposure captured by a live sweep follows the same rule as the geometry above: in per-filter
+                // mode it belongs to the filter that was swept, not to the profile. NINA core already models this
+                // (FilterInfo.AutoFocusExposureTime > -1 wins in AutoFocusEngine.TakeExposure), so this writes core's
+                // own per-filter field rather than inventing a parallel one.
+                if (lastRunWasLive && capturedLiveExposureSeconds > 0) {
+                    if (IsPerFilterEnabled) {
+                        var targetFilter = UsesTargetFilterSettings ? resolveFilterByName?.Invoke(TargetFilterName) : null;
+                        if (targetFilter != null) {
+                            targetFilter.AutoFocusExposureTime = capturedLiveExposureSeconds;
+                            Logger.Info($"Applied AF exposure time {capturedLiveExposureSeconds}s to filter '{TargetFilterName}'");
+                        } else {
+                            // Same discipline as the geometry write: refuse rather than fall back to the profile,
+                            // which would be the cross-filter clobber this whole change removes.
+                            Logger.Error(
+                                "Per-filter star detection is enabled but the target filter could not be resolved; the " +
+                                "sweep exposure was NOT applied.");
+                        }
+                    } else if (focuserSettings != null) {
                         focuserSettings.AutoFocusExposureTime = capturedLiveExposureSeconds;
                         Logger.Info($"Applied AF exposure time {capturedLiveExposureSeconds}s to the active profile");
                     }
@@ -2877,6 +4500,83 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
         }
 
         // ---- Review step (optional, post-Summary) ----------------------------------------------------------
+
+        /// <summary>
+        /// Installs the result of a pass that RE-TUNED FROM SCRATCH — "Optimize again at NxN" and "Capture a new
+        /// sweep" — as the Optimized variant, and selects it.
+        ///
+        /// <para>Distinct from <see cref="ContinueOptimizationAsync"/>'s adoption, which APPENDS a stage: both
+        /// callers here seeded fresh, so the round chain is RESET to a single stage rather than extended. Splicing
+        /// either onto the previous trajectory would render a per-round path whose stages were measured in
+        /// different units — a different pixel scale for the binning pass, a different exposure for the capture —
+        /// and the numbers would look comparable when they are not.</para>
+        ///
+        /// <para>The feedback variant is dropped for the same reason: it was measured under the superseded
+        /// conditions, so it can neither be compared against this result nor accepted alongside it.</para>
+        ///
+        /// <para><b>What it deliberately does NOT do is touch the review snapshot</b> (<c>capturedLabels</c>,
+        /// <see cref="ReviewVM"/>, <c>reviewFrames</c>, <c>reviewParams</c>, <see cref="Recommendation"/>). The two
+        /// callers differ there and must: the binning pass re-reads the SAME files, so its RunIds and the labels
+        /// keyed by them still line up, and silently discarding a user's labelling work would be a regression. The
+        /// capture pass replaces the frames outright and so calls <see cref="DiscardReviewSnapshot"/> itself. Any
+        /// third caller has to make that decision explicitly, which is why it is not folded in here.</para>
+        /// </summary>
+        private void AdoptFreshTuning(
+            OptimizationResult optimizeResult,
+            (OptimizationSummary Summary, OptimizationCurve CurrentCurve, OptimizationCurve OptimizedCurve) built) {
+            optimizedResult = optimizeResult;
+            optimizedSummary = built.Summary;
+            optimizedCurve = built.OptimizedCurve;
+            currentCurve = built.CurrentCurve;
+            optimizedChain.Clear();
+            optimizedChain.Add(optimizeResult.BestParams);
+            optimizedRoundJ.Clear();
+            optimizedRoundJ.Add(optimizeResult.BestJ);
+            optimizedRoundCurves.Clear();
+            optimizedRoundCurves.Add(built.OptimizedCurve);
+            feedbackResult = null;
+            feedbackSummary = null;
+            feedbackCurve = null;
+            currentSummary = BuildCurrentSummary(built.Summary);
+            OptimizerImprovedOverCurrent = optimizeResult.BestJ > currentBaselineJ + ImprovementEpsilon;
+            selectedVariant = OptimizationVariant.Optimized;
+            RaiseSelectedVariantDependents();
+        }
+
+        /// <summary>
+        /// Drops the whole review snapshot — the built <see cref="ReviewVM"/> and its subscription, the in-memory
+        /// labels, the detected frames and the params they were detected at, and the label→gate recommendation —
+        /// exactly as <see cref="StartAsync"/> does when a fresh run begins, and for exactly the same reason: the
+        /// images those labels were drawn on are no longer the images this result describes.
+        ///
+        /// <para>Called by the capture path only. It is NOT enough to null the feedback variant: the labels
+        /// themselves drive <see cref="ShowReoptimizePrompt"/> and re-enable <see cref="ReOptimizeCommand"/>, so
+        /// leaving them behind puts a "you labeled stars — re-run optimization" prompt on a summary built from
+        /// frames those labels never saw.</para>
+        ///
+        /// <para><c>reviewDescriptors</c> / <c>reviewLabelsDir</c> / the re-optimize folders are NOT cleared here:
+        /// every caller re-establishes them from the new runs via <see cref="SnapshotReviewInputs"/> on the very
+        /// next line, and clearing them first would only widen the window in which they are inconsistent.</para>
+        ///
+        /// <para>This does NOT write anything. A caller that is discarding labels the user actually drew must call
+        /// <see cref="PersistReviewLabels"/> FIRST — it is <see cref="ReviewVM"/> that performs the write, and this
+        /// nulls it — so their work lands on disk under the run it describes. The capture path does exactly that;
+        /// see the call site for why the ordering is load-bearing in both directions.</para>
+        /// </summary>
+        private void DiscardReviewSnapshot() {
+            if (ReviewVM != null) {
+                ReviewVM.PropertyChanged -= OnReviewLabelsChanged;
+            }
+            ReviewVM = null;
+            capturedLabels = null;
+            reviewFrames = null;
+            reviewParams = null;
+            Recommendation = null;
+            RaisePropertyChanged(nameof(HasLabels));
+            RaisePropertyChanged(nameof(ShowReoptimizePrompt));
+            RaisePropertyChanged(nameof(ShowFeedbackPanel));
+            ReOptimizeCommand.NotifyCanExecuteChanged();
+        }
 
         /// <summary>
         /// Captures the Mat-free inputs the optional Review step needs, snapshotted while <paramref name="runs"/> is
@@ -2904,6 +4604,13 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             // The button then sits permanently disabled under copy claiming the frames are gone, while they are on
             // disk exactly where this method just recorded them.
             RaiseDetectionBinningBlockChanged();
+            // The Star signal block is refreshed at the same point, for the same structural reason: this is where a
+            // run's post-success state finally settles, AFTER every path has already raised the summary's
+            // dependents. Its inputs are all fixed by BuildSummaryAsync today, so this is currently belt-and-braces
+            // — but the binning block's bug was exactly "a later-settling input was never re-notified", and pairing
+            // the two refreshes keeps the next input added here (the Live capture action reads the same
+            // run-availability state the binning button does) from re-introducing it.
+            RaiseExposureBlockChanged();
         }
 
         /// <summary>
@@ -3393,25 +5100,9 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
                 var built = await BuildSummaryAsync(reloaded, optimizeResult, token).ConfigureAwait(true);
 
                 // A fresh tuning, not another round: reset the chain so the trajectory does not splice together
-                // values measured in two different pixel scales.
-                optimizedResult = optimizeResult;
-                optimizedSummary = built.Summary;
-                optimizedCurve = built.OptimizedCurve;
-                currentCurve = built.CurrentCurve;
-                optimizedChain.Clear();
-                optimizedChain.Add(optimizeResult.BestParams);
-                optimizedRoundJ.Clear();
-                optimizedRoundJ.Add(optimizeResult.BestJ);
-                optimizedRoundCurves.Clear();
-                optimizedRoundCurves.Add(built.OptimizedCurve);
-                // The feedback variant was measured at the old factor; it cannot be compared or accepted now.
-                feedbackResult = null;
-                feedbackSummary = null;
-                feedbackCurve = null;
-                currentSummary = BuildCurrentSummary(built.Summary);
-                OptimizerImprovedOverCurrent = optimizeResult.BestJ > currentBaselineJ + ImprovementEpsilon;
-                selectedVariant = OptimizationVariant.Optimized;
-                RaiseSelectedVariantDependents();
+                // values measured in two different pixel scales. The frames themselves are unchanged, so unlike the
+                // capture path this deliberately KEEPS the review snapshot — see AdoptFreshTuning.
+                AdoptFreshTuning(optimizeResult, built);
 
                 SnapshotReviewInputs(reloaded, reoptimizeRunFolders, reoptimizeRunIds);
                 RecordRunDuration();
@@ -3432,6 +5123,183 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
                     pendingDetectionBinning = previous;
                 }
                 DisposeLoadedRuns(reloaded);
+                IsBusy = false;
+                Interlocked.Exchange(ref running, 0);
+            }
+        }
+
+        /// <summary>
+        /// Summary → "Capture a new sweep and optimize": captures a WHOLE NEW Live sweep at
+        /// <see cref="RecaptureExposureSeconds"/> and re-runs the optimization on the fresh frames. The answer to a
+        /// signal-starved run whose gate floored: the settings cannot be fixed on frames that never had the signal,
+        /// so the frames are replaced rather than re-analyzed.
+        ///
+        /// <para>Structurally the twin of <see cref="OptimizeAgainAtRecommendedBinningAsync"/> — same interlock,
+        /// same progress reset, same chain reset, same <c>succeeded</c>/<c>finally</c> restore — with four
+        /// deliberate differences, each of which was a trap:</para>
+        ///
+        /// <list type="number">
+        /// <item>It CAPTURES via <see cref="RunLiveAttemptAsync"/> instead of re-loading
+        /// <c>reoptimizeRunFolders</c>. Those folders hold the starved frames; re-reading them is exactly what
+        /// cannot help.</item>
+        /// <item>It loops over <see cref="RunCount"/>, not over the recorded folders. A user who configured 2 runs
+        /// gets 2 sweeps — capturing a single sweep here would silently halve a multi-run configuration, and the
+        /// summary would then compare a 1-run result against a 2-run baseline.</item>
+        /// <item>The snapshot at the end passes the FRESH folders and ids. The old ones point at the frames this
+        /// action exists to replace, so re-optimize/continue/review would all reach for the starved set.</item>
+        /// <item>It restores BOTH <see cref="LiveExposureSeconds"/> (which <see cref="RunLiveAttemptAsync"/> reads)
+        /// and <c>capturedLiveExposureSeconds</c> (which it WRITES, before the sweep can fail) when the capture
+        /// does not succeed. Restoring only the first leaves the intact summary's exposure row — and Accept's
+        /// profile write-back — reporting an exposure nothing was ever captured at.</item>
+        /// </list>
+        ///
+        /// <para><c>pendingDetectionBinning</c> is deliberately LEFT ALONE, so a prior "Optimize again at NxN"
+        /// still applies: the fresh frames are analyzed at the factor the user is mid-way through evaluating, and
+        /// Accept still writes that factor with the settings measured at it.
+        /// <c>capturedRecoveryStepsPerSide</c> is likewise reused rather than re-read from
+        /// <see cref="FocusRecoverySteps"/> — <see cref="LoadRunStampedAsync"/>'s contract is that every reload
+        /// after the originating Start uses that Start's snapshot, so the widened capture and the recovery TAGGING
+        /// cannot disagree.</para>
+        ///
+        /// <para>Persists nothing, like every other path here: Accept remains the only writer.</para>
+        /// </summary>
+        private async Task CaptureNewSweepAsync(CancellationToken externalToken) {
+            if (!CanCaptureNewSweep) {
+                return;
+            }
+            if (Interlocked.CompareExchange(ref running, 1, 0) != 0) {
+                return; // a Start/re-optimize/continue/capture is already in flight
+            }
+
+            var target = RecaptureExposureSeconds;
+            // The sweep exposure is what RunLiveAttemptAsync reads, so the confirmation quotes the change it is
+            // about to make to it rather than the summary's (identical, but derived) recommendation row.
+            var previousExposure = LiveExposureSeconds;
+            var previousCapturedExposure = capturedLiveExposureSeconds;
+            if (!confirmCaptureNewSweep(previousExposure, target)) {
+                Interlocked.Exchange(ref running, 0);
+                return;
+            }
+            LiveExposureSeconds = target;
+            // F51(b) — carry the recommended sweep GEOMETRY too, not only the exposure. Read from the SELECTED
+            // summary (the variant whose row the user is looking at), and only when it actually differs from the
+            // profile: StepSizeOrOffsetChanged is the same predicate the Apply toggle is enabled by, so the
+            // re-capture carries exactly what the page says is recommended. Nothing is written to the profile —
+            // this is a per-run override on the sweep about to be taken, which is what makes re-capturing
+            // independent of Accept.
+            var geometry = SelectedSummary;
+            recaptureStepSize = geometry != null && geometry.RecommendedStepSize != geometry.CurrentStepSize
+                ? geometry.RecommendedStepSize
+                : 0;
+
+            ErrorMessage = null;
+            SetProgress(null, 0, 0);
+            ProgressSeedJ = 0;
+            ProgressBestJ = 0;
+            ProgressSeedSigma = double.NaN;
+            ProgressBestSigma = double.NaN;
+            IsBusy = true;
+
+            cts?.Dispose();
+            cts = CancellationTokenSource.CreateLinkedTokenSource(externalToken);
+            var token = cts.Token;
+
+            List<LoadedRun> captured = null;
+            var succeeded = false;
+            try {
+                CurrentStep = WizardStep.Acquire;
+                // The freshly captured folders/ids REPLACE the previous run's, in capture order, exactly as
+                // AcquireAsync fills them on a Start — SnapshotReviewInputs below hands them on to every path that
+                // re-reads this run from disk.
+                //
+                // Cleared inside the try with NO rollback, deliberately: nothing reads these two except
+                // SnapshotReviewInputs (which only runs on the success path below), and both of their writers —
+                // StartAsync and this method — clear before filling. So a capture that fails halfway leaves them
+                // half-populated but unread, and the previous run's re-optimize/review inputs are unaffected
+                // because those live in reoptimizeRunFolders/Ids, which only SnapshotReviewInputs writes.
+                loadedRunFolders.Clear();
+                loadedRunIds.Clear();
+                captured = new List<LoadedRun>(RunCount);
+                for (var i = 0; i < RunCount; i++) {
+                    token.ThrowIfCancellationRequested();
+                    var folder = await RunLiveAttemptAsync(token).ConfigureAwait(true);
+                    if (string.IsNullOrEmpty(folder)) {
+                        // Same clean message AcquireAsync gives, but the user stays on the SUMMARY: the previous
+                        // run's result is still valid and still acceptable, which is the whole point of this being
+                        // an optional extra capture rather than a re-Start.
+                        ErrorMessage = "The live sweep did not produce a saved set of frames. Check the focuser and try again.";
+                        CurrentStep = WizardStep.Summary;
+                        return;
+                    }
+                    SetProgress("Loading frames", 0, 0);
+                    var loadProgress = new Progress<RunLoadProgress>(rp =>
+                        SetProgress("Loading frames", rp.Current, rp.Total));
+                    // Load + stamp through the single choke-point: it carries the recovery snapshot AND any pending
+                    // optimize-again binning factor onto the fresh runs.
+                    var loaded = await LoadRunStampedAsync(folder, null, loadProgress, token).ConfigureAwait(true);
+                    captured.Add(loaded);
+                    loadedRunFolders.Add(folder);
+                    loadedRunIds.Add(loaded.Data.RunId);
+                }
+
+                CurrentStep = WizardStep.Optimize;
+                await AnalyzeWithProgressAsync(captured, r => r.Seed, token).ConfigureAwait(true);
+                // The "before" is the user's current settings measured on THESE frames — the only honest
+                // comparison, since the previous run's baseline was measured on differently-exposed ones.
+                currentBaselineJ = await ComputeBaselineJAsync(captured, token).ConfigureAwait(true);
+
+                var optimizeResult = await OptimizeAsync(captured, token).ConfigureAwait(true);
+                var built = await BuildSummaryAsync(captured, optimizeResult, token).ConfigureAwait(true);
+
+                // A fresh tuning on fresh frames, not another round: reset the chain rather than splicing a
+                // trajectory across two different sets of exposures.
+                AdoptFreshTuning(optimizeResult, built);
+                // Flush the labels to disk BEFORE dropping them, and before SnapshotReviewInputs re-points the
+                // labels dir at the run that is replacing this one. Order is load-bearing twice over: the discard
+                // nulls ReviewVM, which is what actually writes (and what PersistReviewLabels guards on), so a
+                // flush after it silently no-ops; and reviewLabelsDir still resolves to the OLD run's folder here,
+                // which is where labels drawn on the OLD run's images belong. The principle is the Cancel path's:
+                // labels are the user's work product, not a settings mutation, so they survive an action that
+                // discards everything else. (Tolerant — a failed write logs and does not block the capture.)
+                PersistReviewLabels();
+                // …and, UNLIKE the binning path, throw away the review with it. That path re-reads the very same
+                // files, so its RunIds — and therefore its labels — still line up. This one replaced the frames, so
+                // the captured labels describe images that no longer exist here. Keeping them would leave
+                // ShowReoptimizePrompt true on the new summary, and "Optimize with feedback" would then miss on
+                // every runId and fall through to ResolveLabelsForRun's POSITIONAL fallback, applying star boxes
+                // hand-drawn on the old sweep to the new sweep's frames behind nothing but a Logger.Warning.
+                // Success path only: a failed or cancelled capture leaves the previous run — and its review —
+                // entirely intact.
+                DiscardReviewSnapshot();
+
+                SnapshotReviewInputs(captured, loadedRunFolders, loadedRunIds);
+                RecordRunDuration();
+                CurrentStep = WizardStep.Summary;
+                succeeded = true;
+                Logger.Info($"Captured a new sweep at {target}s per frame and re-optimized on it (not yet applied; Accept writes the settings)");
+            } catch (OperationCanceledException) {
+                Logger.Info("Capture of a new sweep was cancelled");
+                CurrentStep = WizardStep.Summary;
+            } catch (Exception ex) {
+                Logger.Error(ex, "Capturing a new sweep failed");
+                ErrorMessage = $"Capturing a new sweep at {target}s failed: {ex.Message}";
+                CurrentStep = WizardStep.Summary;
+            } finally {
+                if (!succeeded) {
+                    // Cancelled or failed: put BOTH exposures back. LiveExposureSeconds is what a later sweep would
+                    // capture at; capturedLiveExposureSeconds is what the (still-displayed, still-acceptable)
+                    // summary reports and what Accept writes to the profile — and RunLiveAttemptAsync has already
+                    // overwritten it by the time any sweep can fail. Nothing was persisted, so there is no other
+                    // residue to undo.
+                    LiveExposureSeconds = previousExposure;
+                    capturedLiveExposureSeconds = previousCapturedExposure;
+                    RaiseExposureRowChanged();
+                }
+                // F51(b) — the geometry override is consumed by exactly the sweep this command started, so it is
+                // cleared on EVERY exit path (success as well as failure). Leaving it set would silently apply
+                // this run's recommended step size to a later ordinary Start, which no page ever offered.
+                recaptureStepSize = 0;
+                DisposeLoadedRuns(captured);
                 IsBusy = false;
                 Interlocked.Exchange(ref running, 0);
             }
@@ -3498,12 +5366,19 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
 
         /// <summary>
         /// Builds the production review-builder seam: the SHARED <see cref="FrameReviewBuilder.BuildAsync"/> over a
-        /// real <see cref="StarDetector"/> and a profile-aware disk loader (.xisf/.fits via NINA's loaders →
-        /// normalized float Mat; .tif direct). Mirrors the TestApp <c>review</c> path so detection + overlay
-        /// extraction + the MTF-stretch image provider are byte-identical between the offline tool and the wizard.
+        /// real <see cref="StarDetector"/> and the SAME disk-load path the optimizer step itself uses (NINA's
+        /// <see cref="IImageDataFactory"/> + <see cref="RenderedImageLoading.ForDetection"/>), so Review detects on
+        /// the image the optimizer scored rather than on a differently-loaded copy of it.
+        ///
+        /// <para>This used to load a bare float Mat with <c>isBayered: false</c>, which for an OSC run meant Review
+        /// detected and displayed the raw Bayer MOSAIC while the optimizer step ran on CFA-filtered luminance — and
+        /// the labels a user draws here are what "Optimize with feedback" subsequently trusts.</para>
         /// </summary>
+        /// <param name="cameraSensorType">The connected camera's sensor type, live's last-resort CFA source (see
+        /// <see cref="RenderedImageLoading.ResolveBayerPattern"/>). Probed per call so connecting the camera between
+        /// wizard steps is picked up.</param>
         private static Func<IReadOnlyList<FrameReviewDescriptor>, StarDetectorParams, IProgress<RunLoadProgress>, CancellationToken, Task<List<FrameReview>>>
-            BuildProductionReviewBuilder(IProfileService profileService, IImageDataFactory imageDataFactory) {
+            BuildProductionReviewBuilder(IProfileService profileService, IImageDataFactory imageDataFactory, Func<SensorType?> cameraSensorType) {
             return (descriptors, p, progress, token) => {
                 var detector = new StarDetector(HocusFocusPlugin.AlglibAPI);
                 // Hop to the threadpool so the WHOLE build (disk load + detection) runs off the captured UI context.
@@ -3513,37 +5388,45 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
                 return Task.Run(
                     () => FrameReviewBuilder.BuildAsync(
                         descriptors, p, detector,
-                        path => LoadFloatMatFromDisk(path, profileService, imageDataFactory),
+                        // Detection: Detect(IRenderedImage, …), so the CFA hotpixel filter and the debayer happen
+                        // INSIDE detection at the review's params — exactly as the live app does them.
+                        path => LoadRenderedImageFromDisk(path, profileService, imageDataFactory, cameraSensorType, token),
+                        // Display: the same debayer WITHOUT the CFA filter. A mosaic renders as a visible
+                        // checkerboard, which is unreviewable, and the stretch is not a detection input. Straight
+                        // off the image data, so a big OSC frame does not also build the Rgb48 debayered source
+                        // this path would immediately discard.
+                        async path => RenderedImageLoading.ToDebayeredLuminanceMat(
+                            await LoadImageDataFromDisk(path, profileService, imageDataFactory, token).ConfigureAwait(false),
+                            profileService, cameraSensorType?.Invoke()),
                         token, progress),
                     token);
             };
         }
 
         /// <summary>
-        /// Loads an image file as a CV_32F Mat normalized to [0,1] for the review detection input. .tif/.tiff are
-        /// read directly; .xisf/.fits/.fit go through NINA's loaders (which need the active profile). Mirrors the
-        /// TestApp <c>DiagnosticUtil.LoadFloatMat</c> body so the wizard and the offline tool share one float-Mat
-        /// load path — but lives in the plugin (no TestApp dependency).
+        /// The DETECTION input for one review frame: loaded exactly as the optimizer step loads its run frames,
+        /// then handed to <see cref="RenderedImageLoading.ForDetection"/> for the profile-gated debayer, so
+        /// <c>Detect</c> — not this loader — decides whether to CFA-filter.
         /// </summary>
-        private static async Task<Mat> LoadFloatMatFromDisk(string path, IProfileService profileService, IImageDataFactory imageDataFactory) {
-            var ext = Path.GetExtension(path).ToLowerInvariant();
-            if (ext == ".tif" || ext == ".tiff") {
-                // Normalize by ushort.MaxValue, matching DiagnosticUtil.LoadFloatMat for 16-bit TIFFs (the real case
-                // — AF/review frames are 16-bit). For non-16-bit TIFFs the scale factor would differ, but those are
-                // not produced by this pipeline.
-                using var src = new Mat(path, ImreadModes.Unchanged);
-                var dst = new Mat();
-                src.ConvertTo(dst, MatType.CV_32F, 1.0 / ushort.MaxValue);
-                return dst;
-            }
-            if (ext == ".xisf" || ext == ".fits" || ext == ".fit") {
-                var uri = new Uri(Path.GetFullPath(path));
-                IImageData imageData = ext == ".xisf"
-                    ? await XISF.Load(uri, false, imageDataFactory, CancellationToken.None).ConfigureAwait(false)
-                    : await FITS.Load(uri, false, imageDataFactory, CancellationToken.None).ConfigureAwait(false);
-                return CvImageUtility.ToOpenCVMat(imageData);
-            }
-            throw new NotSupportedException($"Unsupported image extension '{ext}'. Supported: .tif/.tiff, .xisf, .fits/.fit");
+        private static async Task<IRenderedImage> LoadRenderedImageFromDisk(
+            string path, IProfileService profileService, IImageDataFactory imageDataFactory, Func<SensorType?> cameraSensorType, CancellationToken token) {
+            var imageData = await LoadImageDataFromDisk(path, profileService, imageDataFactory, token).ConfigureAwait(false);
+            return RenderedImageLoading.ForDetection(imageData, profileService, cameraSensorType?.Invoke());
+        }
+
+        /// <summary>
+        /// The disk read behind both review loaders: NINA's image-data factory with the frame's REAL
+        /// <c>isBayered</c> + bit depth recovered from the AF engine's file name. A file that is not an AF-engine
+        /// saved frame falls back to not-bayered at the profile's bit depth — what the previous loader assumed for
+        /// every file.
+        /// </summary>
+        private static Task<IImageData> LoadImageDataFromDisk(
+            string path, IProfileService profileService, IImageDataFactory imageDataFactory, CancellationToken token) {
+            var saved = SavedAutoFocusImage.TryParseFileName(path);
+            var bitDepth = saved?.BitDepth ?? (int)profileService.ActiveProfile.CameraSettings.BitDepth;
+            return imageDataFactory.CreateFromFile(
+                path, bitDepth, saved?.IsBayered ?? false,
+                profileService.ActiveProfile.CameraSettings.RawConverter, token);
         }
 
         private void Cancel() {
@@ -3614,14 +5497,13 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
         /// <summary>The filter the live sweep will expose through, for display: the designated AF filter when
         /// filter-wheel offsets are enabled, otherwise the filter currently loaded in the wheel. Null when unknown.</summary>
         private static string ResolveSweepFilterName(IProfileService profileService, IFilterWheelMediator filterWheelMediator) {
-            var focuserSettings = profileService?.ActiveProfile?.FocuserSettings;
-            if (focuserSettings != null && focuserSettings.UseFilterWheelOffsets) {
-                var af = profileService.ActiveProfile.FilterWheelSettings?.FilterWheelFilters?.FirstOrDefault(f => f.AutoFocusFilter);
-                if (af != null) {
-                    return af.Name;
-                }
-            }
-            return filterWheelMediator?.GetInfo()?.SelectedFilter?.Name;
+            // Shares AutoFocusFilterResolver with the engine so this readout cannot claim a different filter than
+            // the one SetAutofocusFilter will actually move the wheel to. The "imaging filter" for a live sweep
+            // started from this page is whatever is currently loaded in the wheel.
+            return AutoFocusFilterResolver.ResolveName(
+                profileService?.ActiveProfile,
+                filterWheelMediator?.GetInfo()?.SelectedFilter,
+                useExactImagingFilter: false);
         }
 
         /// <summary>The gain the live sweep will expose with, for display: the designated AF filter's gain when

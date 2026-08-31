@@ -38,6 +38,7 @@ using OxyPlot.Series;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics.Metrics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -396,7 +397,138 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             }
         }
 
+        // ---- Stars per accepted curve point --------------------------------------------------------------
+        //
+        // How many stars the curve was actually built from is the difference between a result to trust and one
+        // that happened to land: an eleven-point sweep whose best point found 40 stars is a different object from
+        // one whose worst found 400, and nothing else on the panel says which you have.
+        //
+        // Sourced from SubMeasurementPointCompleted, which already carries each frame's StarDetectionResult, so
+        // no engine or event change is needed. That event is raised ONLY by FocusPointMeasurementAction, so the
+        // initial-HFR and final-validation frames — which are not curve points — never enter the map.
+        // The handler fires concurrently across focuser positions, hence the lock.
+        private readonly object starCountLock = new object();
+
+        private readonly Dictionary<int, List<int>> starCountsByFocuserPosition = new Dictionary<int, List<int>>();
+
+        private int acceptedStarCountMin = -1;
+        private int acceptedStarCountMax = -1;
+
+        /// <summary>Fewest accepted stars found at any point the curve was fitted on; -1 when not known.</summary>
+        public int AcceptedStarCountMin {
+            get => acceptedStarCountMin;
+            private set {
+                if (acceptedStarCountMin != value) {
+                    acceptedStarCountMin = value;
+                    RaisePropertyChanged();
+                    RaisePropertyChanged(nameof(AcceptedStarCountRangeText));
+                    RaisePropertyChanged(nameof(HasAcceptedStarCountRange));
+                }
+            }
+        }
+
+        /// <summary>Most accepted stars found at any point the curve was fitted on; -1 when not known.</summary>
+        public int AcceptedStarCountMax {
+            get => acceptedStarCountMax;
+            private set {
+                if (acceptedStarCountMax != value) {
+                    acceptedStarCountMax = value;
+                    RaisePropertyChanged();
+                    RaisePropertyChanged(nameof(AcceptedStarCountRangeText));
+                    RaisePropertyChanged(nameof(HasAcceptedStarCountRange));
+                }
+            }
+        }
+
+        /// <summary>False collapses the row, which is what a run (or a loaded report) that never recorded star
+        /// counts must do — showing 0 would read as "found no stars".</summary>
+        public bool HasAcceptedStarCountRange => acceptedStarCountMin >= 0 && acceptedStarCountMax >= acceptedStarCountMin;
+
+        /// <summary>"412 – 1,067" over the accepted points, or the single value when the range is degenerate.</summary>
+        public string AcceptedStarCountRangeText =>
+            !HasAcceptedStarCountRange
+                ? string.Empty
+                : acceptedStarCountMin == acceptedStarCountMax
+                    ? acceptedStarCountMin.ToString("N0", CultureInfo.CurrentCulture)
+                    : $"{acceptedStarCountMin.ToString("N0", CultureInfo.CurrentCulture)} – {acceptedStarCountMax.ToString("N0", CultureInfo.CurrentCulture)}";
+
+        /// <summary>Records one frame's accepted-star count against its focuser position. Silently ignores a
+        /// measurement with no star detection behind it (contrast-detection AF), which correctly leaves the row
+        /// collapsed rather than reporting a range of zeros.
+        /// internal so tests can feed per-frame counts without driving a full engine run.</summary>
+        internal void RecordFrameStarCount(int focuserPosition, StarDetectionResult result) {
+            if (result == null) {
+                return;
+            }
+            lock (starCountLock) {
+                if (!starCountsByFocuserPosition.TryGetValue(focuserPosition, out var counts)) {
+                    counts = new List<int>();
+                    starCountsByFocuserPosition[focuserPosition] = counts;
+                }
+                counts.Add(result.DetectedStars);
+            }
+        }
+
+        /// <summary>
+        /// Recomputes the min/max over the points the curve is ACTUALLY fitted on: every measured position minus
+        /// the Grubbs-rejected ones and minus the symmetric-window exclusions. Both sets are re-synced to their
+        /// final values at completion, so this is called from the live per-point handler AND from completion.
+        ///
+        /// <para>A position measured with FramesPerPoint &gt; 1 is pooled by MEAN across its frames, matching how
+        /// <see cref="AutoFocusEngine.TryCompleteFocuserPoint"/> pools that position's HFR into the one point the
+        /// fit sees.</para>
+        ///
+        /// internal so the accepted-vs-rejected partition is testable without driving a full engine run.
+        /// </summary>
+        internal void UpdateAcceptedStarCountRange(
+                IReadOnlyList<AutoFocusRegionPoint> rejectedPoints,
+                IReadOnlyList<AutoFocusRegionPoint> windowExcludedPoints) {
+            var excluded = new HashSet<int>();
+            if (rejectedPoints != null) {
+                foreach (var p in rejectedPoints) {
+                    excluded.Add(p.FocuserPosition);
+                }
+            }
+            if (windowExcludedPoints != null) {
+                foreach (var p in windowExcludedPoints) {
+                    excluded.Add(p.FocuserPosition);
+                }
+            }
+
+            var min = int.MaxValue;
+            var max = int.MinValue;
+            lock (starCountLock) {
+                foreach (var entry in starCountsByFocuserPosition) {
+                    if (entry.Value.Count == 0 || excluded.Contains(entry.Key)) {
+                        continue;
+                    }
+                    var pooled = (int)Math.Round(entry.Value.Average(), MidpointRounding.AwayFromZero);
+                    if (pooled < min) { min = pooled; }
+                    if (pooled > max) { max = pooled; }
+                }
+            }
+
+            if (min > max) {
+                AcceptedStarCountMin = -1;
+                AcceptedStarCountMax = -1;
+            } else {
+                AcceptedStarCountMin = min;
+                AcceptedStarCountMax = max;
+            }
+        }
+
+        /// <summary>Drops the accumulated per-frame counts (a new run, or a failed iteration whose points the
+        /// engine has just discarded, supersedes them) and collapses the row.</summary>
+        private void ClearAcceptedStarCounts() {
+            lock (starCountLock) {
+                starCountsByFocuserPosition.Clear();
+            }
+            AcceptedStarCountMin = -1;
+            AcceptedStarCountMax = -1;
+        }
+
         private void ClearCharts() {
+            ClearAcceptedStarCounts();
             InitialHFR = 0.0d;
             FinalHFR = 0.0d;
             InitialFocuserPosition = -1;
@@ -446,7 +578,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                 Method = profileService.ActiveProfile.FocuserSettings.AutoFocusMethod,
                 CurveFittingType = profileService.ActiveProfile.FocuserSettings.AutoFocusCurveFitting
             };
-            return GenerateReport(
+            var report = GenerateReport(
                 profileService: profileService,
                 starDetector: starDetectionSelector.GetBehavior(),
                 focusPoints: FocusPoints,
@@ -461,8 +593,50 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                 region: region,
                 starDetectionOptions: this.starDetectionOptions,
                 autoFocusOptions: this.autoFocusOptions,
-                duration: duration);
+                duration: duration,
+                acceptedStarCountMin: AcceptedStarCountMin,
+                acceptedStarCountMax: AcceptedStarCountMax);
+            if (report != null) {
+                MarkReportGenerated(report.Timestamp);
+            }
+            return report;
         }
+
+        /// <summary>
+        /// Records the report timestamp of the run this VM itself produced, so <see cref="SetCurveFittings"/> can tell
+        /// "the watcher re-loaded my own just-written chart" (keep the live-only info rows) apart from "a foreign chart
+        /// was loaded" (reset them). Internal so reload-survival tests can stamp it without running a full engine cycle.
+        /// </summary>
+        internal void MarkReportGenerated(DateTime timestamp) {
+            lastGeneratedReportTimestamp = timestamp;
+            // Snapshot the live-only info rows alongside the timestamp. They are about to become recoverable ONLY
+            // from disk: the moment a foreign chart is loaded these three fields are overwritten with that run's
+            // values, and returning here must not depend on this VM's own report still being readable.
+            liveInitialFocuserPosition = InitialFocuserPosition;
+            liveInitialHFR = InitialHFR;
+            liveFinalHFR = FinalHFR;
+            liveAcceptedStarCountMin = AcceptedStarCountMin;
+            liveAcceptedStarCountMax = AcceptedStarCountMax;
+        }
+
+        // Timestamp of the last report generated BY this VM (null until a run completes here). See MarkReportGenerated.
+        private DateTime? lastGeneratedReportTimestamp;
+
+        // The live-only info rows as this VM's own completed run left them, captured by MarkReportGenerated.
+        private int liveInitialFocuserPosition = -1;
+        private double liveInitialHFR;
+        private double liveFinalHFR;
+        private int liveAcceptedStarCountMin = -1;
+        private int liveAcceptedStarCountMax = -1;
+
+        /// <summary>
+        /// How <see cref="SetCurveFittings"/> recovers a FOREIGN chart's own initial position / Start HFR / HFR
+        /// change. Core's <c>LoadChart</c> hands the plugin nothing but the report's <c>Timestamp</c>, so the report
+        /// has to be re-read from disk. Internal and settable so the reload-survival tests can point it at a
+        /// temporary directory holding real report JSON, and so a test can assert the no-report path without
+        /// depending on whatever the developer's own report directory happens to contain.
+        /// </summary>
+        internal ILoadedAutoFocusReportSource LoadedReportSource { get; set; } = new AutoFocusReportDirectorySource(ReportDirectory);
 
         public static AutoFocusReport GenerateReport(
             IProfileService profileService,
@@ -479,7 +653,9 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             DataPoint finalFocusPoint,
             ReportAutoFocusPoint lastAutoFocusPoint,
             StarDetectionRegion region,
-            TimeSpan duration) {
+            TimeSpan duration,
+            int acceptedStarCountMin = -1,
+            int acceptedStarCountMax = -1) {
             try {
                 var report = HocusFocusReport.GenerateReport(
                     profileService,
@@ -496,7 +672,9 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                     region,
                     starDetectionOptions,
                     autoFocusOptions,
-                    duration
+                    duration,
+                    acceptedStarCountMin,
+                    acceptedStarCountMax
                 );
 
                 var reportText = JsonConvert.SerializeObject(report, Formatting.Indented);
@@ -511,11 +689,40 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             }
         }
 
+        /// <summary>
+        /// The sweep geometry to re-render a RELOADED chart with: the per-filter override belonging to the filter
+        /// that run was actually taken through, else the profile.
+        ///
+        /// <para>Keyed on the loaded report's own <c>Filter</c> — which the engine wrote from the resolved
+        /// auto-focus filter — and deliberately NOT on whatever is in the wheel right now: the chart on screen may
+        /// be from another night through another filter, and keying it on the present would be the same
+        /// stale-value class of bug the info-row loading already guards against.</para>
+        /// </summary>
+        private (int StepSize, int OffsetSteps) ResolveReloadedChartSweepGeometry(HocusFocusReport loadedReport) {
+            var focuserSettings = profileService.ActiveProfile.FocuserSettings;
+            var profileGeometry = (focuserSettings.AutoFocusStepSize, focuserSettings.AutoFocusInitialOffsetSteps);
+            var filterName = loadedReport?.Filter;
+            if (perFilterStore?.Enabled != true || string.IsNullOrWhiteSpace(filterName)) {
+                return profileGeometry;
+            }
+            var geometry = perFilterStore.GetSweepGeometry(filterName);
+            if (geometry == null) {
+                return profileGeometry;
+            }
+            return (
+                geometry.HasStepSize ? geometry.StepSize : focuserSettings.AutoFocusStepSize,
+                geometry.HasOffsetSteps ? geometry.InitialOffsetSteps : focuserSettings.AutoFocusInitialOffsetSteps);
+        }
+
         public void SetCurveFittings(string method, string fitting) {
+            // Read ONCE, at the top: the fit below needs the report's filter to resolve this chart's sweep
+            // geometry, and ApplyInfoRowsFromLoadedReport further down needs the report itself.
+            var loadedReport = TryFindLoadedReport(LastAutoFocusPoint?.Timestamp);
             // NINA core's saved-chart reload (AutoFocusToolVM.LoadChart) rebuilds FocusPoints from a
             // saved report's raw Error values and calls this method — another fit entry point, so the
             // same regularization the live engine applies must happen here too.
             var validFocusPoints = WeightRegularization.Regularize(FocusPoints.Where(fp => fp.Y > 0.0).ToList());
+            var windowExcluded = new List<ScatterErrorPoint>();
 
             if (AFMethodEnum.STARHFR.ToString() == method) {
                 if (validFocusPoints.Count() >= 3) {
@@ -528,27 +735,42 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                     }
 
                     if (AFCurveFittingEnum.HYPERBOLIC.ToString() == fitting || AFCurveFittingEnum.TRENDHYPERBOLIC.ToString() == fitting) {
-                        var stepSize = profileService.ActiveProfile.FocuserSettings.AutoFocusStepSize;
-                        // When the option is Hybrid, reproduce the engine's best-fit pick on this saved point set so
-                        // a reloaded run shows the concrete chosen model (and its LOO) instead of falling back to
-                        // Tilted. SelectBestModel returns the already-solved winning fit, so no extra Solve() is needed.
-                        AlglibHyperbolicFitting hf;
-                        var modelForRun = autoFocusOptions.HyperbolicFitModel;
-                        if (modelForRun == HyperbolicFitModel.Hybrid) {
-                            modelForRun = AlglibHyperbolicFitting.SelectBestModel(this.alglibAPI, validFocusPoints, stepSize, autoFocusOptions.WeightedHyperbolicFitEnabled, out hf);
-                            if (hf == null) {
-                                hf = AlglibHyperbolicFitting.Create(this.alglibAPI, modelForRun, validFocusPoints, stepSize, autoFocusOptions.WeightedHyperbolicFitEnabled);
-                                hf.Solve();
+                        var (stepSize, offsetSteps) = ResolveReloadedChartSweepGeometry(loadedReport);
+                        var fitInput = validFocusPoints;
+                        var hf = SolveHyperbolicForPoints(fitInput, stepSize, out var modelForRun);
+
+                        // Behavior A parity for reloaded charts: the engine's final pass excludes points outside
+                        // minimum ± (offsetSteps+0.5)*stepSize and refits on the kept subset (ApplyFinalSymmetricWindow).
+                        // Saved reports carry the FULL measured set, so re-derive the same bounded fit→window→refit
+                        // fixed point here — otherwise a reloaded chart would fit (and fill-render) far points the live
+                        // run excluded. Same guards as the engine: ≤ offsetSteps+1 passes, never below 3 valid points.
+                        if (offsetSteps >= 1 && stepSize > 0) {
+                            for (var pass = 0; pass < offsetSteps + 1; pass++) {
+                                var center = hf.Minimum.X;
+                                if (double.IsNaN(center) || double.IsInfinity(center)) {
+                                    break;
+                                }
+                                var (included, excluded) = AutoFocusEngine.PartitionByFocusWindow(fitInput, center, offsetSteps, stepSize);
+                                if (excluded.Count == 0) {
+                                    break;
+                                }
+                                if (included.Count(p => p.Y > 0.0) < 3) {
+                                    break;
+                                }
+                                windowExcluded.AddRange(excluded);
+                                fitInput = included;
+                                hf = SolveHyperbolicForPoints(fitInput, stepSize, out modelForRun);
+                                if (AFCurveFittingEnum.TRENDHYPERBOLIC.ToString() == fitting) {
+                                    TrendlineFitting = new TrendlineFitting().Calculate(fitInput, method);
+                                }
                             }
-                        } else {
-                            hf = AlglibHyperbolicFitting.Create(this.alglibAPI, modelForRun, validFocusPoints, stepSize, autoFocusOptions.WeightedHyperbolicFitEnabled);
-                            hf.Solve();
                         }
+
                         // Best-focus stability is a one-time computation here (saved-run display), so unlike the
                         // live engine path it is safe to compute it directly after solving the final curve. Use the
                         // resolved concrete model so the LOO matches the chosen curve.
                         hf.LeaveOneOutStdError = AlglibHyperbolicFitting.ComputeLeaveOneOutBestFocusStdError(
-                            this.alglibAPI, modelForRun, validFocusPoints, stepSize, autoFocusOptions.WeightedHyperbolicFitEnabled);
+                            this.alglibAPI, modelForRun, fitInput, stepSize, autoFocusOptions.WeightedHyperbolicFitEnabled);
                         HyperbolicFitting = hf;
                     }
                 }
@@ -556,7 +778,156 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                 TrendlineFitting = new TrendlineFitting().Calculate(validFocusPoints, method);
                 GaussianFitting = new GaussianFitting().Calculate(validFocusPoints);
             }
+
+            // Core's LoadChart replaced FocusPoints/PlotFocusPoints, but it cannot see the plugin-only display state
+            // this method is now responsible for reconciling: the filled/hollow marker split and the live-only info
+            // rows. Without this, a loaded chart renders its curve and summary over the PREVIOUS live run's markers.
+            RebuildDisplaySeriesFromFocusPoints(windowExcluded);
+            // The initial-position / Start-HFR / HFR-change rows are plugin-only: core's LoadChart cannot restore
+            // them, so after ANY load they still describe whichever run was on screen before. Re-populate them from
+            // the LOADED run's own report — which carries all three — falling back to the sentinels (collapsed
+            // rows) when it cannot be found. Leaving the previous run's numbers on screen is the 2026-07-29 field
+            // report; showing 0 as though it were a measurement is the same defect wearing a different hat.
+            //
+            // This runs for THIS VM's own run too, and the 2026-08-06 field report is why. Skipping it when the
+            // timestamps matched was correct for the only sequence it was tested on — the watcher re-loading the
+            // just-written chart, where the live fields are still intact — but wrong after a ROUND TRIP: once a
+            // foreign chart has been loaded those fields already hold the foreign run's values, and "keep what is
+            // on screen" then keeps exactly the wrong thing. Re-reading unconditionally makes the rows a function
+            // of the LOADED run rather than of the path taken to it.
+            ApplyInfoRowsFromLoadedReport(loadedReport, LastAutoFocusPoint?.Timestamp);
             RefreshFinalFocusPointError();
+        }
+
+        /// <summary>
+        /// Re-reads the loaded chart's own report and renders ITS initial focuser position, Start HFR and final HFR
+        /// — the three rows core's <c>LoadChart</c> cannot restore, because they are plugin-only and (for
+        /// <see cref="HocusFocusReport.FinalHFR"/>) not even on the type core deserializes.
+        ///
+        /// <para><b>Fail-visible by construction.</b> Every path that cannot produce a value from THIS report writes
+        /// the sentinel that collapses the row (-1 / 0.0 / 0.0), which is byte-identical to the behaviour before
+        /// this method existed. So the change can only ever add information about the loaded run; it can never
+        /// substitute another run's number, and it can never present a missing value as a measured 0.</para>
+        /// </summary>
+        /// <summary>Reads the saved report for a chart timestamp, or null. Never throws — a chart must still render.</summary>
+        private HocusFocusReport TryFindLoadedReport(DateTime? timestamp) {
+            if (!timestamp.HasValue) {
+                return null;
+            }
+            try {
+                return LoadedReportSource?.TryFind(timestamp.Value);
+            } catch (Exception ex) {
+                // TryFind's contract is not to throw; this is belt-and-braces so a chart still renders.
+                Logger.Debug($"Could not read the loaded AutoFocus report for {timestamp.Value:o}: {ex.Message}");
+                return null;
+            }
+        }
+
+        private void ApplyInfoRowsFromLoadedReport(HocusFocusReport report, DateTime? timestamp) {
+            if (report == null && timestamp.HasValue && timestamp == lastGeneratedReportTimestamp) {
+                // This VM's OWN run, whose report could not be read back (not yet flushed, deleted, or a directory
+                // that has moved). The live values are still the truth for it, so prefer them over collapsing the
+                // rows. This is the one case where a value not sourced from the loaded report is still ABOUT the
+                // loaded run — every other path stays fail-visible.
+                InitialFocuserPosition = liveInitialFocuserPosition;
+                InitialHFR = liveInitialHFR;
+                FinalHFR = liveFinalHFR;
+                AcceptedStarCountMin = liveAcceptedStarCountMin;
+                AcceptedStarCountMax = liveAcceptedStarCountMax;
+                return;
+            }
+            InitialFocuserPosition = ResolveReportInitialFocuserPosition(report);
+            InitialHFR = ResolveReportHfr(report?.InitialFocusPoint?.Value);
+            FinalHFR = ResolveReportHfr(report?.FinalHFR);
+            // The loaded run's own star range, or the collapsed sentinel. Core's LoadChart rebuilds FocusPoints
+            // but carries no per-point star counts, so this row can only ever come from the report.
+            var (starMin, starMax) = ResolveReportStarCountRange(report);
+            AcceptedStarCountMin = starMin;
+            AcceptedStarCountMax = starMax;
+        }
+
+        /// <summary>
+        /// The loaded report's accepted-star range, or <c>(-1, -1)</c> — the collapsed row — for anything that is
+        /// not a coherent recorded pair. A report from core or another auto-focuser has no such field at all and
+        /// lands here, which is correct: it genuinely does not know.
+        /// </summary>
+        private static (int Min, int Max) ResolveReportStarCountRange(HocusFocusReport report) {
+            var min = report?.AcceptedStarCountMin ?? -1;
+            var max = report?.AcceptedStarCountMax ?? -1;
+            return min >= 0 && max >= min ? (min, max) : (-1, -1);
+        }
+
+        /// <summary>
+        /// The loaded report's initial focuser position, or <c>-1</c> ("not known", the same sentinel
+        /// <c>AutoFocusEngine</c> writes when it has none) when the report does not actually record one.
+        ///
+        /// <para>A missing <c>InitialFocusPoint</c> deserializes to <c>new FocusPoint()</c> — <c>Position = 0</c> —
+        /// which is indistinguishable from a genuinely recorded 0. Treating non-positive as "not recorded" means an
+        /// absent value collapses the row instead of claiming the focuser started at 0, and costs only the
+        /// unreachable case of a rig actually focusing at step 0.</para>
+        /// </summary>
+        private static int ResolveReportInitialFocuserPosition(HocusFocusReport report) {
+            var position = report?.InitialFocusPoint?.Position ?? double.NaN;
+            if (!double.IsFinite(position) || position <= 0.0) {
+                return -1;
+            }
+            return (int)Math.Round(position, MidpointRounding.AwayFromZero);
+        }
+
+        /// <summary>
+        /// An HFR from the loaded report, or <c>0.0</c> — the value the XAML's zero-to-collapsed converters read as
+        /// "no row" — for anything that is not a real positive measurement. A report written by core or another
+        /// auto-focuser carries no <see cref="HocusFocusReport.FinalHFR"/> at all and lands here, which is correct:
+        /// that report genuinely does not know the value.
+        /// </summary>
+        private static double ResolveReportHfr(double? value) {
+            var hfr = value ?? double.NaN;
+            return double.IsFinite(hfr) && hfr > 0.0 ? hfr : 0.0;
+        }
+
+        /// <summary>
+        /// Solves the configured hyperbolic model on <paramref name="points"/>. When the option is Hybrid, reproduces
+        /// the engine's best-fit pick on this point set so a reloaded run shows the concrete chosen model (and its LOO)
+        /// instead of falling back to Tilted. SelectBestModel returns the already-solved winning fit, so no extra
+        /// Solve() is needed.
+        /// </summary>
+        private AlglibHyperbolicFitting SolveHyperbolicForPoints(List<ScatterErrorPoint> points, int stepSize, out HyperbolicFitModel resolvedModel) {
+            AlglibHyperbolicFitting hf;
+            resolvedModel = autoFocusOptions.HyperbolicFitModel;
+            if (resolvedModel == HyperbolicFitModel.Hybrid) {
+                resolvedModel = AlglibHyperbolicFitting.SelectBestModel(this.alglibAPI, points, stepSize, autoFocusOptions.WeightedHyperbolicFitEnabled, out hf);
+                if (hf == null) {
+                    hf = AlglibHyperbolicFitting.Create(this.alglibAPI, resolvedModel, points, stepSize, autoFocusOptions.WeightedHyperbolicFitEnabled);
+                    hf.Solve();
+                }
+            } else {
+                hf = AlglibHyperbolicFitting.Create(this.alglibAPI, resolvedModel, points, stepSize, autoFocusOptions.WeightedHyperbolicFitEnabled);
+                hf.Solve();
+            }
+            return hf;
+        }
+
+        /// <summary>
+        /// Rebuilds the marker display series from <see cref="FocusPoints"/> after an external chart load: refills the
+        /// filled series (<see cref="PlotCoreFocusPoints"/>) from the full measured set, then routes the re-derived
+        /// window exclusions through <see cref="ApplyWindowExclusionToDisplay"/> — the same partition the live
+        /// completion handler applies — so excluded points render only as hollow rings and the legend gate refreshes.
+        /// </summary>
+        private void RebuildDisplaySeriesFromFocusPoints(IReadOnlyList<ScatterErrorPoint> windowExcluded) {
+            PlotCoreFocusPoints.Clear();
+            foreach (var fp in FocusPoints) {
+                PlotCoreFocusPoints.AddSorted(fp, focusPointComparer);
+            }
+            var excludedRegionPoints = windowExcluded.Select(p => {
+                var position = (int)Math.Round(p.X);
+                // Show the raw measured error on the hollow ring (like the live path), not the regularized fit weight.
+                var raw = FocusPoints.FirstOrDefault(fp => (int)Math.Round(fp.X) == position);
+                return new AutoFocusRegionPoint() {
+                    FocuserPosition = position,
+                    Measurement = new MeasureAndError() { Measure = p.Y, Stdev = raw?.ErrorY ?? p.ErrorY },
+                };
+            }).ToList();
+            ApplyWindowExclusionToDisplay(excludedRegionPoints);
         }
 
         /// <summary>
@@ -629,7 +1000,10 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                 autoFocusEngine.SubMeasurementPointCompleted += AutoFocusEngine_SubMeasurementPointCompleted;
                 autoFocusEngine.Completed += AutoFocusEngine_Completed;
                 autoFocusEngine.Failed += AutoFocusEngine_Failed;
-                var options = autoFocusEngine.GetOptions();
+                // The imaging filter is passed so a per-filter sweep-geometry override can be resolved for the
+                // filter this run will actually expose through (the engine applies the AF-filter substitution
+                // itself). The wheel-connected gate above already ran.
+                var options = autoFocusEngine.GetOptions(imagingFilter: imagingFilter);
 
                 ApplyFrameReviewOptions(options);
                 var result = await autoFocusEngine.Run(options, imagingFilter, autoFocusRunCts.Token, progress);
@@ -672,12 +1046,23 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
 
         public AutoFocusReport LastReport { get; private set; }
 
-        private String GetAttemptSaveFolder(string saveFolder, int iteration) {
+        private static String GetAttemptSaveFolder(string saveFolder, int iteration) {
             var parentFolder = Path.Combine(saveFolder, $"attempt{iteration:00}");
             if (!Directory.Exists(parentFolder)) {
                 Directory.CreateDirectory(parentFolder);
             }
             return parentFolder;
+        }
+
+        /// <summary>
+        /// Writes the single-region AutoFocus report as <c>attemptNN/autofocus_report_Region0.json</c> under
+        /// <paramref name="saveFolder"/>. The plain AutoFocus pane always analyzes one region, so region 0 is the
+        /// whole report set here (the Inspector's multi-region equivalent is InspectorVM.SaveRegionReports).
+        /// </summary>
+        private static void SaveRegionReport(string saveFolder, int iteration, AutoFocusReport report) {
+            var reportText = JsonConvert.SerializeObject(report, Formatting.Indented);
+            var targetFilePath = Path.Combine(GetAttemptSaveFolder(saveFolder, iteration), "autofocus_report_Region0.json");
+            File.WriteAllText(targetFilePath, reportText);
         }
 
         private void AutoFocusEngine_Completed(object sender, AutoFocusCompletedEventArgs e) {
@@ -694,10 +1079,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                 region: firstRegion.Region,
                 duration: e.Duration);
             if (!string.IsNullOrEmpty(e.SaveFolder)) {
-                var regionIndex = 0;
-                var reportText = JsonConvert.SerializeObject(report, Formatting.Indented);
-                var targetFilePath = Path.Combine(GetAttemptSaveFolder(e.SaveFolder, e.Iteration), $"autofocus_report_Region{regionIndex}.json");
-                File.WriteAllText(targetFilePath, reportText);
+                SaveRegionReport(e.SaveFolder, e.Iteration, report);
             }
 
             var autoFocusInfo = new AutoFocusInfo(report.Temperature, report.CalculatedFocusPoint.Position, report.Filter, report.Timestamp);
@@ -705,6 +1087,37 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
 
             LastReport = report;
             BuildFrameReviewSnapshotIfRequested();
+        }
+
+        /// <summary>
+        /// Completion handler for the reprocess (replay) path. Mirrors <see cref="AutoFocusEngine_Completed"/> minus
+        /// everything that would announce a focus event that never happened: no BroadcastSuccessfulAutoFocusRun, and
+        /// no report written into NINA's watched report directory. <see cref="LastReport"/> is left alone too, so the
+        /// pane keeps showing the report of the run that actually moved the focuser. It does write the per-region
+        /// report when the engine created a save folder (AF Options -> Save), so a re-analysis is as inspectable as
+        /// the live run that produced the frames. Best-effort: the replay has already succeeded by the time this
+        /// runs, so a write failure is logged rather than surfaced through the engine.
+        /// </summary>
+        private void AutoFocusEngine_CompletedReplay(object sender, AutoFocusCompletedEventArgs e) {
+            AutoFocusEngine_CompletedNoReport(sender, e);
+            if (string.IsNullOrEmpty(e.SaveFolder)) {
+                return;
+            }
+            try {
+                var firstRegion = e.RegionHFRs[0];
+                var report = GenerateReport(
+                    initialFocusPosition: e.InitialFocusPosition,
+                    initialHFR: firstRegion.InitialHFR ?? 0.0d,
+                    finalHFR: firstRegion.FinalHFR ?? firstRegion.EstimatedFinalHFR,
+                    filter: e.Filter,
+                    finalFocusPoint: FinalFocusPoint,
+                    lastAutoFocusPoint: LastAutoFocusPoint,
+                    region: firstRegion.Region,
+                    duration: e.Duration);
+                SaveRegionReport(e.SaveFolder, e.Iteration, report);
+            } catch (Exception ex) {
+                Logger.Error(ex, $"Failed to save the reprocessed AutoFocus report to {e.SaveFolder}");
+            }
         }
 
         private void AutoFocusEngine_Failed(object sender, AutoFocusFailedEventArgs e) {
@@ -721,10 +1134,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                 duration: e.Duration);
 
             if (!string.IsNullOrEmpty(e.SaveFolder)) {
-                var regionIndex = 0;
-                var reportText = JsonConvert.SerializeObject(report, Formatting.Indented);
-                var targetFilePath = Path.Combine(GetAttemptSaveFolder(e.SaveFolder, e.Iteration), $"autofocus_report_Region{regionIndex}.json");
-                File.WriteAllText(targetFilePath, reportText);
+                SaveRegionReport(e.SaveFolder, e.Iteration, report);
             }
             LastReport = report;
             // Build the review snapshot even for a failed sweep — seeing why detection struggled is often the most
@@ -734,8 +1144,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
 
         private void AutoFocusEngine_IterationFailed(object sender, AutoFocusFailedEventArgs e) {
             if (!string.IsNullOrEmpty(e.SaveFolder)) {
-                var regionIndex = 0;
-                var firstRegion = e.RegionHFRs[regionIndex];
+                var firstRegion = e.RegionHFRs[0];
                 AutoFocusEngine_CompletedNoReport(sender, e);
                 var report = HocusFocusReport.GenerateReport(
                     profileService: this.profileService,
@@ -752,11 +1161,11 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                     region: firstRegion.Region,
                     hocusFocusStarDetectionOptions: this.starDetectionOptions,
                     hocusFocusAutoFocusOptions: this.autoFocusOptions,
-                    duration: e.Duration);
+                    duration: e.Duration,
+                    acceptedStarCountMin: AcceptedStarCountMin,
+                    acceptedStarCountMax: AcceptedStarCountMax);
 
-                var reportText = JsonConvert.SerializeObject(report, Formatting.Indented);
-                var targetFilePath = Path.Combine(GetAttemptSaveFolder(e.SaveFolder, e.Iteration), $"autofocus_report_Region{regionIndex}.json");
-                File.WriteAllText(targetFilePath, reportText);
+                SaveRegionReport(e.SaveFolder, e.Iteration, report);
             }
 
             FocusPoints.Clear();
@@ -766,6 +1175,9 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             PlotCoreFocusPoints.Clear();
             PlotWindowExcludedFocusPoints.Clear();
             RaisePropertyChanged(nameof(HasWindowExcludedFocusPoints));
+            // The next attempt re-measures from scratch, so this attempt's per-frame counts must not survive into
+            // its range — exactly as its focus points do not survive into its curve.
+            ClearAcceptedStarCounts();
         }
 
         private void AutoFocusEngine_CompletedNoReport(object sender, AutoFocusFinishedEventArgsBase e) {
@@ -812,6 +1224,11 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             // arrives here (empty on the live per-point events). Move them into the hollow-ring overlay and out of the
             // filled/line display series (see ApplyWindowExclusionToDisplay); FocusPoints is left intact.
             ApplyWindowExclusionToDisplay(firstRegion.WindowExcludedPoints);
+
+            // Re-sync the star-count range to the FINAL accepted set, for the same reason the two overlays above
+            // are re-synced: the live per-point events see only the intermediate Grubbs flags and never see the
+            // window exclusions at all.
+            UpdateAcceptedStarCountRange(firstRegion.RejectedPoints, firstRegion.WindowExcludedPoints);
 
             RefreshFinalFocusPointError();
             AutoFocusDuration = e.Duration;
@@ -872,6 +1289,8 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             }
             RaisePropertyChanged(nameof(HasWindowExcludedFocusPoints));
 
+            UpdateAcceptedStarCountRange(e.RejectedPoints, e.WindowExcludedPoints);
+
             this.TrendlineFitting = e.Fittings.TrendlineFitting;
             this.GaussianFitting = e.Fittings.GaussianFitting;
             this.HyperbolicFitting = e.Fittings.HyperbolicFitting;
@@ -917,9 +1336,18 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
         public bool ReviewFramesAvailable => reviewSnapshot?.Frames.Count > 0;
 
         private void AutoFocusEngine_SubMeasurementPointCompleted(object sender, AutoFocusSubMeasurementPointCompletedEventArgs e) {
-            // Standard (non-inspector) AF uses a single region 0; the image is only present when PreserveExposures was
-            // forced on (i.e. frameReviewRequestedForRun). Accumulate one tuple per fired frame.
-            if (!frameReviewRequestedForRun || e.RegionIndex != 0) {
+            // Standard (non-inspector) AF uses a single region 0.
+            if (e.RegionIndex != 0) {
+                return;
+            }
+
+            // Accepted-star count for this frame, accumulated for EVERY run (not just review runs) — it is one int
+            // and it is the only place the panel can learn how many stars the curve was built from.
+            RecordFrameStarCount(e.FocuserPosition, e.StarDetectionResult);
+
+            // The image is only present when PreserveExposures was forced on (i.e. frameReviewRequestedForRun).
+            // Accumulate one tuple per fired frame.
+            if (!frameReviewRequestedForRun) {
                 return;
             }
             if (e.StarDetectionResult is not HocusFocusStarDetectionResult hf || e.Image == null) {
@@ -1051,7 +1479,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                 autoFocusEngine.IterationFailed += AutoFocusEngine_IterationFailed;
                 autoFocusEngine.MeasurementPointCompleted += AutoFocusEngine_MeasurementPointCompleted;
                 autoFocusEngine.SubMeasurementPointCompleted += AutoFocusEngine_SubMeasurementPointCompleted;
-                autoFocusEngine.Completed += AutoFocusEngine_CompletedNoReport;
+                autoFocusEngine.Completed += AutoFocusEngine_CompletedReplay;
 
                 var filterInfo = filterWheelMediator.GetInfo();
                 FilterInfo imagingFilter = null;
@@ -1084,7 +1512,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                     ? await autoFocusEngine.RerunWithRegions(options, savedAttempt, imagingFilter, resolution.CaptureTimeRegions, loadSavedAutoFocusRunCts.Token, this.progress)
                     : await autoFocusEngine.Rerun(options, savedAttempt, imagingFilter, loadSavedAutoFocusRunCts.Token, this.progress);
                 if (result != null) {
-                    // The reprocess path wires Completed -> CompletedNoReport (no report handler), so build the review
+                    // The reprocess path wires Completed -> CompletedReplay (which never sets LastReport), so build the review
                     // snapshot here once the replay has finished and every reloaded frame has been collected.
                     BuildFrameReviewSnapshotIfRequested();
                     InitialFocuserPosition = result.InitialFocuserPosition;
@@ -1100,14 +1528,14 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                 return false;
             } finally {
                 // Detach the per-run engine handlers symmetrically (F28). This path wires Completed ->
-                // AutoFocusEngine_CompletedNoReport and does not subscribe Failed, so the -= list mirrors that exactly.
+                // AutoFocusEngine_CompletedReplay and does not subscribe Failed, so the -= list mirrors that exactly.
                 if (autoFocusEngine != null) {
                     autoFocusEngine.Started -= AutoFocusEngine_AutoFocusStarted;
                     autoFocusEngine.InitialHFRCalculated -= AutoFocusEngine_InitialHFRCalculated;
                     autoFocusEngine.IterationFailed -= AutoFocusEngine_IterationFailed;
                     autoFocusEngine.MeasurementPointCompleted -= AutoFocusEngine_MeasurementPointCompleted;
                     autoFocusEngine.SubMeasurementPointCompleted -= AutoFocusEngine_SubMeasurementPointCompleted;
-                    autoFocusEngine.Completed -= AutoFocusEngine_CompletedNoReport;
+                    autoFocusEngine.Completed -= AutoFocusEngine_CompletedReplay;
                 }
                 ReleaseUnsnapshottedReviewFrames();
                 AutoFocusInProgress = false;

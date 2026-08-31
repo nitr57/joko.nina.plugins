@@ -109,7 +109,8 @@ hardware model, then converts the measured tilt into concrete screw-turn (or ste
 instructions. See [Tilt Adapter Wizard](tilt-adapter-wizard.md).
 
 The arrows describe what the adapter must do: ⬆ means that corner of the adapter plate moves toward
-the objective, ⬇ toward the camera — the same on every rig. The numeric rows each carry the screw
+the objective, ⬇ toward the camera — the same on every rig with the same **Increasing focuser
+position** setting ([below](#which-way-does-your-focuser-travel)). The numeric rows each carry the screw
 rotation that produces the move: `1.25 ⟳` means 1.25 turns clockwise (tighten), `0.50 ⟲`
 counter-clockwise (loosen); stepper adapters show signed steps (`+35 steps`) matching the wizard's
 prompts. A legend at the top of the section defines both conventions and is marked "(assumed)" until
@@ -138,7 +139,8 @@ star-matching, outlier-rejection, and save-images settings (plus **Astigmatic fi
 | Setting | Default | Range | What it does |
 |---|---|---|---|
 | **Eccentricity Grid Width** | 7 | odd, positive | "How many cells wide to divide the sensor pixels when generating a grid of eccentricity vectors … the height will be calculated proportionally." |
-| **Focuser Step Size** | -1 (auto) | -1 or &gt;0 | "How much the focuser moves per step, in microns. If this is set, the adjustment chart will include adjustments in microns." |
+| **Focuser Step Size** | blank | blank or &gt;0 | µm of focuser travel per step. Blank uses the value your focuser driver reports (shown greyed out in the box); a value here overrides it. See [below](#where-the-focuser-step-size-comes-from). |
+| **Increasing focuser position** | Moves camera away from objective (standard) | standard / reversed | Which way your focuser travels. Affects direction labels and diagrams only — see [below](#which-way-does-your-focuser-travel). Also editable under Options → Hocus Focus → Auto Focus. |
 | **Sensor ROI** | 1.0 | 0.1–1.0 | "Uses only a centered portion of the full sensor when evaluating aberration. This is useful if you have a flattener that cannot produce a flat field for your sensor." |
 | **Corners ROI** | 1.0 | 0.1–1.0 | "Reduces the size of the corner regions when performing corners analysis … evaluate only stars closer to the corners than the full 1/9th region. This can be combined with Sensor ROI." |
 | **Sensor Curve Model Enabled** | off | on/off | "Create a paraboloid model of the sensor by creating focus curves for every star. This enables calculation of centering error and curvature … similar to … CCD Inspector." |
@@ -155,19 +157,67 @@ star-matching, outlier-rejection, and save-images settings (plus **Astigmatic fi
 | **Mouse Events Enabled** | on | on/off | "Enable mouse events on charts to scroll, pan, and zoom. Disable this if you don't want the charts to intercept mouse actions." |
 | **Steps** | -1 (auto) | -1 or &gt;0 | "The minimum number of data points needed on each side of the AutoFocus curve minimum. Uses the value set for AutoFocus if blank." |
 | **Step Size** | -1 (auto) | -1 or &gt;0 | "How many focuser steps in between each data point … Uses the value set for AutoFocus if blank." |
-| **Signal Amplification** | 2 | &ge;1 | "Increases the resolution and signal of sensor-model / tilt calibration runs by capturing more, finer-spaced focuser points. The focuser step size is divided by this factor and the number of steps multiplied by it, so the sweep covers the same range with more points (and smaller defocus jumps between adjacent frames, which makes star alignment more reliable) … Set to 1 to disable. Applies to live captures only." Sits above the Options expander, with a live estimate of the images each run will capture. |
+| **Signal Amplification** | 1 | &ge;1 | "Increases the resolution and signal of sensor-model / tilt calibration runs by capturing more, finer-spaced focuser points. The focuser step size is divided by this factor and the number of steps multiplied by it, so the sweep covers the same range with more points (and smaller defocus jumps between adjacent frames, which makes star alignment more reliable) … Applies to live captures only." Off by default: each step multiplies the exposures a sweep captures, and a tilt calibration is seven sweeps. Raise it for faint fields or poor seeing. Sits above the Options expander, with a live estimate of the images each run will capture. |
 | **Center Focuser First** | off | on/off | "When on, a quick standard AutoFocus is run before each live sensor-model / tilt calibration sweep to center the focuser at best focus. The detailed sweep then brackets focus symmetrically, which reduces extreme one-sided defocus frames that fail to align … Has no effect when replaying saved frames." Sits above the Options expander, next to Signal Amplification. |
 | **Exposures per Point** | -1 (auto) | -1 or &ge;1 | "How many exposures to average together for each focuser point. Uses the value set for AutoFocus if blank." |
 | **AutoFocus Timeout** | -1 (auto) | -1 or &gt;0 | "How long, in seconds, after which AutoFocus should time out and fail. Uses the value set for AutoFocus if blank." |
 | **Simple Analysis exposure** (the unlabeled seconds box beside **Take Exposure**) | -1 (auto) | -1 or &gt;0 | "How long of an exposure to take for analysis. Defaults to the Auto Focus exposure duration if not set." Sets the exposure for the single-frame Simple Analysis. |
 | **AutoFocus Exposure** | -1 (auto) | -1 or &gt;0 | Per-frame exposure for a Detailed Analysis sweep; defaults to the AutoFocus exposure duration when blank. The **Simple Analysis exposure** box sets the single-frame exposure instead. |
 | **Looping** | off | on/off | "If enabled, repeatedly take and analyze exposures." |
-| **Save annotated images when rerunning a saved autofocus** | off | on/off | Save registered/alignment images when reanalyzing saved runs. |
-| **Save alignment images** | off | on/off | Also save the pre-alignment star-detection images. |
 
 !!! tip "Sensor ROI protects the tilt fit"
     Restricting analysis to the well-corrected center (**Sensor ROI**) keeps a corner your
     flattener cannot correct from polluting the tilt fit.
+
+### Where the focuser step size comes from
+
+The focuser step size is the scale that turns everything the inspector measures — which is measured in
+focuser positions — into microns. It sets the curvature and tilt effects in µm, the per-screw corrections,
+and the backfocus error.
+
+It resolves in this order:
+
+1. **What you typed** in **Focuser Step Size**, if anything.
+2. **What your focuser driver reports**, if it reports a usable value. Most drivers do, so most people never
+   need to touch this. The greyed-out hint in the box shows the value that will be used.
+3. **Nothing** — micron readouts are hidden rather than guessed.
+
+!!! warning "⚠ differs from the focuser driver"
+    If you type a value and it disagrees with the driver's by more than 1%, the box shows this flag. It is
+    informational: **your** value is the one being used, and if you measured it yourself it is very likely the
+    better of the two.
+
+    It is worth a look, though, because the driver field is optional in ASCOM and some drivers fill it in
+    wrongly. The common failure is a driver reporting `1` — meaning "one step per step" rather than one micron
+    per step — which would scale every micron the inspector reports by whatever your real step size is.
+
+    To go back to the driver's value, clear the box.
+
+### Which way does your focuser travel?
+
+Everything the inspector measures is in focuser positions. Turning one of those measurements into a
+sentence about the real world — "move the sensor **towards** the flattener", "⬆ = toward the
+objective", "Telescope is up" — needs one more fact that no driver reports: whether a **higher**
+focuser position moves your camera *away* from the objective, or *toward* it.
+
+Almost every focuser is the first kind, so **Increasing focuser position** defaults to **Moves camera
+away from objective (standard)**. If your focuser is wired or geared the other way, set it to
+**reversed** and the labels follow.
+
+!!! info "This setting can only be wrong on a label"
+    It affects direction **labels and diagrams only**: the tilt-table captions, the Telescope/Sensor
+    labels on the sensor model, the spacer advice, the ⬆/⬇ motion arrows, and the wizard's direction
+    wording. It can never change a measurement, a stored screw angle, or a correction — the tilt
+    adapter's direction is measured in focuser units, and the focuser convention cancels out of that
+    measurement entirely.
+
+    So if the labels read backwards on your rig, just flip this. Nothing you have already calibrated
+    is affected, no numbers change, and nothing starts turning the other way.
+
+    One narrow exception, worth knowing about: if you skip the wizard's **Measure direction** step and
+    set the adapter direction by hand, that hand-entered direction *is* interpreted through this
+    setting. Running the six-step calibration overwrites it with a measurement that does not depend on
+    this setting at all.
 
 ## Running it from a sequence
 

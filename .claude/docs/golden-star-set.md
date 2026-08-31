@@ -24,6 +24,15 @@ audit must not use it.** Measured against the (correct) detector positions on th
 
 ## The method that works: independent SNR reference + LLM montage QA
 
+0. **The LINEAR FITS the reference reads.** `TestApp export-linear --runs <bank>` writes `<frame>.linear.fits`
+   beside each frame (`snr_ref.py` only parses mono FITS, so this is how XISF and **bayered** runs are covered).
+   "Linear" means no MTF/auto-stretch — it does **not** mean no debayer: a bayered frame is debayered to
+   luminance, because a reference computed on the Bayer MOSAIC while HocusFocus detects on luminance scores every
+   mosaic-only find as an HF recall gap HF could never close. It is deliberately **not** CFA hot-pixel filtered
+   (unlike the detector's own OSC path): the reference's independent blind spots are the point, and hot-pixel
+   rejection is step 2's job. Sidecars written before 2026-07 were exported from the mosaic for the four bayered
+   runs (`SorenVance`, `bobp`, `bobp_m101`, `timmer`) — regenerate those with `--overwrite` before rebuilding
+   their goldens. See `docs/headless-detection-parity-design.md`.
 1. **Independent reference detector (code, on the LINEAR FITS).** A simple local-background + per-pixel SNR +
    connected-component detector (`scratchpad`/`tools`: `snr_ref.py`). It is INDEPENDENT of HocusFocus's gates
    (no contamination/distortion/centering/sensitivity/PSF gates, no wavelet structure stage), so stars it finds
@@ -38,16 +47,36 @@ audit must not use it.** Measured against the (correct) detector positions on th
    is robust to the thumbnail downscale because it needs only "is there a concentrated source under the reticle",
    not coordinates. Use sonnet + low effort (cheap).
 3. **Golden = QA-confirmed candidates**, each carrying its **SNR as the confidence tier** (objective:
-   SNR≥12 high, 8–12 medium, 5–8 low) — better than subjective LLM tiers.
+   SNR≥12 high, 8–12 medium, 5–8 low) — better than subjective LLM tiers. Candidates the montage budget
+   never reached are **unresolved**, not rejected, and are excluded from both the recall and precision
+   denominators.
+   **Significance alone never establishes that a candidate is a star.** On a heavily-defocused run a 3 px
+   noise spike at 12σ peak is *more* significant than a 36 px donut, so auto-confirming on SNR keeps the
+   noise and discards the stars (this is F16, which invalidated two goldens). Auto-confirm therefore also
+   requires **plausibility** — the candidate's size relative to the frame's own star scale — and is
+   disabled outright when `--donut` is set. Integrated SNR does **not** fix this and was measured; see
+   `docs/golden-tier-plausibility-design.md` §2.
 4. **Score** with `TestApp golden eval --params <current|default|optimized> --match centroid --match-radius ~12`
    (centroid match absorbs the few-px reference/HF offset). It reports recall (overall / per-region / per-SNR-tier
    / per-frame) + precision + **FN gate attribution** (`NO CANDIDATE` = structure/candidate-formation gap vs
    `REJECTED:<gate>` = a tunable late gate vs `ACCEPTED-elsewhere`).
 
+   **On the SYNTHETIC bank only**, `golden eval` and `bank-verify` additionally **protect** detections landing on
+   real rendered stars the golden policy dropped (`*.truth.json`, tiers `omitted` / `merged-into`) from the
+   false-positive count, at the match radius — `TestApp/SynthBank/TruthProtection.cs`, [F31](../../docs/followups.md).
+   Real-bank runs have no truth sidecar, so `TruthProtection.LoadForImage` returns null, the path is a no-op, and
+   **real-bank numbers are unaffected**. `bank-verify` announces this (`scoring: golden+truth-protected (N …
+   protected)`); **`golden eval` did not until wave 27**, so for any `golden_eval.txt` produced before then, date
+   the run against **2026-08-03** (`aaf26e8`) to know which metric you are reading. A synthetic-bank precision
+   from before that date is NOT comparable with one from after.
+
 **Donut caveat:** the per-pixel-SNR reference UNDER-counts heavily defocused donuts (their surface brightness is
 spread below the per-pixel threshold), so candidate counts fall toward the focus-sweep extremes. For donut-recall
 on the most-defocused frames, extend the reference with a matched filter (convolve `(img-bg)/σ` with a disk/annulus
-kernel) before thresholding. Near-focus and moderately-defocused frames are reliable as-is.
+kernel) before thresholding. Near-focus and moderately-defocused frames are reliable as-is. **Validate any
+golden with `tools/golden/golden_health.py --run-dir <run>` before trusting its numbers** — it reads the stored
+sidecars alone (no FITS, no LLM) and flags high-tier size collapse, tier–size inversion, and a
+non-responsive width-vs-focus curve.
 
 ## Data format — per-image `golden.json` sidecar
 

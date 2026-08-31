@@ -235,7 +235,7 @@
                         FontSize="11"
                         Foreground="{StaticResource FgDim}"
                         TextWrapping="Wrap"
-                        Text="+ = the wizard's positive step direction (clockwise / tighten); − = the opposite. Screw numbers match the Tilt Adapter Wizard."
+                        Text="+ = the wizard's positive step direction (clockwise / tighten); − = the opposite. Screw names match the Tilt Adapter Wizard."
                         Visibility="{Binding HasMoves, Converter={StaticResource BoolToVis}}" />
                 </StackPanel>
             </Border>
@@ -370,7 +370,7 @@
             </StackPanel>
             <StackPanel Grid.Column="1" VerticalAlignment="Center" Orientation="Horizontal">
                 <Button MinWidth="90" Command="{Binding CancelCommand}">
-                    <TextBlock Margin="12,6" Text="Cancel" />
+                    <TextBlock Margin="12,6" Foreground="{StaticResource ButtonForegroundBrush}" Text="Cancel" />
                 </Button>
                 <Button
                     Margin="8,0,0,0"

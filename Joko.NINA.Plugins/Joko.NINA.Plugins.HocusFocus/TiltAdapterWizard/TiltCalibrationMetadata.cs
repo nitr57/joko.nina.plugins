@@ -47,6 +47,13 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
         public double DirectionDeg { get; set; }
         public double CurvatureRadiusMillimeters { get; set; } = double.NaN;
         public double CurvatureEffectMicronsAtScrewRadius { get; set; } = double.NaN;
+
+        // ---- Task 5: corner-region AF cross-check (a second, independent tilt-plane reading for this same
+        // step, from the inspector's 4-corner region plane rather than the per-star paraboloid) ----
+        // NaN when the corner plane could not be fit for this step, or on a run saved before this shipped.
+        public double CornerTiltPlaneA { get; set; } = double.NaN;
+        public double CornerTiltPlaneB { get; set; } = double.NaN;
+        public double CornerMeanFocuserPosition { get; set; } = double.NaN;
     }
 
     /// <summary>The computed calibration result stored for reference (the wizard/validator re-derive this from
@@ -61,11 +68,33 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
         public double RawAngleDiffDegrees { get; set; }
         public double MoveMagnitudeRatio { get; set; }
 
+        /// <summary>Focuser-frame µm-per-applied-unit implied by the AllInward piston — a free, tilt-fit-independent
+        /// cross-check of <see cref="MeasuredHardwareMicrons"/>. "PerStep" names the applied unit generically,
+        /// same convention as <see cref="MeasuredHardwareMicrons"/>: it is a turn on thread-pitch (screw)
+        /// adapters, a step on stepper adapters. See
+        /// <see cref="TiltCalibrationCalculator.PistonImpliedMicronsPerStep"/>. NaN for 4-step runs (no piston
+        /// measured) or runs saved before this field existed.</summary>
+        public double PistonImpliedMicronsPerStep { get; set; } = double.NaN;
+
         // ---- Confidence (persisted so a saved/replayed run carries its reliability) ----
         public double SignalToNoise { get; set; } = double.NaN;
         public double PredictedAngleUncertaintyDeg { get; set; } = double.NaN;
         public double PitchUncertaintyMicrons { get; set; } = double.NaN;
         public bool ConfidenceIsReliable { get; set; }
+
+        // ---- Task 5: corner-region AF cross-check of this same calibration ----
+        /// <summary>Adapter hardware (µm/turn or µm/step, same convention as <see cref="MeasuredHardwareMicrons"/>)
+        /// recovered from the inspector's 4-corner region plane instead of the per-star paraboloid — a second,
+        /// independent estimate of the same screw moves. NaN when the run didn't capture a corner reading for
+        /// every active step, or on a run saved before this shipped. See
+        /// <see cref="TiltCalibrationCalculator.Calibrate"/>.</summary>
+        public double CornerMeasuredHardwareMicrons { get; set; } = double.NaN;
+
+        /// <summary>Relative disagreement between the paraboloid- and corner-AF-derived per-screw move
+        /// magnitudes (the larger of the two screws' relative differences). Flags, but never replaces, the
+        /// paraboloid-measured pitch — see the design doc's §7 recommendation 2. NaN when uncomputable (missing
+        /// corner data, or a ~0 corner-estimated move magnitude).</summary>
+        public double EstimatorRelativeDifference { get; set; } = double.NaN;
     }
 
     /// <summary>Snapshot of the profile/inspector inputs the tilt measurement reads from live state, so a replay
@@ -96,7 +125,13 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
     /// </summary>
     public sealed class TiltCalibrationMetadata {
 
-        public const int CurrentSchemaVersion = 2;
+        // 4: PixelSizeMicrons became the EFFECTIVE (binning-scaled) pitch of the saved frames rather than the
+        //    profile's native camera pixel size. Purely informational — nothing gates on the version — but a
+        //    file written by version <= 3 at an Auto Focus Binning above 1x1 carries the native pitch, so its
+        //    sensor extent (and every gradient derived from it) is short by the binning factor. The wizard's
+        //    replay is immune either way: it prefers the pitch carried by the tilt plane it just re-fitted from
+        //    the frames themselves (TiltPlaneModel.PixelSizeMicrons) over this stored number.
+        public const int CurrentSchemaVersion = 4;
 
         /// <summary>The six discrete measurement steps, in capture order. Same for 3- and 4-screw adapters.</summary>
         public static readonly string[] StepOrder = {
@@ -122,6 +157,16 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
         public double ScrewThreadPitchMicrons { get; set; } = -1;     // µm/turn (screws)
         public double StepperStepSizeMicrons { get; set; } = -1;      // µm/step (steppers)
         public double ScrewRadiusMillimeters { get; set; }
+
+        /// <summary>
+        /// The EFFECTIVE pixel pitch of the frames this run measured — the camera's native pixel size times
+        /// the Auto Focus Binning they were captured at — because it only ever appears multiplied by a frame
+        /// dimension to get the sensor's physical extent, and the saved frames are binned. Seeded from the
+        /// profile's native <c>CameraSettings.PixelSize</c> when the run starts (no frame exists yet) and
+        /// overwritten with the value the calibration actually used once the run completes, so a saved run is
+        /// self-describing for replay and for the headless TestApp validator. Identical to the native pixel
+        /// size for the usual 1x1 case.
+        /// </summary>
         public double PixelSizeMicrons { get; set; }
         public double FocuserStepSizeMicrons { get; set; }
         public double CalibrationAppliedAmount { get; set; } = 1.0;   // turns/steps applied per screw step

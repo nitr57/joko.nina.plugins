@@ -25,6 +25,7 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
+using TestApp.SynthBank;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
@@ -43,10 +44,15 @@ namespace TestApp {
     ///
     /// Usage:
     ///   TestApp golden eval --runs &lt;dir&gt; [--golden &lt;dir&gt;] [--params current|default|optimized] [--opt-results &lt;dir&gt;]
-    ///       [--match center|iou|both] [--iou 0.3] [--label &lt;name&gt;] [--annotate] [--run &lt;runId&gt;] [--profile-id &lt;guid&gt;]
+    ///       [--match center|iou|both] [--iou 0.3] [--match-radius 0] [--pixel-scale header|profile]
+    ///       [--label &lt;name&gt;] [--annotate] [--run &lt;runId&gt;] [--profile-id &lt;guid&gt;]
     ///       [--defocus-donut] [--defocus-gates] [--defocus-structure] [--structure-layer-boost N]
     ///       [--defocus-size-ref V] [--defocus-min-factor V] [--defocus-center-factor V]
     ///       [--donut-morph-close N] [--donut-hole-fraction V] [--donut-streak-ecc V] [--donut-bloom-radius V]
+    ///
+    /// <c>--pixel-scale</c> (V-P1) and the dataset-provided <c>matchRadiusPx</c> (V-P2) are documented on
+    /// <see cref="BankVerifyRunner"/>'s identical seam; both default to reading the run's OWN frame header /
+    /// dataset metadata rather than one bank-wide value from the active profile / CLI default.
     /// </summary>
     internal static class GoldenEvalRunner {
 
@@ -71,9 +77,23 @@ namespace TestApp {
             public int FnAcceptedElsewhere;
             public int FnNoCandidate;
             public Dictionary<string, int> FnByGate = new Dictionary<string, int>(StringComparer.Ordinal);
+
+            // F46: the same attribution restricted to the HIGH confidence tier (peak SNR >= 20, the tier the
+            // checked-in recallHighMin bands are scored on). The aggregate attribution above mixes every tier, so
+            // on D12 it explains 107 false negatives of which only 20 are bright -- reading it as an explanation of
+            // a recall@high movement is an inference, not a measurement. These three make it a measurement.
+            public int FnHighAcceptedElsewhere;
+            public int FnHighNoCandidate;
+            public Dictionary<string, int> FnHighByGate = new Dictionary<string, int>(StringComparer.Ordinal);
             public int MatchedHigh, TotalHigh, MatchedHighMed, TotalHighMed, MatchedAll, TotalAll;
             public Dictionary<int, PrecisionRecall> PerRegion = new Dictionary<int, PrecisionRecall>();
             public double DefocusOffset; // |focuser - best| in steps (filled later)
+
+            /// <summary>W27 (A): this frame's truth-related disclosures — scoringMode's input, protectedStars,
+            /// protectedDetections, truthViolations, scoredFraction and precisionNull. Carried on the frame so
+            /// <see cref="WriteReports"/> is passed the truth dispositions it previously was not: every stored
+            /// golden_eval report was written by a truth-protected instrument that could not say so.</summary>
+            public TruthDisclosureFrame Truth = new TruthDisclosureFrame();
         }
 
         public static async Task Run(string[] args) {
@@ -83,7 +103,8 @@ namespace TestApp {
 
             var runsDir = DiagnosticUtil.GetArg(args, "--runs");
             if (string.IsNullOrWhiteSpace(runsDir)) {
-                Console.WriteLine("Usage: TestApp golden eval --runs <dir> [--golden <dir>] [--params current|default|optimized] [--opt-results <dir>] [--match center|iou|both] [--iou 0.3] [--label <name>] [--annotate] ...");
+                Console.WriteLine("Usage: TestApp golden eval --runs <dir> [--golden <dir>] [--params current|default|optimized] [--opt-results <dir>] [--match center|iou|both] [--iou 0.3] [--match-radius 0] [--pixel-scale header|profile] [--label <name>] [--annotate] [--detection-binning 1|2|3|4] ...");
+                Console.WriteLine("  --detection-binning N: detect at software binning N (PixelScale carries the factor, as the app does).");
                 return;
             }
             var profileId = DiagnosticUtil.GetArg(args, "--profile-id");
@@ -92,7 +113,14 @@ namespace TestApp {
             var optResults = DiagnosticUtil.GetArg(args, "--opt-results");
             var matchArg = (DiagnosticUtil.GetArg(args, "--match") ?? "both").Trim().ToLowerInvariant();
             var tau = ParseDouble(DiagnosticUtil.GetArg(args, "--iou"), 0.3);
+            // CLI default stays 0.0 (unchanged behavior) — see EvalRun for why 0 is dangerous in centroid mode and
+            // how a synthetic dataset's own synthetic_meta.json overrides this per run (V-P2).
             var matchRadius = ParseDouble(DiagnosticUtil.GetArg(args, "--match-radius"), 0.0);
+            // header (default): PixelScaleForFrame reads each run's OWN frame header — see BankVerifyRunner's
+            // identical flag for the full rationale (V-P1). profile: the exact pre-V-P1 behavior, kept as an
+            // escape hatch.
+            var pixelScaleMode = string.Equals(DiagnosticUtil.GetArg(args, "--pixel-scale"), "profile", StringComparison.OrdinalIgnoreCase)
+                ? "profile" : "header";
             var label = DiagnosticUtil.GetArg(args, "--label");
             var annotate = DiagnosticUtil.HasFlag(args, "--annotate");
             var runFilter = DiagnosticUtil.GetArg(args, "--run");
@@ -110,13 +138,22 @@ namespace TestApp {
             if (activeProfile == null) {
                 throw new InvalidOperationException("No active NINA profile could be loaded. Pass --profile-id, or run NINA once to create a profile.");
             }
-            var guid = PluginOptionsAccessor.GetAssemblyGuid(typeof(StarDetectionOptions));
-            var accessor = new PluginOptionsAccessor(profileService, guid.Value);
+            // Detector settings come from the harness's LOCAL settings file, not the NINA profile: a
+            // profile-sourced value is mutable machine state nothing records, and the ACTIVE profile can
+            // even be a different telescope between runs. See HarnessSettingsStore.
+            var harnessSettings = HarnessSettingsStore.Resolve(args, profileService, activeProfile);
+            var accessor = harnessSettings.Accessor;
             var options = new StarDetectionOptions(profileService, accessor);
+
+            // V-P1: the pre-change bank-wide value — "profile" mode's value AND "header" mode's fallback when a
+            // run's own frame header carries no usable pixel size / focal length. See BankVerifyRunner for the
+            // identical computation and rationale.
+            const int binning = 1;
+            var profilePixelScale = MathUtility.ArcsecPerPixel(activeProfile.CameraSettings.PixelSize, activeProfile.TelescopeSettings.FocalLength) * binning;
 
             Directory.CreateDirectory(outDir);
             Console.WriteLine($"Profile: {activeProfile.Name} ({activeProfile.Id})");
-            Console.WriteLine($"Output: {outDir}  (params={mode}, match={matchMode}, iou={tau})");
+            Console.WriteLine($"Output: {outDir}  (params={mode}, match={matchMode}, iou={tau}, pixelScale={pixelScaleMode})");
 
             var discovery = OptimizationRunDiscovery.Discover(runsDir);
             if (discovery.Runs.Count == 0) {
@@ -129,24 +166,40 @@ namespace TestApp {
                 if (!string.IsNullOrWhiteSpace(runFilter) && !string.Equals(run.RunId, runFilter, StringComparison.OrdinalIgnoreCase)) {
                     continue;
                 }
-                await EvalRun(run, goldenDirArg, mode, optResults, matchMode, tau, matchRadius, label, annotate, outDir,
-                    options, activeProfile, profileService, detector, args);
+                await EvalRun(run, runsDir, goldenDirArg, mode, optResults, matchMode, tau, matchRadius, label, annotate, outDir,
+                    options, activeProfile, profileService, detector, args, harnessSettings, profilePixelScale, pixelScaleMode);
             }
             Console.WriteLine("Done.");
         }
 
-        private static async Task EvalRun(OptimizationRunDiscovery.DiscoveredRun run, string goldenDirArg, string mode,
+        private static async Task EvalRun(OptimizationRunDiscovery.DiscoveredRun run, string runsRoot, string goldenDirArg, string mode,
             string optResults, GoldenMatchMode matchMode, double tau, double matchRadius, string label, bool annotate, string outRoot,
-            StarDetectionOptions options, IProfile activeProfile, ProfileService profileService, StarDetector detector, string[] args) {
+            StarDetectionOptions options, IProfile activeProfile, ProfileService profileService, StarDetector detector, string[] args,
+            HarnessSettingsStore.Resolved harnessSettings, double profilePixelScale, string pixelScaleMode) {
 
             var runFolder = Path.GetDirectoryName(run.Frames.First().Path);
-            var p = BuildEvalParams(options, activeProfile, mode, optResults, runFolder, args, out var sourceLabel);
+            var p = BuildEvalParams(options, mode, optResults, runFolder, args, out var sourceLabel);
             var paramsLabel = string.IsNullOrWhiteSpace(label) ? sourceLabel : label;
             var bestFocuser = ReadBestFocuser(runFolder);
             var stepSize = InferStep(run);
 
             var runOut = Path.Combine(outRoot, OptimizationRunDiscovery.SanitizeForFileName(run.RunId));
             Directory.CreateDirectory(runOut);
+
+            // V-P2: match radius FOR THIS RUN — the synthetic bank's own matchRadiusPx (dataset root, one level
+            // above this run's frame folder) wins over the CLI/default when present; see SyntheticDatasetMeta and
+            // BankVerifyRunner's identical seam. The CLI default here is 0.0 (unchanged by this work), which
+            // silently matches NOTHING in centroid mode (GoldenGeometry requires radius > 0), so that combination
+            // gets a loud warning below rather than a quietly empty report.
+            var syntheticMatchRadius = SyntheticDatasetMeta.TryReadMatchRadiusPx(runFolder, runsRoot);
+            var effectiveMatchRadius = syntheticMatchRadius ?? matchRadius;
+            var matchRadiusSource = syntheticMatchRadius.HasValue ? "synthetic_meta.json" : "CLI/default";
+            if (matchMode == GoldenMatchMode.Centroid && effectiveMatchRadius <= 0.0) {
+                Console.WriteLine($"  WARNING: centroid match mode with matchRadius={effectiveMatchRadius} matches NOTHING " +
+                    "(GoldenGeometry requires radius > 0) -- every golden star will be a false negative. Pass --match-radius, " +
+                    "or use a synthetic dataset whose synthetic_meta.json carries matchRadiusPx.");
+            }
+            Console.WriteLine($"  matchRadius: {Fmt(effectiveMatchRadius)}px ({matchRadiusSource})");
 
             // Optional focuser-position filter (sweep on a single representative frame quickly).
             var framesArg = DiagnosticUtil.GetArg(args, "--frames");
@@ -159,6 +212,14 @@ namespace TestApp {
                     }
                 }
             }
+
+            // V-P1: pixel scale FOR THIS RUN, resolved once from the first frame this loop actually processes (the
+            // first with a golden sidecar, honoring --frames when given) — see BuildEvalParams and BankVerifyRunner
+            // for the identical seam/rationale. p.PixelScale is set the first time through the loop, before the
+            // first Detect call, so every frame in this run is detected at the same value.
+            var pixelScaleResolved = false;
+            var effectivePixelScale = double.NaN;
+            string pixelScaleSource = null;
 
             var frameEvals = new List<FrameEval>();
             foreach (var frame in run.Frames.OrderBy(f => f.FocuserPosition)) {
@@ -175,15 +236,56 @@ namespace TestApp {
                     continue;
                 }
 
-                using var floatMat = await DiagnosticUtil.LoadFloatMat(frame.Path, profileService);
-                var fullW = floatMat.Cols;
-                var fullH = floatMat.Rows;
+                // Detect on the IRenderedImage, exactly as the live app does: the CFA hotpixel filter and the
+                // debayer then run INSIDE Detect at these params (see DiagnosticUtil.LoadRenderedImage). Recall and
+                // precision are only meaningful when the harness scores the image the app actually detects on.
+                var rendered = await DiagnosticUtil.LoadRenderedImage(frame.Path, profileService);
+
+                if (!pixelScaleResolved) {
+                    pixelScaleResolved = true;
+                    if (pixelScaleMode == "profile") {
+                        effectivePixelScale = profilePixelScale;
+                        pixelScaleSource = "profile (forced via --pixel-scale profile)";
+                    } else {
+                        var firstFrameMeta = rendered.RawImageData?.MetaData;
+                        var headerScale = HarnessSettingsStore.PixelScaleForFrame(firstFrameMeta, harnessSettings, out var headerSource);
+                        if (double.IsFinite(headerScale)) {
+                            effectivePixelScale = headerScale;
+                            pixelScaleSource = headerSource;
+                        } else {
+                            effectivePixelScale = profilePixelScale;
+                            pixelScaleSource = $"profile (fallback: {headerSource})";
+                        }
+                    }
+                    // PixelScale carries the software binning factor, exactly as
+                    // HocusFocusStarDetection.ApplyDetectionImageContext does (`pixelScale * softwareBinning`):
+                    // detection reasons in BINNED pixels. Without this a --detection-binning 2 run would evaluate
+                    // every pixel-scale-dependent gate at half the scale it is actually analyzing at.
+                    var detectionBinningFactor = Math.Max(1, p.DetectionBinning);
+                    p.PixelScale = effectivePixelScale * detectionBinningFactor;
+                    Console.WriteLine($"  pixelScale: {Fmt(effectivePixelScale)} arcsec/px ({pixelScaleSource})"
+                        + (detectionBinningFactor > 1 ? $"; detectionBinning {detectionBinningFactor} -> detecting at {Fmt(p.PixelScale)} arcsec/binned-px" : string.Empty));
+
+                    // F39(b) wave 8: `optimize` now DEFAULTS to each run's derived detection binning. `golden eval`
+                    // deliberately does NOT — it is the instrument every prior wave's golden arm was measured with,
+                    // and silently re-basing it would re-baseline those comparisons rather than extend them (F41).
+                    // What it does instead is SAY when this invocation disagrees with the run's own physics, so the
+                    // two harnesses cannot disagree QUIETLY. A run scored at the wrong factor is now a stated fact
+                    // in the report rather than something a reader has to know to go and check.
+                    var derivedFactor = HarnessSettingsStore.ResolveRunDetectionBinningFactor(runFolder, null, out var derivedSource);
+                    if (derivedFactor != detectionBinningFactor) {
+                        Console.WriteLine($"  NOTE: this run's derived detection binning is {derivedFactor} "
+                            + $"({derivedSource}) but it is being scored at {detectionBinningFactor}. "
+                            + "Pass --detection-binning to score it at its own factor; `optimize` uses the derived one by default.");
+                    }
+                }
+
+                var fullW = rendered.RawImageData.Properties.Width;
+                var fullH = rendered.RawImageData.Properties.Height;
                 var regions = ReadRegions(runFolder, fullW, fullH);
 
-                HocusFocusStarDetectorResult result;
-                using (var clone = floatMat.Clone()) {
-                    result = await detector.Detect(clone, p, null, CancellationToken.None);
-                }
+                // Detect(IRenderedImage) builds its own source Mat per call, so the caller's image is never mutated.
+                var result = await detector.Detect(rendered, p, null, CancellationToken.None);
 
                 var stars = result.DetectedStars ?? new List<Star>();
                 var det = stars.Select(s => new DetBox(RectD.FromRect(s.StarBoundingBox), s.Center.X, s.Center.Y)).ToList();
@@ -191,7 +293,29 @@ namespace TestApp {
                 var rejected = result.RejectedCandidates ?? new List<RejectedCandidateRecord>();
 
                 var goldenRects = gf.Stars.Select(b => new RectD(b.X, b.Y, b.W, b.H)).ToList();
-                var match = GoldenMatch.Match(goldenRects, det, matchMode, tau, matchRadius);
+                // Unresolved candidates are neither stars nor confirmed non-stars, so they are absent from
+                // goldenRects (no effect on recall) and are subtracted from the false positives below.
+                // F31: the golden's own `unresolved` boxes PLUS the real-but-unboxed truth stars the golden
+                // policy dropped (`omitted` / `merged-into`). Without the second group, every detection of a
+                // sub-3.5-SNR real star is charged as a false positive — 96% of the synthetic bank's reported
+                // false positives were real stars. No sidecar (the real bank) => identical to before.
+                //
+                // The truth half uses the CENTROID predicate (the one matching itself uses) rather than
+                // GoldenMatch.Covers, which dilates each rect by the detection's own bounding box and so protects
+                // a wide donut detection far past the match radius. Kept identical to BankVerifyRunner so the two
+                // harnesses cannot disagree about what a false positive is.
+                var truthDispositions = TruthProtection.LoadForImage(frame.Path);
+                var unresolvedRects = (gf.Unresolved ?? new List<GoldenStarBox>())
+                    .Select(b => new RectD(b.X, b.Y, b.W, b.H)).ToList();
+                var match = GoldenMatch.Match(goldenRects, det, matchMode, tau, effectiveMatchRadius);
+                // W27 (A): the unresolved-excluded list is NAMED rather than inlined, so `protectedDetections` —
+                // how much protection was actually EXERCISED — is the difference between it and the scored list
+                // instead of something a reader has to re-derive. Identical call, identical arguments, identical
+                // result: this is a rename, and the scored numbers below are byte-for-byte what they were.
+                var falsePositivesBeforeProtection = GoldenMatch.ExcludeUnresolved(match.FalsePositives, det, unresolvedRects);
+                var falsePositives = TruthProtection.ExcludeProtected(
+                    falsePositivesBeforeProtection,
+                    det, TruthProtection.ProtectionCenters(truthDispositions), effectiveMatchRadius);
 
                 var fe = new FrameEval {
                     FocuserPosition = frame.FocuserPosition,
@@ -199,12 +323,20 @@ namespace TestApp {
                     GoldenCount = gf.Stars.Count,
                     Accepted = stars.Count,
                     TP = match.Pairs.Count,
-                    FP = match.FalsePositives.Count,
+                    FP = falsePositives.Count,
                     FN = match.FalseNegatives.Count,
                     DefocusOffset = bestFocuser.HasValue && stepSize > 0
                         ? Math.Abs(frame.FocuserPosition - bestFocuser.Value) / (double)stepSize
                         : double.NaN
                 };
+
+                // W27 (A): the four disclosures bank-verify carries and this harness did not. REPORT-ONLY by
+                // construction — Measure is handed the results the scoring path already produced and never
+                // re-runs, re-orders or re-filters them, and its null control works on a copy of `det`.
+                fe.Truth = TruthDisclosure.Measure(
+                    truthDispositions, goldenRects, unresolvedRects, det,
+                    falsePositivesBeforeProtection, falsePositives, match.Pairs.Count,
+                    matchMode, tau, effectiveMatchRadius, fullW, fullH);
 
                 // Per-confidence recall (cuts: high; high+med; all). A golden box is "matched" iff it is in a TP pair.
                 var matchedGolden = new HashSet<int>(match.Pairs.Select(x => x.Golden));
@@ -216,19 +348,37 @@ namespace TestApp {
                     if (rank >= 3) { fe.TotalHigh++; if (matched) fe.MatchedHigh++; }
                 }
 
-                // FN attribution.
+                // FN attribution, tallied for every tier AND separately for the high tier (F46), plus a per-star
+                // dump so a specific missed star can be looked up by position instead of inferred from a total.
+                var fnCsv = new StringBuilder("x,y,w,h,confidence,disposition,gate\n");
                 foreach (var gi in match.FalseNegatives) {
                     var cls = BoxMatcher.Classify(goldenRects[gi], acceptedBounds, rejected);
+                    var isHigh = GoldenConfidence.Rank(gf.Stars[gi].Confidence) >= 3;
+                    string disposition, gate = string.Empty;
                     if (cls.Kind == BoxClassification.Accepted) {
                         fe.FnAcceptedElsewhere++;
+                        if (isHigh) { fe.FnHighAcceptedElsewhere++; }
+                        disposition = "accepted-elsewhere";
                     } else if (cls.Kind == BoxClassification.Rejected) {
-                        var gate = cls.Gate ?? "Unknown";
+                        gate = cls.Gate ?? "Unknown";
                         fe.FnByGate.TryGetValue(gate, out var c);
                         fe.FnByGate[gate] = c + 1;
+                        if (isHigh) {
+                            fe.FnHighByGate.TryGetValue(gate, out var hc);
+                            fe.FnHighByGate[gate] = hc + 1;
+                        }
+                        disposition = "rejected";
                     } else {
                         fe.FnNoCandidate++;
+                        if (isHigh) { fe.FnHighNoCandidate++; }
+                        disposition = "no-candidate";
                     }
+                    var b = gf.Stars[gi];
+                    fnCsv.AppendLine($"{b.X.ToString("F1", CultureInfo.InvariantCulture)},{b.Y.ToString("F1", CultureInfo.InvariantCulture)}," +
+                        $"{b.W.ToString("F1", CultureInfo.InvariantCulture)},{b.H.ToString("F1", CultureInfo.InvariantCulture)}," +
+                        $"{b.Confidence},{disposition},{gate}");
                 }
+                File.WriteAllText(Path.Combine(runOut, $"false_negatives_f{frame.FocuserPosition}.csv"), fnCsv.ToString());
 
                 // Per-region (assign golden & detected to regions by center).
                 foreach (var region in regions) {
@@ -240,7 +390,7 @@ namespace TestApp {
                         .ToHashSet();
                     var tp = match.Pairs.Count(pr => gIdx.Contains(pr.Golden));
                     var fn = match.FalseNegatives.Count(gi => gIdx.Contains(gi));
-                    var fp = match.FalsePositives.Count(di => dIdx.Contains(di));
+                    var fp = falsePositives.Count(di => dIdx.Contains(di));
                     fe.PerRegion[region.Index] = PrecisionRecall.Compute(tp, fp, fn);
                 }
 
@@ -258,7 +408,10 @@ namespace TestApp {
                     $"P={Fmt(PrecisionRecall.Compute(fe.TP, fe.FP, fe.FN).Precision)} R={Fmt(PrecisionRecall.Compute(fe.TP, fe.FP, fe.FN).Recall)}");
 
                 if (annotate) {
-                    WriteAnnotated(floatMat, gf, stars, match, runOut, frame.FocuserPosition);
+                    // Display only (debayered luminance for an OSC frame, never CFA-filtered) — the overlay boxes
+                    // are full-frame pixel coordinates, which the debayer preserves.
+                    using var displayMat = RenderedImageLoading.ToDebayeredLuminanceMat(rendered);
+                    WriteAnnotated(displayMat, gf, stars, match, runOut, frame.FocuserPosition);
                 }
             }
 
@@ -266,20 +419,39 @@ namespace TestApp {
                 Console.WriteLine($"  run '{run.RunId}': no per-image golden sidecars found; nothing scored.");
                 return;
             }
-            WriteReports(runOut, run.RunId, paramsLabel, sourceLabel, p, frameEvals);
+
+            // W27 (A): say, on the console and before the report, what this run was actually scored under. The
+            // wording is BankVerifyRunner's verbatim, so the two harnesses cannot drift apart and a grep for
+            // `scoring:` finds both. The mode is DERIVED from how many frames carried a sidecar -- a hardcoded
+            // label here would silently misattribute every stored report, which is the defect being repaired.
+            var truthTotal = TruthDisclosure.Aggregate(frameEvals.Select(f => f.Truth));
+            var framesWithTruth = TruthDisclosure.FramesWithTruth(frameEvals.Select(f => f.Truth));
+            Console.WriteLine(TruthDisclosure.ScoringLine(framesWithTruth, truthTotal.ProtectedStars));
+            Console.WriteLine(TruthDisclosure.ProtectedDetectionsLine(truthTotal.ProtectedDetections, truthTotal.ProtectedStars));
+            if (truthTotal.TruthViolations > 0) {
+                // Loud on purpose, exactly as bank-verify is: truth is complete by construction, so this has an
+                // exact answer and the answer must be 0.
+                Console.WriteLine(TruthDisclosure.ViolationLine(run.RunId, truthTotal.TruthViolations));
+                Logger.Warning($"golden eval {run.RunId}: {truthTotal.TruthViolations} scored false positives land within the match radius of a truth star (F31 regression)");
+            }
+
+            WriteReports(runOut, run.RunId, paramsLabel, sourceLabel, p, frameEvals, matchMode, tau, effectiveMatchRadius,
+                effectivePixelScale, pixelScaleSource, matchRadiusSource);
         }
 
         // ---- Params bundle ---------------------------------------------------------------------------------
 
-        private static StarDetectorParams BuildEvalParams(StarDetectionOptions options, IProfile activeProfile, string mode,
+        private static StarDetectorParams BuildEvalParams(StarDetectionOptions options, string mode,
             string optResults, string runFolder, string[] args, out string sourceLabel) {
 
             var p = mode == "default"
                 ? HocusFocusStarDetection.BuildDefaultStarDetectorParams()
                 : HocusFocusStarDetection.BuildStarDetectorParams(options);
 
-            const int binning = 1;
-            p.PixelScale = MathUtility.ArcsecPerPixel(activeProfile.CameraSettings.PixelSize, activeProfile.TelescopeSettings.FocalLength) * binning;
+            // V-P1: PixelScale is NOT set here — it depends on the run's first frame header (or the profile
+            // fallback) and is resolved once the caller (EvalRun) has actually loaded that frame. Setting it here
+            // would mean either loading a frame early just for this, or reproducing the pre-V-P1 bug of one
+            // profile-wide value for every run. See EvalRun's "V-P1: pixel scale FOR THIS RUN" block.
             p.Region = StarDetectionRegion.Full;
             p.ModelPSF = false;
             p.SaveIntermediateFilesPath = string.Empty;
@@ -326,6 +498,12 @@ namespace TestApp {
             Dbl("--min-hfr", v => p.MinHFR = v, "minHFR");
             Dbl("--star-center-tolerance", v => p.StarCenterTolerance = v, "centerTol");
             Int("--adaptive-block", v => p.AdaptiveNoiseBlockSize = v, "adaptiveBlock");  // adaptive-binarization grid (candidate formation)
+            // F39(b): software detection binning. Only the FACTOR is set here — PixelScale carries the factor too,
+            // and it is resolved per run from the frame header AFTER this method (see the p.PixelScale assignment in
+            // the frame loop), so multiplying it here would be overwritten. That assignment applies the factor.
+            // Clamped through DetectionBinningResolver so the flag cannot express a factor the detector rejects.
+            Int("--detection-binning", v => p.DetectionBinning = DetectionBinningResolver.ToFactor(
+                DetectionBinningResolver.ToSetting(v)), "detBin");
             if (DiagnosticUtil.HasFlag(args, "--adaptive-binarize")) { p.LocallyAdaptiveBinarization = true; notes.Add("adaptiveBinarize"); }
             if (notes.Count > 0) {
                 sourceLabel += " +params[" + string.Join(",", notes) + "]";
@@ -486,11 +664,15 @@ namespace TestApp {
         // ---- Reporting -------------------------------------------------------------------------------------
 
         private static void WriteReports(string runOut, string runId, string paramsLabel, string sourceLabel,
-            StarDetectorParams p, List<FrameEval> frames) {
+            StarDetectorParams p, List<FrameEval> frames, GoldenMatchMode matchMode, double tau, double matchRadius,
+            double pixelScale, string pixelScaleSource, string matchRadiusSource) {
 
-            // CSV (per-frame).
+            // CSV (per-frame). W27 (A): the truth disclosures are APPENDED at the end and never inserted -- the
+            // score_*.py scorers across nine wave roots index this file BY POSITION, so an inserted column
+            // silently re-labels every number to its right.
             var csv = new StringBuilder();
-            csv.AppendLine("focuser,params,golden,accepted,TP,FP,FN,precision,recall,f1,recallHigh,recallHighMed,recallAll,fnAcceptedElsewhere,fnNoCandidate,fnRejected");
+            csv.AppendLine("focuser,params,golden,accepted,TP,FP,FN,precision,recall,f1,recallHigh,recallHighMed,recallAll,fnAcceptedElsewhere,fnNoCandidate,fnRejected"
+                + "," + TruthDisclosure.CsvHeaderSuffix);
             foreach (var f in frames.OrderBy(f => f.FocuserPosition)) {
                 var pr = PrecisionRecall.Compute(f.TP, f.FP, f.FN);
                 var fnRej = f.FnByGate.Values.Sum();
@@ -498,7 +680,8 @@ namespace TestApp {
                     f.FocuserPosition, Csv(paramsLabel), f.GoldenCount, f.Accepted, f.TP, f.FP, f.FN,
                     Fmt(pr.Precision), Fmt(pr.Recall), Fmt(pr.F1),
                     Ratio(f.MatchedHigh, f.TotalHigh), Ratio(f.MatchedHighMed, f.TotalHighMed), Ratio(f.MatchedAll, f.TotalAll),
-                    f.FnAcceptedElsewhere, f.FnNoCandidate, fnRej));
+                    f.FnAcceptedElsewhere, f.FnNoCandidate, fnRej,
+                    TruthDisclosure.CsvRowSuffix(f.Truth)));
             }
             File.WriteAllText(Path.Combine(runOut, "golden_eval_frames.csv"), csv.ToString());
 
@@ -516,9 +699,20 @@ namespace TestApp {
 
             // Text summary.
             var sb = new StringBuilder();
-            sb.AppendLine($"GOLDEN EVAL — run '{runId}'");
+            sb.AppendLine($"GOLDEN EVAL -- run '{runId}'");
             sb.AppendLine($"params: {paramsLabel}   (source: {sourceLabel})");
-            sb.AppendLine($"match: center-in-box OR IoU; key detector knobs: Sensitivity={p.Sensitivity}, StarClip={p.StarClippingMultiplier}, " +
+            // V-P1/V-P2: record which source won for the two per-run knobs this report was scored with, so a
+            // reader comparing two reports can tell whether a delta came from the detector or from a resolved
+            // input changing underneath it.
+            sb.AppendLine($"pixelScale: {Fmt(pixelScale)} arcsec/px ({pixelScaleSource})   matchRadius: {Fmt(matchRadius)}px ({matchRadiusSource})");
+            // Report the mode actually used — a hardcoded label here silently misattributes every stored report.
+            var matchLabel = matchMode switch {
+                GoldenMatchMode.Center => "center-in-box",
+                GoldenMatchMode.Iou => $"IoU>={tau}",
+                GoldenMatchMode.Centroid => $"centroid within {matchRadius}px",
+                _ => $"center-in-box OR IoU>={tau}"
+            };
+            sb.AppendLine($"match: {matchLabel}; key detector knobs: Sensitivity={p.Sensitivity}, StarClip={p.StarClippingMultiplier}, " +
                 $"NoiseClip={p.NoiseClippingMultiplier}, PeakResponse={p.PeakResponse}, MaxDistortion={p.MaxDistortion}, StarCenterTol={p.StarCenterTolerance}, " +
                 $"StructureLayers={p.StructureLayers}, MinHFR={p.MinHFR}, MinBox={p.MinimumStarBoundingBoxSize}");
             sb.AppendLine($"defocus: Donut={p.DefocusAwareDonutDetection}, Distortion={p.DefocusAwareDistortion}, Centering={p.DefocusAwareCentering}, " +
@@ -536,8 +730,18 @@ namespace TestApp {
                 $"recall@all={Ratio(frames.Sum(f => f.MatchedAll), frames.Sum(f => f.TotalAll))}");
             sb.AppendLine();
 
+            // W27 (A): the four honesty disclosures bank-verify has always carried and this harness -- the one
+            // that produced the published results table -- carried none of. Placed directly under OVERALL because
+            // it is what the precision on that line was scored under, not a footnote to it. The mode is DERIVED
+            // from the frames, never hardcoded: see the identical rule on `matchLabel` above.
+            var truthTotal = TruthDisclosure.Aggregate(frames.Select(f => f.Truth));
+            foreach (var line in TruthDisclosure.ReportLines(runId, truthTotal, TruthDisclosure.FramesWithTruth(frames.Select(f => f.Truth)))) {
+                sb.AppendLine(line);
+            }
+            sb.AppendLine();
+
             sb.AppendLine("PER-FRAME (sorted by focuser):");
-            sb.AppendLine("  focuser  Δsteps  golden  acc   TP   FP   FN   prec   recall   f1");
+            sb.AppendLine("  focuser  dsteps  golden  acc   TP   FP   FN   prec   recall   f1");
             foreach (var f in frames.OrderBy(f => f.FocuserPosition)) {
                 var pr = PrecisionRecall.Compute(f.TP, f.FP, f.FN);
                 sb.AppendLine($"  {f.FocuserPosition,7}  {(double.IsNaN(f.DefocusOffset) ? "  -  " : f.DefocusOffset.ToString("F1")),6}  {f.GoldenCount,6}  {f.Accepted,4}  {f.TP,4} {f.FP,4} {f.FN,4}  {Fmt(pr.Precision),6} {Fmt(pr.Recall),7} {Fmt(pr.F1),6}");
@@ -563,6 +767,17 @@ namespace TestApp {
             foreach (var gate in allGates) {
                 sb.AppendLine($"  REJECTED:{gate}: {frames.Sum(f => f.FnByGate.TryGetValue(gate, out var c) ? c : 0)}");
             }
+            sb.AppendLine();
+
+            // F46: the same table restricted to the HIGH tier, because recall@high is what the checked-in bands are
+            // scored on and the aggregate above is dominated by the faint tier on every long-focal-length dataset.
+            sb.AppendLine("FALSE-NEGATIVE ATTRIBUTION, HIGH TIER ONLY (what recall@high is actually losing):");
+            sb.AppendLine($"  ACCEPTED-elsewhere: {frames.Sum(f => f.FnHighAcceptedElsewhere)}");
+            sb.AppendLine($"  NO CANDIDATE (structure gap): {frames.Sum(f => f.FnHighNoCandidate)}");
+            foreach (var gate in frames.SelectMany(f => f.FnHighByGate.Keys).Distinct().OrderBy(x => x)) {
+                sb.AppendLine($"  REJECTED:{gate}: {frames.Sum(f => f.FnHighByGate.TryGetValue(gate, out var c) ? c : 0)}");
+            }
+            sb.AppendLine("  (per-star detail: false_negatives_f<focuser>.csv)");
 
             File.WriteAllText(Path.Combine(runOut, "golden_eval.txt"), sb.ToString());
             Console.WriteLine();

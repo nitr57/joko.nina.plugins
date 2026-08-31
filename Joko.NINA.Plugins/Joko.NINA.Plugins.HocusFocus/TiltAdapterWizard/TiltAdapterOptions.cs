@@ -11,11 +11,13 @@
 #endregion "copyright"
 
 using NINA.Core.Utility;
+using NINA.Core.Utility.Notification;
 using NINA.Joko.Plugins.HocusFocus.AutoFocus;
 using NINA.Joko.Plugins.HocusFocus.Interfaces;
 using NINA.Profile;
 using NINA.Profile.Interfaces;
 using System;
+using System.Collections.Generic;
 
 namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
 
@@ -57,6 +59,7 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
             screwInwardCurvatureSign = optionsAccessor.GetValueInt32(nameof(ScrewInwardCurvatureSign), TiltScrewGeometry.DefaultScrewInwardCurvatureSign);
             screwInwardCurvatureSignIsMeasured = optionsAccessor.GetValueBoolean(nameof(ScrewInwardCurvatureSignIsMeasured), false);
             measureCurvatureDuringCalibration = optionsAccessor.GetValueBoolean(nameof(MeasureCurvatureDuringCalibration), false);
+            measureFinalRebaseline = optionsAccessor.GetValueBoolean(nameof(MeasureFinalRebaseline), true);
             calibrationIsManual = optionsAccessor.GetValueBoolean(nameof(CalibrationIsManual), false);
             adjustmentType = optionsAccessor.GetValueEnum(nameof(AdjustmentType), TiltAdjustmentType.Screws);
             angleDisplayUnit = optionsAccessor.GetValueEnum(nameof(AngleDisplayUnit), TiltGuidanceAngleUnit.Turns);
@@ -81,6 +84,56 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
             calibrationIsReliable = optionsAccessor.GetValueBoolean(nameof(CalibrationIsReliable), false);
             tiltDeviceShadowPositions = optionsAccessor.GetValueString(nameof(TiltDeviceShadowPositions), string.Empty);
             calibrationAppliedAmount = optionsAccessor.GetValueDouble(nameof(CalibrationAppliedAmount), -1.0);
+            screwLabelsJson = optionsAccessor.GetValueString(nameof(ScrewLabelsJson), string.Empty);
+            screwLabels = ScrewLabelStore.Parse(screwLabelsJson);
+
+            MigrateMeasuredCurvatureSign();
+        }
+
+        // Persisted internal state, not a user option — same category as TiltDeviceShadowPositions /
+        // DeviceLinkedCalibrationDeviceName / CalibrationIsReliable, so it has no interface property and no
+        // control in Resources/OptionsDataTemplates.xaml.
+        private const string CurvatureSignMeasurementMigratedKey = "CurvatureSignMeasurementMigrated";
+
+        /// <summary>
+        /// One-time, per-profile correction of a MEASURED <see cref="ScrewInwardCurvatureSign"/>. Every sign
+        /// a 6-step calibration ever wrote before 2026-08-04 came from an inverted
+        /// <see cref="TiltCalibrationCalculator.ComputeCurvatureSign"/>, so those values are deterministically
+        /// negated (docs/focuser-direction-convention-design.md §5).
+        ///
+        /// Called from <see cref="InitializeOptions"/>, so it covers construction AND every profile change —
+        /// each profile carries its own marker, and the marker makes double-application impossible. Values
+        /// that were NOT measured are left alone: they are either the default assumption or a direction the
+        /// user set by hand through the wizard's direction combo (whose setter clears IsMeasured), and neither
+        /// came from the buggy formula.
+        ///
+        /// Downgrade hazard, accepted and documented: a migrated profile re-measured on an OLD plugin version
+        /// gets the inverted sign back. Nothing here can defend against running old code.
+        /// </summary>
+        private void MigrateMeasuredCurvatureSign() {
+            if (optionsAccessor.GetValueBoolean(CurvatureSignMeasurementMigratedKey, false)) {
+                return;
+            }
+
+            if (screwInwardCurvatureSignIsMeasured && screwInwardCurvatureSign != 0) {
+                int corrected = -screwInwardCurvatureSign;
+                Logger.Info(
+                    $"Tilt adapter: correcting this profile's MEASURED ScrewInwardCurvatureSign " +
+                    $"{screwInwardCurvatureSign:+0;-0} -> {corrected:+0;-0}. Every direction measured by a 6-step " +
+                    $"calibration before this version came from an inverted formula; see " +
+                    $"docs/focuser-direction-convention-design.md. Signs that were assumed or set by hand are not touched.");
+                screwInwardCurvatureSign = corrected;
+                optionsAccessor.SetValueInt32(nameof(ScrewInwardCurvatureSign), screwInwardCurvatureSign);
+                Notification.ShowInformation(
+                    "HocusFocus corrected the tilt adapter direction that a 6-step calibration measured for this " +
+                    "profile — it was measured with an inverted formula, which reversed the backfocus half of the " +
+                    "screw guidance. Automatic and manual corrections now turn the other way; the screw diagram and " +
+                    "the tilt numbers are unchanged. The Tilt Adapter Wizard still reports \"Direction was measured " +
+                    "by a calibration run.\" — re-run the 6-step calibration if you want to re-verify it.");
+            }
+
+            // Set even when nothing needed correcting, so the check never re-runs for this profile.
+            optionsAccessor.SetValueBoolean(CurvatureSignMeasurementMigratedKey, true);
         }
 
         private int screwCount;
@@ -221,6 +274,19 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
                 if (measureCurvatureDuringCalibration != value) {
                     measureCurvatureDuringCalibration = value;
                     optionsAccessor.SetValueBoolean(nameof(MeasureCurvatureDuringCalibration), measureCurvatureDuringCalibration);
+                    RaisePropertyChanged();
+                }
+            }
+        }
+
+        private bool measureFinalRebaseline;
+
+        public bool MeasureFinalRebaseline {
+            get => measureFinalRebaseline;
+            set {
+                if (measureFinalRebaseline != value) {
+                    measureFinalRebaseline = value;
+                    optionsAccessor.SetValueBoolean(nameof(MeasureFinalRebaseline), measureFinalRebaseline);
                     RaisePropertyChanged();
                 }
             }
@@ -458,6 +524,66 @@ namespace NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard {
                     optionsAccessor.SetValueDouble(nameof(CalibrationAppliedAmount), calibrationAppliedAmount);
                     RaisePropertyChanged();
                 }
+            }
+        }
+
+        private string screwLabelsJson;
+
+        // Parsed form of screwLabelsJson, kept alongside it so a label lookup -- which happens on every
+        // guidance rebuild and every wizard prompt -- is a dictionary hit rather than a JSON parse. The
+        // two are only ever written together; see SetScrewLabelOverride.
+        private Dictionary<string, string[]> screwLabels = new Dictionary<string, string[]>(StringComparer.Ordinal);
+
+        public string ScrewLabelsJson {
+            get => screwLabelsJson;
+            set {
+                var newValue = value ?? string.Empty;
+                if (screwLabelsJson != newValue) {
+                    screwLabelsJson = newValue;
+                    screwLabels = ScrewLabelStore.Parse(screwLabelsJson);
+                    optionsAccessor.SetValueString(nameof(ScrewLabelsJson), screwLabelsJson);
+                    RaisePropertyChanged();
+                }
+            }
+        }
+
+        /// <summary>The label scheme of the currently selected device preset.</summary>
+        private ScrewLabelScheme CurrentScrewLabelScheme => TiltAdapterDevicePreset.ByName(DeviceName).ScrewLabels;
+
+        public string GetScrewLabelOverride(int wizardScrewNumber) {
+            ValidateScrewNumber(wizardScrewNumber);
+            return screwLabels.TryGetValue(CurrentScrewLabelScheme.Id, out var labels)
+                ? labels[wizardScrewNumber - 1]
+                : string.Empty;
+        }
+
+        public void SetScrewLabelOverride(int wizardScrewNumber, string label) {
+            ValidateScrewNumber(wizardScrewNumber);
+            var normalized = ScrewLabelStore.Normalize(label);
+            var schemeId = CurrentScrewLabelScheme.Id;
+            if (!screwLabels.TryGetValue(schemeId, out var labels)) {
+                if (normalized.Length == 0) {
+                    return;   // clearing an already-unset label writes nothing
+                }
+                labels = new string[ScrewLabelStore.ScrewSlots];
+                for (int i = 0; i < labels.Length; ++i) {
+                    labels[i] = string.Empty;
+                }
+                screwLabels[schemeId] = labels;
+            }
+            if (labels[wizardScrewNumber - 1] == normalized) {
+                return;
+            }
+            labels[wizardScrewNumber - 1] = normalized;
+
+            // Write through the raw property so the accessor, the parsed cache, and the change
+            // notification all stay in step -- but re-serialize from the cache, which is authoritative.
+            ScrewLabelsJson = ScrewLabelStore.Serialize(screwLabels);
+        }
+
+        private static void ValidateScrewNumber(int wizardScrewNumber) {
+            if (wizardScrewNumber < 1 || wizardScrewNumber > ScrewLabelStore.ScrewSlots) {
+                throw new ArgumentOutOfRangeException(nameof(wizardScrewNumber), wizardScrewNumber, "Wizard screw index must be 1-4.");
             }
         }
     }

@@ -694,8 +694,37 @@ namespace NINA.Joko.Plugins.HocusFocus.Interfaces {
         /// </summary>
         public bool RelaxationAdmitted { get; set; }
 
+        /// <summary>
+        /// INFORMATIONAL ONLY (never affects an accept/reject decision, never enters the optimizer objective). The
+        /// exact scalar the Sensitivity gate compared this star against: <c>NormalizedBrightness / σ</c>, or — when
+        /// <see cref="StarDetectorParams.DefocusAwareDonutDetection"/> admits the integrated-flux path for an
+        /// extended candidate — the larger of that and the donut integrated-flux SNR (whichever the gate actually
+        /// used). These are two DIFFERENT statistics with different scalings (a per-pixel peak-vs-noise ratio vs. a
+        /// matched-filter <c>TotalFlux / (σ√N)</c>) — a caller cannot tell which one a given value is, so treat
+        /// entries as belonging to a single scalar "the gate's verdict", not something to pool or threshold as one
+        /// physical quantity.
+        /// <para>
+        /// Carried through detection binning
+        /// (<see cref="NINA.Joko.Plugins.HocusFocus.Utility.CvImageUtility.ScaleToSourcePixels(Star, int)"/>) and an
+        /// ROI offset (<see cref="NINA.Joko.Plugins.HocusFocus.Utility.CvImageUtility.AddOffset"/>) WITHOUT rescaling
+        /// — not because binning "preserves the level" (it does not: the σ denominator is measured on the
+        /// already-binned image, so it shrinks under binning — by up to ~<c>DetectionBinning</c> for uncorrelated
+        /// noise, measurably less in practice, since the default <c>HotpixelFiltering</c> runs ABOVE the bin at
+        /// native resolution and correlates the noise, giving ~1.3x at 2x on synthetic white noise rather than
+        /// ~2x; the numerator moves too, just less — the peak term of <c>NormalizedBrightness</c> also shrinks
+        /// slightly when a sharp star is block-averaged), but because this is the gate's own comparison pair with
+        /// <see cref="StarDetectorParams.Sensitivity"/> (a binned-space param compared BEFORE the rescale) — both
+        /// must stay in the same space, exactly like <c>RejectedCandidateRecord.MeasuredValue</c>. The DIRECTION is
+        /// what matters, not a specific ratio: values are NOT comparable across different
+        /// <see cref="StarDetectorParams.DetectionBinning"/> factors.
+        /// </para>
+        /// <see cref="double.NaN"/> at every legacy construction site that doesn't set it. Feeds a later
+        /// exposure-time recommendation when the optimizer floors the Sensitivity gate.
+        /// </summary>
+        public double MeasuredSensitivity { get; set; } = double.NaN;
+
         public override string ToString() {
-            return $"{{{nameof(Center)}={Center.ToString()}, {nameof(StarBoundingBox)}={StarBoundingBox.ToString()}, {nameof(Background)}={Background.ToString()}, {nameof(MeanBrightness)}={MeanBrightness.ToString()}, {nameof(PeakBrightness)}={PeakBrightness.ToString()}, {nameof(HFR)}={HFR.ToString()}, {nameof(PSF)}={PSF}, {nameof(StarContaminationSuspected)}={StarContaminationSuspected}, {nameof(RelaxationAdmitted)}={RelaxationAdmitted}}}";
+            return $"{{{nameof(Center)}={Center.ToString()}, {nameof(StarBoundingBox)}={StarBoundingBox.ToString()}, {nameof(Background)}={Background.ToString()}, {nameof(MeanBrightness)}={MeanBrightness.ToString()}, {nameof(PeakBrightness)}={PeakBrightness.ToString()}, {nameof(HFR)}={HFR.ToString()}, {nameof(PSF)}={PSF}, {nameof(StarContaminationSuspected)}={StarContaminationSuspected}, {nameof(RelaxationAdmitted)}={RelaxationAdmitted}, {nameof(MeasuredSensitivity)}={MeasuredSensitivity.ToString()}}}";
         }
     }
 
@@ -748,6 +777,17 @@ namespace NINA.Joko.Plugins.HocusFocus.Interfaces {
         /// thread from the assembled accepted-star list (it never flows through <see cref="Merge"/>, since the
         /// per-thread metrics instances never touch it). Zero whenever the defocus-aware gates are OFF, so it
         /// does NOT affect detection bit-identity. The optimizer consumes it as a precision/false-positive signal.
+        ///
+        /// <para>Re-tallied a second time over the FINAL post-filter survivor set, in
+        /// HocusFocusStarDetection.BuildStarDetectionResult — that re-tally is where this field is corrupted if
+        /// AddOffset (Utility/CvImageUtility.cs; the ROI-offset translation) ever drops Star.RelaxationAdmitted
+        /// again, as it silently did before AddOffset was fixed to carry the flag through. Same lossy
+        /// cache boundary as HocusFocusDetectedStar.MeasuredSensitivity (HocusFocusStarDetection.cs): this value
+        /// is persisted to the saved &lt;image&gt;_star_detection_result.json, and that fix correctly did NOT bump
+        /// StarDetector.StarDetectorVersion (no detection OUTPUT changed, only this readout). So a cache file saved
+        /// by a PRE-fix build from an ROI + defocus-aware-gates run — one that persisted this count as 0 due to the
+        /// bug — still passes AutoFocusEngine.TryLoadValidCachedDetection's version check and reloads with
+        /// RelaxationAdmittedCount pinned at 0 until that frame is re-detected.</para>
         /// </summary>
         public int RelaxationAdmittedCount { get; set; } = 0;
         public int OutsideROI { get; set; } = 0;
@@ -763,9 +803,10 @@ namespace NINA.Joko.Plugins.HocusFocus.Interfaces {
         /// so the fold is additive and does not double-count values already present on the main metrics.
         /// </summary>
         /// <summary>
-        /// Returns all seven <c>*Bounds</c> lists in a fixed, canonical order. Every method that needs to
-        /// iterate over all bounds lists (Merge, SortBounds, AddROIOffset) uses this helper so that adding an
-        /// eighth bounds list in the future requires only a single edit here.
+        /// Returns all NINE <c>*Bounds</c> lists in a fixed, canonical order. Every method that needs to iterate
+        /// over all bounds lists (Merge, SortBounds, AddROIOffset) uses this helper, so adding another one
+        /// requires a single edit here. (The count read "seven" long after TooElongatedBounds and
+        /// BloomSuppressedBounds joined the list — the helper is the source of truth, not the prose.)
         /// </summary>
         private List<List<Rect>> AllBoundsLists() => new List<List<Rect>> {
             TooDistortedBounds,
@@ -893,9 +934,22 @@ namespace NINA.Joko.Plugins.HocusFocus.Interfaces {
     /// <summary>
     /// Per-rejected-candidate diagnostics, captured only when
     /// <see cref="StarDetectorParams.CollectRejectedCandidateDiagnostics"/> is enabled. One record is produced for
-    /// EVERY candidate a late gate rejects (unlike the metrics <c>*Bounds</c> lists, which only exist for seven of
-    /// the gates), so the label-driven recommender can attribute a labeled "wrongly-rejected" star to the exact
-    /// gate that killed it and invert that gate's threshold. <see cref="MeasuredValue"/> is the scalar the gate
+    /// EVERY candidate a late gate rejects — unlike the metrics <c>*Bounds</c> lists, which carry only geometry
+    /// (a rect, with no measured value and no threshold) and do not even span the gates: there are NINE of them
+    /// against <see cref="RejectionGate"/>'s TWELVE constants, they cover eight (TooSmall, OnBorder,
+    /// HFRAnalysisFailed and TooLowHFR have none), and the ninth, <c>SaturatedBounds</c>, corresponds to no gate
+    /// at all because saturated stars are kept and masked during the PSF fit rather than rejected. So the
+    /// label-driven recommender can
+    /// attribute a labeled "wrongly-rejected" star to the exact gate that killed it and invert that gate's
+    /// threshold.
+    ///
+    /// <para><b>Not reachable from the optimizer</b> (F30's sibling, F27). These records live on
+    /// <c>HocusFocusStarDetectorResult.RejectedCandidates</c>, and
+    /// <c>HocusFocusStarDetection.BuildStarDetectionResult</c> copies only <c>Metrics</c> forward — the type the
+    /// optimizer consumes has no member for them at all. Only the review/feedback path re-detects with the flag
+    /// on, outside the optimizer loop. Anything in the objective needing per-rejection detail has to plumb this
+    /// through first; the <c>*Bounds</c> rect lists ARE reachable at the same seam that reads
+    /// <c>LowSensitivity</c>/<c>TooFlat</c>, but they answer a strictly weaker question.</para> <see cref="MeasuredValue"/> is the scalar the gate
     /// compared against <see cref="ThresholdValue"/>; both are <see cref="double.NaN"/> for the non-scalar gates
     /// (OnBorder/Degenerate/HFRAnalysisFailed), which can only be flagged, not threshold-recovered.
     /// </summary>

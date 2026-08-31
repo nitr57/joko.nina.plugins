@@ -25,7 +25,7 @@ public class InspectorOptionsTests {
         Assert.Multiple(() => {
             Assert.That(options.StepCount, Is.EqualTo(-1));
             Assert.That(options.StepSize, Is.EqualTo(-1));
-            Assert.That(options.SignalAmplification, Is.EqualTo(2));
+            Assert.That(options.SignalAmplification, Is.EqualTo(1));
             Assert.That(options.CenterFocuserBeforeRun, Is.False);
             Assert.That(options.FramesPerPoint, Is.EqualTo(-1));
             Assert.That(options.TimeoutSeconds, Is.EqualTo(-1));
@@ -34,6 +34,9 @@ public class InspectorOptionsTests {
             Assert.That(options.NumRegionsWide, Is.EqualTo(7));
             Assert.That(options.LoopingExposureAnalysisEnabled, Is.False);
             Assert.That(options.MicronsPerFocuserStep, Is.EqualTo(-1));
+            // Default k: standard focuser (increasing position moves the camera AWAY from the objective),
+            // which reproduces every caption exactly as it rendered before the setting existed.
+            Assert.That(options.FocuserIncreasesTowardObjective, Is.False);
             Assert.That(options.EccentricityColorMapEnabled, Is.True);
             Assert.That(options.MouseOnChartsEnabled, Is.True);
             Assert.That(options.SensorCurveModelEnabled, Is.False);
@@ -48,8 +51,6 @@ public class InspectorOptionsTests {
             Assert.That(options.RejectBadBrightnessMatches, Is.False);
             Assert.That(options.RejectBadlyFittingMatches, Is.True);
             Assert.That(options.UseRANSAC, Is.True);
-            Assert.That(options.SaveImagesOnReruns, Is.False);
-            Assert.That(options.SaveAlignmentImages, Is.False);
             Assert.That(options.FrameReviewEnabled, Is.False);
             Assert.That(options.MaxStarsPerRegion, Is.EqualTo(-1));
             Assert.That(options.InterpolationEnabled, Is.False);
@@ -69,6 +70,7 @@ public class InspectorOptionsTests {
         options.DetailedAnalysisExposureSeconds = 4.0;
         options.LoopingExposureAnalysisEnabled = true;
         options.MicronsPerFocuserStep = 1.5;
+        options.FocuserIncreasesTowardObjective = true;
         options.EccentricityColorMapEnabled = false;
         options.MouseOnChartsEnabled = false;
         options.SensorCurveModelEnabled = true;
@@ -83,8 +85,6 @@ public class InspectorOptionsTests {
         options.RejectBadBrightnessMatches = true;
         options.RejectBadlyFittingMatches = false;
         options.UseRANSAC = false;
-        options.SaveImagesOnReruns = true;
-        options.SaveAlignmentImages = true;
         options.FrameReviewEnabled = true;
         options.MaxStarsPerRegion = 50;
 
@@ -99,6 +99,7 @@ public class InspectorOptionsTests {
             Assert.That(store.Snapshot[nameof(InspectorOptions.NumRegionsWide)], Is.EqualTo(9));
             Assert.That(store.Snapshot[nameof(InspectorOptions.LoopingExposureAnalysisEnabled)], Is.True);
             Assert.That(store.Snapshot[nameof(InspectorOptions.MicronsPerFocuserStep)], Is.EqualTo(1.5));
+            Assert.That(store.Snapshot[nameof(InspectorOptions.FocuserIncreasesTowardObjective)], Is.True);
             Assert.That(store.Snapshot[nameof(InspectorOptions.EccentricityColorMapEnabled)], Is.False);
             Assert.That(store.Snapshot[nameof(InspectorOptions.MouseOnChartsEnabled)], Is.False);
             Assert.That(store.Snapshot[nameof(InspectorOptions.SensorCurveModelEnabled)], Is.True);
@@ -113,8 +114,6 @@ public class InspectorOptionsTests {
             Assert.That(store.Snapshot[nameof(InspectorOptions.RejectBadBrightnessMatches)], Is.True);
             Assert.That(store.Snapshot[nameof(InspectorOptions.RejectBadlyFittingMatches)], Is.False);
             Assert.That(store.Snapshot[nameof(InspectorOptions.UseRANSAC)], Is.False);
-            Assert.That(store.Snapshot[nameof(InspectorOptions.SaveImagesOnReruns)], Is.True);
-            Assert.That(store.Snapshot[nameof(InspectorOptions.SaveAlignmentImages)], Is.True);
             Assert.That(store.Snapshot[nameof(InspectorOptions.FrameReviewEnabled)], Is.True);
             Assert.That(store.Snapshot[nameof(InspectorOptions.MaxStarsPerRegion)], Is.EqualTo(50));
         });
@@ -193,7 +192,7 @@ public class InspectorOptionsTests {
             Assert.That(options.SensorROI, Is.EqualTo(1.0));
             Assert.That(options.MouseOnChartsEnabled, Is.True);
             Assert.That(options.InterpolationAmount, Is.EqualTo(InterpolationAmountEnum.Medium));
-            Assert.That(options.SignalAmplification, Is.EqualTo(2));
+            Assert.That(options.SignalAmplification, Is.EqualTo(1));
             Assert.That(options.CenterFocuserBeforeRun, Is.False);
         });
     }
@@ -203,6 +202,7 @@ public class InspectorOptionsTests {
     [TestCase(nameof(InspectorOptions.CenterFocuserBeforeRun), true)]
     [TestCase(nameof(InspectorOptions.LoopingExposureAnalysisEnabled), true)]
     [TestCase(nameof(InspectorOptions.MicronsPerFocuserStep), 2.5)]
+    [TestCase(nameof(InspectorOptions.FocuserIncreasesTowardObjective), true)]
     [TestCase(nameof(InspectorOptions.SensorROI), 0.6)]
     [TestCase(nameof(InspectorOptions.UseRANSAC), false)]
     [TestCase(nameof(InspectorOptions.FrameReviewEnabled), true)]
@@ -298,6 +298,135 @@ public class InspectorOptionsTests {
     public void CenterFocuserBeforeRun_DefaultsToOff() {
         var (options, _, _) = Build();
         Assert.That(options.CenterFocuserBeforeRun, Is.False);
+    }
+
+    // ---- Focuser step size: driver value, override, and the mismatch flag -----------------------------
+    //
+    // docs/focuser-step-size-driver-design.md. The driver's reported StepSize is the default source; the
+    // persisted MicronsPerFocuserStep is an override. The governing constraint is that "unset" must never
+    // become silently WRONG — only ever missing — so the driver value is accepted on exactly one test
+    // (finite and > 0) and is never persisted.
+
+    [Test]
+    public void EffectiveMicronsPerFocuserStep_ResolvesOverrideThenDriverThenUnset() {
+        var (options, _, _) = Build();
+
+        Assert.Multiple(() => {
+            Assert.That(options.EffectiveMicronsPerFocuserStep, Is.EqualTo(-1.0), "neither set");
+
+            options.DriverMicronsPerFocuserStep = 2.5;
+            Assert.That(options.EffectiveMicronsPerFocuserStep, Is.EqualTo(2.5), "driver alone");
+
+            options.MicronsPerFocuserStep = 1.0;
+            Assert.That(options.EffectiveMicronsPerFocuserStep, Is.EqualTo(1.0), "the override wins");
+
+            options.MicronsPerFocuserStep = -1;
+            Assert.That(options.EffectiveMicronsPerFocuserStep, Is.EqualTo(2.5), "clearing the box returns to the driver");
+        });
+    }
+
+    [TestCase(0.0)]
+    [TestCase(-5.0)]
+    [TestCase(double.NaN)]
+    [TestCase(double.PositiveInfinity)]
+    [TestCase(double.NegativeInfinity)]
+    public void DriverMicronsPerFocuserStep_RejectsUnusableValues(double reported) {
+        // The three ways a driver declines to answer, plus infinity. NaN is the one that matters: it fails
+        // BOTH `> 0` and `<= 0`, so a `!(value <= 0)` guard would wave it through into the sensor model and
+        // produce an all-NaN fit with no error anywhere.
+        var (options, _, _) = Build();
+
+        options.DriverMicronsPerFocuserStep = reported;
+
+        Assert.Multiple(() => {
+            Assert.That(options.DriverMicronsPerFocuserStep, Is.EqualTo(-1.0));
+            Assert.That(options.EffectiveMicronsPerFocuserStep, Is.EqualTo(-1.0));
+        });
+    }
+
+    [Test]
+    public void DriverMicronsPerFocuserStep_IsStickyAcrossADisconnect() {
+        // A disconnected focuser reports StepSize = 0. Dropping that write is the whole stickiness mechanism:
+        // an in-flight analysis must not be rescaled because the focuser dropped off the bus.
+        var (options, _, _) = Build();
+        options.DriverMicronsPerFocuserStep = 3.5;
+
+        options.DriverMicronsPerFocuserStep = 0.0;
+
+        Assert.That(options.EffectiveMicronsPerFocuserStep, Is.EqualTo(3.5));
+    }
+
+    [Test]
+    public void DriverMicronsPerFocuserStep_IsNeverPersisted() {
+        var (options, store, _) = Build();
+
+        options.DriverMicronsPerFocuserStep = 3.5;
+
+        Assert.That(store.Snapshot.ContainsKey(nameof(IInspectorOptions.DriverMicronsPerFocuserStep)), Is.False,
+            "it is live device state — a persisted copy would go stale against a swapped focuser");
+    }
+
+    [Test]
+    public void ProfileChange_ClearsTheDriverValue_ButNotTheOverride() {
+        var profile = Substitute.For<IProfileService>();
+        var store = new InMemoryPluginOptionsAccessor();
+        var options = new InspectorOptions(profile, store);
+        options.MicronsPerFocuserStep = 1.25;
+        options.DriverMicronsPerFocuserStep = 3.5;
+
+        profile.ProfileChanged += Raise.Event<EventHandler>(profile, EventArgs.Empty);
+
+        Assert.Multiple(() => {
+            Assert.That(options.DriverMicronsPerFocuserStep, Is.EqualTo(-1.0), "a profile swap means a different rig");
+            Assert.That(options.MicronsPerFocuserStep, Is.EqualTo(1.25), "the override is persisted and survives");
+        });
+    }
+
+    [Test]
+    public void ResetDefaults_LeavesTheDriverValueAlone() {
+        var (options, _, _) = Build();
+        options.DriverMicronsPerFocuserStep = 3.5;
+
+        options.ResetDefaults();
+
+        Assert.Multiple(() => {
+            Assert.That(options.MicronsPerFocuserStep, Is.EqualTo(-1.0), "the override resets");
+            Assert.That(options.DriverMicronsPerFocuserStep, Is.EqualTo(3.5),
+                "the driver value is device state, not a default");
+        });
+    }
+
+    [TestCase(-1.0, 1.0, false, TestName = "Mismatch_NoOverride_NeverFlags")]
+    [TestCase(1.0, 0.0, false, TestName = "Mismatch_NoDriverValue_NeverFlags")]
+    [TestCase(1.0, double.NaN, false, TestName = "Mismatch_NaNDriverValue_NeverFlags")]
+    [TestCase(1.0, 1.005, false, TestName = "Mismatch_WithinOnePercent_Quiet")]
+    [TestCase(1.0, 2.0, true, TestName = "Mismatch_DoubleTheDriverValue_Flags")]
+    [TestCase(1.0, 0.5, true, TestName = "Mismatch_HalfTheDriverValue_Flags")]
+    public void HasFocuserStepSizeMismatch_Matrix(double overrideValue, double driverValue, bool expected) {
+        var (options, _, _) = Build();
+        options.MicronsPerFocuserStep = overrideValue;
+        options.DriverMicronsPerFocuserStep = driverValue;
+
+        Assert.That(options.HasFocuserStepSizeMismatch, Is.EqualTo(expected));
+    }
+
+    [Test]
+    public void FocuserStepSize_DerivedProperties_RaiseFromBothInputs() {
+        // The hint text and the mismatch flag bind to these, and both derived values read BOTH inputs — so
+        // either setter must re-raise both, or a driver update leaves a stale hint on screen.
+        var (options, _, _) = Build();
+        var raised = new List<string>();
+        options.PropertyChanged += (_, e) => raised.Add(e.PropertyName);
+
+        options.MicronsPerFocuserStep = 1.0;
+        options.DriverMicronsPerFocuserStep = 3.5;
+
+        Assert.Multiple(() => {
+            Assert.That(raised.FindAll(n => n == nameof(InspectorOptions.EffectiveMicronsPerFocuserStep)),
+                Has.Count.EqualTo(2), "once per input");
+            Assert.That(raised.FindAll(n => n == nameof(InspectorOptions.HasFocuserStepSizeMismatch)),
+                Has.Count.EqualTo(2), "once per input");
+        });
     }
 
     [Test]

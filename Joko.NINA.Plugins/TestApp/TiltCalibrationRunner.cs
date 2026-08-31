@@ -15,6 +15,7 @@ using Newtonsoft.Json.Serialization;
 using NINA.Core.Enum;
 using NINA.Core.Model;
 using NINA.Core.Utility;
+using NINA.Image.Interfaces;
 using NINA.Joko.Plugins.HocusFocus.AutoFocus;
 using NINA.Joko.Plugins.HocusFocus.Inspection;
 using NINA.Joko.Plugins.HocusFocus.Interfaces;
@@ -54,10 +55,12 @@ namespace TestApp {
     /// <see cref="StarDetectorParams"/>, never to the profile. The optimization result is persisted only to the
     /// dataset's own <c>&lt;name&gt;.tilt.json</c> metadata file (which this tool owns).
     ///
-    /// NOTE on detection: like the headless <c>optimize</c> harness, detection runs on the loaded float Mats and
-    /// (for bayered frames) is not debayered through NINA's render pipeline — the two harnesses therefore use an
-    /// identical detection representation. Tilt is a relative cross-region measure of the focus-curve minimum, so
-    /// a uniform detection bias largely cancels in the tilt plane.
+    /// NOTE on detection: like the headless <c>optimize</c> harness, every frame is loaded as the
+    /// <see cref="IRenderedImage"/> the LIVE app detects on (<c>DiagnosticUtil.LoadRenderedImage</c>) and detected
+    /// through the plugin's own <c>RunEvaluationLoader.HocusFocusSplitFrameDetector</c>, so the CFA hotpixel filter
+    /// and the debayer happen inside <c>Detect</c> at the caller's params. That matters most HERE: the wizard
+    /// calibrates a per-star sensor-model tilt, and detecting a bayered run on the raw Bayer mosaic biases exactly
+    /// that measurement.
     /// </summary>
     internal static class TiltCalibrationRunner {
 
@@ -65,9 +68,8 @@ namespace TestApp {
         // live wizard via TiltCalibrationMetadata so a wizard-saved run replays both in-app and headlessly.
         private static readonly string[] StepOrder = TiltCalibrationMetadata.StepOrder;
 
-        // Sigma rejections matching the wizard's RunEvaluationLoader / the optimize harness (HocusFocusDetectionParams defaults).
-        private const double HighSigmaOutlierRejection = 4.0;
-        private const double LowSigmaOutlierRejection = 3.0;
+        // The sigma rejections this harness used to restate (4.0 / 3.0) now come from where they are defined:
+        // HocusFocusDetectionParams' own defaults, applied by the wizard's HocusFocusSplitFrameDetector.
 
         private static readonly JsonSerializerSettings MetadataJsonSettings = TiltCalibrationMetadata.JsonSettings;
 
@@ -96,10 +98,16 @@ namespace TestApp {
 
             var profileId = DiagnosticUtil.GetArg(args, "--profile-id");
             bool reoptimize = DiagnosticUtil.HasFlag(args, "--reoptimize");
-            // Match the live app: when the profile debayers (ImageSettings.DebayerImage), detection runs on the
-            // debayered luminance, not the raw Bayer mosaic. The wizard's per-star sensor-model tilt is sensitive
-            // to this, so replaying a bayered run faithfully requires it.
-            bool debayer = DiagnosticUtil.HasFlag(args, "--debayer");
+            // --debayer used to be the opt-in that debayered bayered frames at load time. Matching the live app is
+            // now unconditional (and profile-gated on ImageSettings.DebayerImage, which is what live gates it on),
+            // so the flag has nothing left to switch. Accepted-and-warned rather than rejected: a script that still
+            // passes it gets exactly the behaviour it asked for, and hears that it need not ask.
+            if (DiagnosticUtil.HasFlag(args, "--debayer")) {
+                Console.Error.WriteLine(
+                    "WARNING: --debayer is obsolete and ignored. Detection now always runs on the image the live app " +
+                    "detects on (the CFA hotpixel filter and the debayer happen inside Detect, at the detection params), " +
+                    "gated on the profile's Image Options > Debayer image exactly as the app gates it.");
+            }
             int? maxEvals = null;
             var maxEvalsArg = DiagnosticUtil.GetArg(args, "--max-evals");
             if (!string.IsNullOrWhiteSpace(maxEvalsArg)) {
@@ -161,13 +169,28 @@ namespace TestApp {
                 ?? throw new InvalidOperationException("No active NINA profile could be loaded. Pass --profile-id, or run NINA at least once.");
             Console.WriteLine($"Profile: {activeProfile.Name} ({activeProfile.Id})");
 
-            var guid = PluginOptionsAccessor.GetAssemblyGuid(typeof(StarDetectionOptions))
-                ?? throw new InvalidOperationException("Could not resolve the HocusFocus plugin assembly GUID");
-            var accessor = new PluginOptionsAccessor(profileService, guid);
+            // Detector settings come from the harness's LOCAL settings file, not the NINA profile: a
+            // profile-sourced value is mutable machine state nothing records, and the ACTIVE profile can
+            // even be a different telescope between runs. See HarnessSettingsStore.
+            var harnessSettings = HarnessSettingsStore.Resolve(args, profileService, activeProfile);
+            var accessor = harnessSettings.Accessor;
             var starDetectionOptions = new StarDetectionOptions(profileService, accessor);
-            var afOptions = new AutoFocusOptions(profileService);
+            // F58(d): the pinned settings FILE, not the active profile -- the detector was pinned one line above
+            // and the FIT was not, which is the asymmetry F58 named in `optimize`.
+            var afOptions = HarnessSettingsStore.BuildFitOptions(profileService, harnessSettings);
+            Console.WriteLine($"FitInputs: {HarnessFitInputs.From(afOptions)}");
             var inspectorOptions = new InspectorOptions(profileService);
             var alglibAPI = new AlglibAPI();
+            // The plugin's OWN detection facade, so this harness drives the wizard's split detector (and its
+            // FrameDetectionResult mapping) rather than a copy of it. Only GetInfo() and the inner StarDetector are
+            // exercised; the rest are headless stubs.
+            var detection = new HocusFocusStarDetection(
+                imageStatisticsVM: null,
+                profileService: profileService,
+                focuserMediator: new StubFocuserMediator(),
+                starDetectionOptions: starDetectionOptions,
+                alglibAPI: alglibAPI,
+                perFilterStore: new StubPerFilterStarDetectionStore(accessor));
 
             // Map the run folders to the wizard steps (explicit override in metadata, else folder-name order).
             var orderedRuns = MapRunsToSteps(metadata, runFolders, datasetDir);
@@ -175,18 +198,36 @@ namespace TestApp {
                 Console.WriteLine($"  {r.Step,-10} -> {Path.GetFileName(r.Folder)} ({r.Frames.Count} frames, {r.Frames.Select(f => f.Focuser).Distinct().Count()} positions)");
             }
 
-            // PixelScale = arcsec/pixel from the dataset pixel size + the profile's focal length (binning 1).
-            var pixelScale = MathUtility.ArcsecPerPixel(metadata.PixelSizeMicrons, activeProfile.TelescopeSettings.FocalLength);
+            // The pitch of one pixel of the SAVED frames, read from a frame header rather than from the metadata
+            // (see ResolveEffectivePixelSizeAsync) — this is the single number every ImageSize x pixelSize
+            // product below turns into the sensor's physical extent, and getting it wrong scales the recovered
+            // thread pitch / stepper step size by the binning factor.
+            var pixelSizeResolution = await ResolveEffectivePixelSizeAsync(orderedRuns, metadata, profileService).ConfigureAwait(false);
+            double pixelSizeMicrons = pixelSizeResolution.Microns;
+            string pixelSizeProvenance = pixelSizeResolution.Provenance;
+            Console.WriteLine($"Pixel size: {F(pixelSizeMicrons)} um effective ({pixelSizeProvenance})");
+            if (EffectivePixelSize.DisagreesWithMetadata(pixelSizeResolution, metadata.PixelSizeMicrons)) {
+                // Expected, and benign, for any run saved before metadata schema 4 at a binning above 1x1: the
+                // stored value is the native pitch. Say so rather than silently disagreeing with the file.
+                Console.WriteLine($"  NOTE: metadata records {F(metadata.PixelSizeMicrons)} um. The frame header wins -- " +
+                    "a run saved before metadata schema 4 stored the NATIVE pitch, which would inflate the recovered " +
+                    "hardware by the binning factor.");
+            }
+
+            // PixelScale = arcsec/pixel of the frames as captured. Matches the live app, which multiplies the
+            // profile's native arcsec/pixel by the capture binning (HocusFocusStarDetection.ApplyDetectionImageContext).
+            var pixelScale = MathUtility.ArcsecPerPixel(pixelSizeMicrons, activeProfile.TelescopeSettings.FocalLength);
 
             // Resolve the detection params: stored optimized settings (default), a fresh optimization run, or the
             // optimizer is forced via --reoptimize. The result is applied only to this transient params object.
             var (detectionParams, optimizationSource) = await ResolveDetectionParamsAsync(
                 metadata, metadataPath, outDir, reoptimize, maxEvals, orderedRuns,
-                profileService, starDetectionOptions, afOptions, alglibAPI, pixelScale, debayer).ConfigureAwait(false);
+                profileService, starDetectionOptions, afOptions, detection, alglibAPI, pixelScale).ConfigureAwait(false);
             Console.WriteLine($"Detection params: source={optimizationSource}, Sensitivity={F(detectionParams.Sensitivity)}, " +
                 $"StarClippingMultiplier={F(detectionParams.StarClippingMultiplier)}, StructureLayers={detectionParams.StructureLayers}, " +
                 $"DefocusAwareDonutDetection={detectionParams.DefocusAwareDonutDetection}");
-            Console.WriteLine($"Debayer bayered frames to luminance (match live app): {debayer}");
+            Console.WriteLine($"Detection representation: the live app's (debayer + CFA hotpixel filter inside Detect); " +
+                $"profile Debayer image = {activeProfile.ImageSettings.DebayerImage}");
 
             // Measure the tilt plane for each run.
             var detector = new StarDetector(alglibAPI);
@@ -195,16 +236,16 @@ namespace TestApp {
 
             var perStep = new List<StepResult>(orderedRuns.Count);
             foreach (var run in orderedRuns) {
-                Console.WriteLine($"Measuring 4-corner tilt for {run.Step} ({Path.GetFileName(run.Folder)}, {run.Frames.Count} frames × 5 regions) ...");
+                Console.WriteLine($"Measuring 4-corner tilt for {run.Step} ({Path.GetFileName(run.Folder)}, {run.Frames.Count} frames x 5 regions) ...");
                 var sw4c = System.Diagnostics.Stopwatch.StartNew();
-                var stepResult = await MeasureTiltAsync(run, detector, detectionParams, regions, fRatio,
-                    metadata.FocuserStepSizeMicrons, metadata.PixelSizeMicrons, starDetectionOptions.MeasurementAverage,
-                    profileService, alglibAPI, afOptions.HyperbolicFitModel, debayer).ConfigureAwait(false);
+                var stepResult = await MeasureTiltAsync(run, detection, detectionParams, regions, fRatio,
+                    metadata.FocuserStepSizeMicrons, pixelSizeMicrons,
+                    profileService, alglibAPI, afOptions.HyperbolicFitModel).ConfigureAwait(false);
                 perStep.Add(stepResult);
                 Console.WriteLine($"    [4-corner {run.Step}] done in {sw4c.ElapsedMilliseconds} ms");
                 Console.WriteLine($"    A={F(stepResult.Gradient.A)}, B={F(stepResult.Gradient.B)}, " +
-                    $"direction={F(NormalizeAngle(Math.Atan2(stepResult.Gradient.A, -stepResult.Gradient.B) * 180.0 / Math.PI))}°, " +
-                    $"tilt={F(stepResult.TiltAngleDeg)}°, mean={F(stepResult.Gradient.MeanFocuserPosition)}");
+                    $"direction={F(NormalizeAngle(Math.Atan2(stepResult.Gradient.A, -stepResult.Gradient.B) * 180.0 / Math.PI))} deg, " +
+                    $"tilt={F(stepResult.TiltAngleDeg)} deg, mean={F(stepResult.Gradient.MeanFocuserPosition)}");
             }
 
             // Calibrate using the pure shared calculator.
@@ -226,7 +267,7 @@ namespace TestApp {
                 FallbackCurvatureSign = metadata.Calibration?.CurvatureSign ?? 0,
                 ImageWidthPixels = imageSize.Width,
                 ImageHeightPixels = imageSize.Height,
-                PixelSizeMicrons = metadata.PixelSizeMicrons,
+                PixelSizeMicrons = pixelSizeMicrons,
                 FocuserStepMicrons = metadata.FocuserStepSizeMicrons,
                 ScrewRadiusMillimeters = metadata.ScrewRadiusMillimeters,
                 CalibrationAppliedAmount = metadata.CalibrationAppliedAmount,
@@ -241,17 +282,20 @@ namespace TestApp {
                 Console.WriteLine($"Paraboloid (per-star) tilt for {run.Step} ...");
                 var mean = byStep[run.Step].Gradient.MeanFocuserPosition;
                 var ps = await MeasureTiltViaParaboloidAsync(run, detector, detectionParams, metadata.FocuserStepSizeMicrons,
-                    metadata.PixelSizeMicrons, mean, profileService, inspectorOptions, afOptions, alglibAPI, debayer,
+                    pixelSizeMicrons, mean, profileService, inspectorOptions, afOptions, alglibAPI,
                     diagDir: Path.Combine(outDir, "diag")).ConfigureAwait(false);
                 paraboloidSteps.Add(ps);
                 Console.WriteLine(ps.Fitted
-                    ? $"    A={F(ps.Gradient.A)}, B={F(ps.Gradient.B)}, stars={ps.StarsInModel}, R²={F(ps.RSquared)}"
+                    ? $"    A={F(ps.Gradient.A)}, B={F(ps.Gradient.B)}, stars={ps.StarsInModel}, R^2={F(ps.RSquared)}"
                     : $"    paraboloid fit FAILED: {ps.Status}");
             }
             TiltCalibrationResult paraboloidCalibration = null;
+            // Hoisted out of the `if` (rather than a `var` local to it) so WriteReport's Step 7.2 estimator
+            // comparison can reuse the SAME inputs object Calibrate() consumed here — not a re-derived copy.
+            TiltCalibrationInputs pinputs = null;
             if (paraboloidSteps.All(p => p.Fitted)) {
                 var pbyStep = paraboloidSteps.ToDictionary(s => s.Step, StringComparer.OrdinalIgnoreCase);
-                var pinputs = new TiltCalibrationInputs {
+                pinputs = new TiltCalibrationInputs {
                     ScrewCount = metadata.NumberOfScrews,
                     Baseline = hasCurvatureSteps ? pbyStep["Baseline"].Gradient : default,
                     AllInward = hasCurvatureSteps ? pbyStep["AllInward"].Gradient : default,
@@ -263,7 +307,7 @@ namespace TestApp {
                     FallbackCurvatureSign = metadata.Calibration?.CurvatureSign ?? 0,
                     ImageWidthPixels = imageSize.Width,
                     ImageHeightPixels = imageSize.Height,
-                    PixelSizeMicrons = metadata.PixelSizeMicrons,
+                    PixelSizeMicrons = pixelSizeMicrons,
                     FocuserStepMicrons = metadata.FocuserStepSizeMicrons,
                     ScrewRadiusMillimeters = metadata.ScrewRadiusMillimeters,
                     CalibrationAppliedAmount = metadata.CalibrationAppliedAmount,
@@ -272,7 +316,7 @@ namespace TestApp {
                 paraboloidCalibration = TiltCalibrationCalculator.Calibrate(pinputs);
             }
 
-            WriteReport(outDir, metadata, optimizationSource, perStep, inputs, calibration, paraboloidSteps, paraboloidCalibration);
+            WriteReport(outDir, metadata, optimizationSource, perStep, inputs, calibration, paraboloidSteps, paraboloidCalibration, pinputs, regions, pixelSizeProvenance);
             Console.WriteLine($"Wrote tilt_summary.txt and tilt_summary.json to {outDir}");
         }
 
@@ -369,13 +413,17 @@ namespace TestApp {
         private static async Task<(StarDetectorParams Params, string Source)> ResolveDetectionParamsAsync(
             TiltCalibrationMetadata metadata, string metadataPath, string outDir, bool reoptimize, int? maxEvals,
             List<RunStep> orderedRuns, ProfileService profileService, StarDetectionOptions starDetectionOptions,
-            AutoFocusOptions afOptions, AlglibAPI alglibAPI, double pixelScale, bool debayer) {
+            AutoFocusOptions afOptions, IHocusFocusStarDetection detection, AlglibAPI alglibAPI, double pixelScale) {
 
             StarDetectorParams ApplyAfContext(StarDetectorParams p) {
                 p.PixelScale = pixelScale;
                 p.Region = StarDetectionRegion.Full;
                 p.ModelPSF = false;
                 p.SaveIntermediateFilesPath = string.Empty;
+                // Output-neutral and excluded from the detection cache key, exactly as the wizard sets it: now that
+                // detection runs through the plugin's facade, every one of the ~200 measurement detections (and the
+                // thousands the optimizer makes) would otherwise emit a per-region "Average HFR" INFO line.
+                p.SuppressInfoLogging = true;
                 return p;
             }
 
@@ -398,27 +446,29 @@ namespace TestApp {
                 seed.DefocusAwareDonutDetection = true;
                 baseline.DefocusAwareDonutDetection = true;
             }
-
-            var detector = new StarDetector(alglibAPI);
-            var measurementAverage = starDetectionOptions.MeasurementAverage;
             var objectiveConstants = new ObjectiveConstants();
 
-            var loaded = new List<(RunStep Run, List<(int Focuser, Mat Mat)> Frames, RunEvaluationData Data)>();
+            var loaded = new List<(RunStep Run, RunEvaluationData Data)>();
             try {
                 foreach (var run in orderedRuns) {
-                    var mats = await LoadRunMatsAsync(run, profileService, debayer).ConfigureAwait(false);
-                    var frames = mats.Select(m => new RunFrame { FrameId = m.Path, FocuserPosition = m.Focuser, Image = m.Mat }).ToList();
+                    var images = await LoadRunImagesAsync(run, profileService).ConfigureAwait(false);
+                    var frames = images.Select(m => new RunFrame { FrameId = m.Path, FocuserPosition = m.Focuser, Image = m.Image }).ToList();
                     var stepSize = InferStepSize(run.Frames.Select(f => f.Focuser));
                     var fitConfig = new RunFitConfig {
                         StepSize = stepSize,
                         UseWeights = afOptions.WeightedHyperbolicFitEnabled,
                         MaxOutlierRejections = afOptions.MaxOutlierRejections,
                         RejectionConfidence = afOptions.OutlierRejectionConfidence,
-                        PreferredModel = null
+                        // Was hard-coded null while the wizard's loader passes afOptions.HyperbolicFitModel.
+                        PreferredModel = afOptions.HyperbolicFitModel
                     };
-                    var splitDetector = new MatSplitFrameDetector(detector, measurementAverage, HighSigmaOutlierRejection, LowSigmaOutlierRejection);
+                    // The WIZARD'S OWN split detector over the IRenderedImage the live app detects on, so the CFA
+                    // hotpixel filter and the debayer run inside Detect at each candidate's params — which is what
+                    // keeps HotpixelThreshold/HotpixelThresholdingEnabled meaningful as SEARCHED axes.
+                    var splitDetector = new RunEvaluationLoader.HocusFocusSplitFrameDetector(
+                        detection, new HocusFocusDetectionParams { IsAutoFocus = true, NumberOfAFStars = 0 });
                     var data = new RunEvaluationData(run.Folder, frames, splitDetector, alglibAPI, fitConfig, null);
-                    loaded.Add((run, mats.Select(m => (m.Focuser, m.Mat)).ToList(), data));
+                    loaded.Add((run, data));
                 }
 
                 var settings = new OptimizerSettings();
@@ -457,12 +507,12 @@ namespace TestApp {
                 var detectionParams = ApplyAfContext(CloneParamsViaDefault(result.BestParams));
                 return (detectionParams, reoptimize ? "reoptimized" : "optimized");
             } finally {
+                // An IRenderedImage is not IDisposable; disposing the RunEvaluationData frees the cached early
+                // detection contexts, and dropping the list releases the frames.
                 foreach (var l in loaded) {
                     l.Data?.Dispose();
-                    foreach (var (_, mat) in l.Frames) {
-                        mat?.Dispose();
-                    }
                 }
+                loaded.Clear();
             }
         }
 
@@ -516,26 +566,32 @@ namespace TestApp {
         }
 
         private static async Task<StepResult> MeasureTiltAsync(
-            RunStep run, StarDetector detector, StarDetectorParams baseParams, List<StarDetectionRegion> regions,
-            double fRatio, double focuserStepMicrons, double pixelSizeMicrons, MeasurementAverageEnum measurementAverage,
-            ProfileService profileService, IAlglibAPI alglibAPI, HyperbolicFitModel hyperbolicModel, bool debayer) {
+            RunStep run, IHocusFocusStarDetection detection, StarDetectorParams baseParams, List<StarDetectionRegion> regions,
+            double fRatio, double focuserStepMicrons, double pixelSizeMicrons,
+            ProfileService profileService, IAlglibAPI alglibAPI, HyperbolicFitModel hyperbolicModel) {
 
-            var mats = await LoadRunMatsAsync(run, profileService, debayer).ConfigureAwait(false);
+            // The wizard's own split detector: BuildContext + GateAndMeasure IS Detect, and its FrameDetectionResult
+            // mapping (HFR aggregation at the HocusFocusDetectionParams defaults, high 4.0 / low 3.0) is by
+            // definition the wizard's rather than a harness copy of it.
+            var splitDetector = new RunEvaluationLoader.HocusFocusSplitFrameDetector(
+                detection, new HocusFocusDetectionParams { IsAutoFocus = true, NumberOfAFStars = 0 });
+            var images = await LoadRunImagesAsync(run, profileService).ConfigureAwait(false);
             try {
-                var imageSize = new DrawingSize(mats[0].Mat.Width, mats[0].Mat.Height);
+                var firstProps = images[0].Image.RawImageData.Properties;
+                var imageSize = new DrawingSize(firstProps.Width, firstProps.Height);
 
                 // Per region (1..5): collect (focuser, HFR, sigma) then fit the focus curve -> minimum.
                 var regionFinal = new double[6];
                 var regionR2 = new double[6];
                 for (int ri = 1; ri <= 5; ri++) {
                     var region = regions[ri];
-                    var points = new List<ScatterErrorPoint>(mats.Count);
-                    foreach (var (focuser, _, mat) in mats) {
+                    var points = new List<ScatterErrorPoint>(images.Count);
+                    foreach (var (focuser, _, image) in images) {
                         baseParams.Region = region;
-                        using var frameCopy = mat.Clone(); // Detect mutates its input
-                        var result = await detector.Detect(frameCopy, baseParams, progress: null, CancellationToken.None).ConfigureAwait(false);
-                        var agg = HarnessDetection.ToFrameDetectionResult(result, measurementAverage, HighSigmaOutlierRejection, LowSigmaOutlierRejection, imageSize,
-                            baseParams.ExcludeSaturatedStarsFromHFR, baseParams.SaturationThreshold);
+                        // Detect(IRenderedImage, ...) builds its own source Mat per call, so nothing is cloned and
+                        // nothing is mutated: the same loaded frame serves all 5 regions.
+                        using var ctx = await splitDetector.BuildContextAsync(image, baseParams, CancellationToken.None).ConfigureAwait(false);
+                        var agg = splitDetector.GateAndMeasure(ctx, baseParams);
                         if (agg.AverageHFR > 0 && agg.StarCount > 1) {
                             var sigma = agg.HFRStdDev > 0 ? agg.HFRStdDev : 1.0;
                             points.Add(new ScatterErrorPoint(focuser, agg.AverageHFR, 0, sigma));
@@ -547,10 +603,19 @@ namespace TestApp {
                     regionR2[ri] = rSquared;
                 }
 
+                // The corner-region samples sit at the REGION CENTERS BuildTiltRegions actually laid out (±1/3
+                // normalized with default ROI), not at the true frame corners (±0.5) the 8-arg overload defaults
+                // to for the paraboloid caller (which evaluates its surface AT the real corners). Passing the
+                // actual design points — mirroring TiltPlaneModel.Create(AutoFocusResult, ...)'s own Task-1 fix —
+                // makes the regressed A/B honest; leaving the defaulted ±0.5 in place here silently attenuates
+                // them by (design-point / 0.5), the ×0.62 magnitude scale on this harness's region-path move
+                // ratio and recovered step size that Task 7.1 removes.
+                var (cornerXNorm, cornerYNorm) = CornerDesignPoint(regions);
                 var model = TiltPlaneModel.Create(
                     imageSize: imageSize, fRatio: fRatio, focuserStepSizeMicrons: focuserStepMicrons,
                     centerFocuser: regionFinal[1], topLeftFocuser: regionFinal[2], topRightFocuser: regionFinal[3],
-                    bottomLeftFocuser: regionFinal[4], bottomRightFocuser: regionFinal[5]);
+                    bottomLeftFocuser: regionFinal[4], bottomRightFocuser: regionFinal[5],
+                    cornerXNorm: cornerXNorm, cornerYNorm: cornerYNorm);
 
                 double tiltAngleDeg = TiltAngleDegrees(model.A, model.B, imageSize, focuserStepMicrons, pixelSizeMicrons);
 
@@ -564,9 +629,8 @@ namespace TestApp {
                     RegionPositions = regionFinal.Select(d => (int)Math.Round(d)).ToArray()
                 };
             } finally {
-                foreach (var (_, _, mat) in mats) {
-                    mat?.Dispose();
-                }
+                // An IRenderedImage is not IDisposable; dropping the list releases the frames.
+                images.Clear();
             }
         }
 
@@ -578,6 +642,11 @@ namespace TestApp {
             public int StarsInModel;
             public double RSquared;
             public double TiltAngleDeg;
+
+            // Isotropic curvature coefficient from the same paraboloid fit (SensorParaboloidModel.K): the
+            // surface's z += K·(x-X0)² + K·(y-Y0)² term, with x/y/z all in sensor/focuser MICRONS (see
+            // SensorModel.FitParaboloidModel). Used by the Step 7.2 curvature cross-check. NaN when !Fitted.
+            public double K = double.NaN;
             public bool Fitted;
             public string Status;           // why the fit failed, when !Fitted
         }
@@ -593,10 +662,10 @@ namespace TestApp {
         private static async Task<ParaboloidStepResult> MeasureTiltViaParaboloidAsync(
             RunStep run, StarDetector detector, StarDetectorParams baseParams, double focuserStepMicrons,
             double pixelSizeMicrons, double fourCornerMean, ProfileService profileService,
-            InspectorOptions inspectorOptions, AutoFocusOptions afOptions, IAlglibAPI alglibAPI, bool debayer,
+            InspectorOptions inspectorOptions, AutoFocusOptions afOptions, IAlglibAPI alglibAPI,
             string diagDir = null) {
 
-            var mats = await LoadRunMatsAsync(run, profileService, debayer).ConfigureAwait(false);
+            var images = await LoadRunImagesAsync(run, profileService).ConfigureAwait(false);
             try {
                 // Opt-in observation-only diagnostics: per-star/point/iteration CSV dumps of this step's
                 // sensor-model fit, named after the step (e.g. Screw1_points.csv). Cleared in the finally below.
@@ -604,20 +673,22 @@ namespace TestApp {
                     SensorModel.DiagnosticsDirectory = diagDir;
                     SensorModel.DiagnosticsLabel = run.Step;
                 }
-                var imageSize = new DrawingSize(mats[0].Mat.Width, mats[0].Mat.Height);
-                var sensorFrames = new List<SensorDetectedStars>(mats.Count);
+                var firstProps = images[0].Image.RawImageData.Properties;
+                var imageSize = new DrawingSize(firstProps.Width, firstProps.Height);
+                var sensorFrames = new List<SensorDetectedStars>(images.Count);
                 baseParams.Region = StarDetectionRegion.Full;
                 int fi = 0;
-                foreach (var (focuser, _, mat) in mats) {
+                foreach (var (focuser, _, image) in images) {
                     var swDet = System.Diagnostics.Stopwatch.StartNew();
-                    using var frameCopy = mat.Clone();
-                    var result = await detector.Detect(frameCopy, baseParams, progress: null, CancellationToken.None).ConfigureAwait(false);
+                    // Detect(IRenderedImage, ...) — the live app's entry point, so the CFA hotpixel filter and the
+                    // debayer happen inside detection at baseParams. It builds its own source Mat, so no clone.
+                    var result = await detector.Detect(image, baseParams, progress: null, CancellationToken.None).ConfigureAwait(false);
                     var stars = result.DetectedStars ?? new List<Star>();
                     var starList = stars.Select(HocusFocusStarDetection.ToDetectedStar)
                         .OrderBy(s => s.Position.Y * (long)imageSize.Width + s.Position.X).ToList();
                     sensorFrames.Add(new SensorDetectedStars(
                         focuser, new HocusFocusStarDetectionResult { StarList = starList, ImageSize = imageSize }, image: null));
-                    Console.WriteLine($"    [paraboloid {run.Step}] full-sensor detect {++fi}/{mats.Count} focuser {focuser}: {starList.Count} stars ({swDet.ElapsedMilliseconds} ms)");
+                    Console.WriteLine($"    [paraboloid {run.Step}] full-sensor detect {++fi}/{images.Count} focuser {focuser}: {starList.Count} stars ({swDet.ElapsedMilliseconds} ms)");
                 }
 
                 int stepSize = InferStepSize(run.Frames.Select(f => f.Focuser));
@@ -644,7 +715,7 @@ namespace TestApp {
                         pixelSize: pixelSizeMicrons, progress: new Progress<ApplicationStatus>(), stepSize: stepSize,
                         ct: cts.Token));
                     if (await Task.WhenAny(fitTask, Task.Delay(TimeSpan.FromSeconds(fitTimeoutSec + 5))).ConfigureAwait(false) != fitTask) {
-                        Console.WriteLine($"    [paraboloid {run.Step}] fit TIMED OUT (>{fitTimeoutSec}s) — abandoning and moving on");
+                        Console.WriteLine($"    [paraboloid {run.Step}] fit TIMED OUT (>{fitTimeoutSec}s) -- abandoning and moving on");
                         return new ParaboloidStepResult { Step = run.Step, Fitted = false, Status = $"fit timed out (>{fitTimeoutSec}s)" };
                     }
                     var (fit, _) = await fitTask.ConfigureAwait(false);
@@ -661,6 +732,7 @@ namespace TestApp {
                         StarsInModel = fit.StarsInModel,
                         RSquared = fit.GoodnessOfFit,
                         TiltAngleDeg = fit.Theta * 180.0 / Math.PI,
+                        K = fit.K,
                         Fitted = true
                     };
                 } catch (Exception ex) {
@@ -669,9 +741,7 @@ namespace TestApp {
             } finally {
                 SensorModel.DiagnosticsDirectory = null;
                 SensorModel.DiagnosticsLabel = null;
-                foreach (var (_, _, mat) in mats) {
-                    mat?.Dispose();
-                }
+                images.Clear();
             }
         }
 
@@ -705,11 +775,53 @@ namespace TestApp {
 
         // ---- Image loading + regions ----------------------------------------------------------------------
 
-        private static async Task<List<(int Focuser, string Path, Mat Mat)>> LoadRunMatsAsync(RunStep run, ProfileService profileService, bool debayer) {
-            var result = new List<(int, string, Mat)>(run.Frames.Count);
+        /// <summary>
+        /// Loads a step's frames as the <see cref="IRenderedImage"/>s the LIVE app detects on, so a bayered run is
+        /// not measured on its raw Bayer mosaic. Detection reads them without mutating them (Detect and
+        /// BuildDetectionContext each build their own source Mat), so one load per frame serves every region and
+        /// every candidate evaluation.
+        /// </summary>
+        /// <summary>
+        /// The EFFECTIVE pixel pitch of the saved frames — the camera's own pixel size times the binning they
+        /// were captured at — derived exactly as the live app derives it in
+        /// <c>HocusFocusStarDetection.BuildResultHeader</c>: <c>MetaData.Camera.PixelSize × max(BinX, 1)</c>.
+        ///
+        /// <para>Every consumer here multiplies this by a frame DIMENSION to get the sensor's physical extent, so
+        /// it must describe the same frame those dimensions came from. Under NINA's Auto Focus Binning of N the
+        /// frame is N× smaller per axis and each of its pixels N× coarser; pairing a binned frame with a native
+        /// pitch understates the sensor by N and inflates every recovered gradient — and with it the reported
+        /// thread pitch / stepper step size — by exactly N. That is the bug the wizard carried until
+        /// <c>TiltPlaneModel</c> started carrying its own pitch.</para>
+        ///
+        /// <para>Read from the FRAMES rather than from <c>metadata.PixelSizeMicrons</c> on purpose: that field is
+        /// the effective pitch only from metadata schema 4 onward and the NATIVE pitch before it, so trusting it
+        /// would silently reproduce the old inflation on every run an older wizard saved. The header is
+        /// unambiguous at every schema — both the FITS and XISF readers divide the stored (binned) XPIXSZ back out
+        /// by XBINNING, so <c>Camera.PixelSize</c> is always native and <c>BinX</c> always carries the factor.
+        /// Falls back to the metadata value only when a header carries no pixel size at all.</para>
+        /// </summary>
+        private static async Task<EffectivePixelSize.Resolution> ResolveEffectivePixelSizeAsync(
+            List<RunStep> orderedRuns, TiltCalibrationMetadata metadata, ProfileService profileService) {
+            var firstFrame = orderedRuns.SelectMany(r => r.Frames).OrderBy(f => f.Focuser).Select(f => f.Path).FirstOrDefault();
+            if (firstFrame == null) {
+                return EffectivePixelSize.FromMetadata(metadata.PixelSizeMicrons, "no frames to read a header from");
+            }
+            try {
+                var image = await DiagnosticUtil.LoadRenderedImage(firstFrame, profileService).ConfigureAwait(false);
+                var camera = image.RawImageData.MetaData.Camera;
+                return EffectivePixelSize.FromFrameHeader(
+                    camera.PixelSize, camera.BinX, metadata.PixelSizeMicrons, Path.GetFileName(firstFrame));
+            } catch (Exception ex) {
+                Logger.Warning($"Could not read the pixel size from {firstFrame}: {ex.Message}");
+                return EffectivePixelSize.FromMetadata(metadata.PixelSizeMicrons, $"header unreadable: {ex.Message}");
+            }
+        }
+
+        private static async Task<List<(int Focuser, string Path, IRenderedImage Image)>> LoadRunImagesAsync(RunStep run, ProfileService profileService) {
+            var result = new List<(int, string, IRenderedImage)>(run.Frames.Count);
             foreach (var (focuser, path) in run.Frames.OrderBy(f => f.Focuser)) {
-                var mat = await DiagnosticUtil.LoadFloatMat(path, profileService, debayer).ConfigureAwait(false);
-                result.Add((focuser, path, mat));
+                var image = await DiagnosticUtil.LoadRenderedImage(path, profileService).ConfigureAwait(false);
+                result.Add((focuser, path, image));
             }
             return result;
         }
@@ -732,6 +844,17 @@ namespace TestApp {
             };
         }
 
+        /// <summary>The 4-corner region's design point — the actual center of the TL corner region
+        /// <see cref="BuildTiltRegions"/> laid out, in normalized [-0.5, 0.5] image coordinates — mirroring
+        /// <c>TiltPlaneModel.Create(AutoFocusResult, ...)</c>'s own derivation (Task 1). Used both to regress the
+        /// region plane against where the samples actually are (Step 7.1) and, at the SAME radius, to predict the
+        /// paraboloid's corner-vs-center curvature sag for the cross-check (Step 7.2) — one source of truth for
+        /// "where do the corner regions sit" so the two never disagree with each other.</summary>
+        private static (double xNorm, double yNorm) CornerDesignPoint(List<StarDetectionRegion> regions) {
+            var tl = regions[2].OuterBoundary;
+            return (Math.Abs(tl.StartX + tl.Width / 2.0 - 0.5), Math.Abs(tl.StartY + tl.Height / 2.0 - 0.5));
+        }
+
         private static int InferStepSize(IEnumerable<int> focusers) {
             var positions = focusers.Distinct().OrderBy(x => x).Take(2).ToList();
             return positions.Count > 1 ? Math.Abs(positions[0] - positions[1]) : 0;
@@ -742,9 +865,14 @@ namespace TestApp {
         private static void WriteReport(
             string outDir, TiltCalibrationMetadata metadata, string optimizationSource, List<StepResult> perStep,
             TiltCalibrationInputs inputs, TiltCalibrationResult calibration,
-            List<ParaboloidStepResult> paraboloidSteps, TiltCalibrationResult paraboloidCalibration) {
+            List<ParaboloidStepResult> paraboloidSteps, TiltCalibrationResult paraboloidCalibration,
+            TiltCalibrationInputs pinputs, List<StarDetectionRegion> regions, string pixelSizeProvenance) {
 
             bool isStepper = inputs.IsStepperAdjustment;
+            // The pitch the calibration actually ran on, taken off the inputs Calibrate() consumed rather than
+            // re-read from the metadata — the two differ on a pre-schema-4 run captured with binning, and the
+            // report has to quote the number the numbers below were produced with.
+            double pixelSizeMicrons = inputs.PixelSizeMicrons;
             double groundTruthHardware = isStepper ? metadata.StepperStepSizeMicrons : metadata.ScrewThreadPitchMicrons;
             double measuredHardware = calibration.MeasuredHardwareMicrons;
             double hardwarePctDelta = (groundTruthHardware > 0 && !double.IsNaN(measuredHardware))
@@ -758,15 +886,18 @@ namespace TestApp {
             Line("================ TILT CALIBRATION VALIDATION ================");
             Line($"Screws: {metadata.NumberOfScrews}   Adjustment: {(isStepper ? "StepperMotors" : "Screws")}");
             Line($"Ground truth: radius={F(metadata.ScrewRadiusMillimeters)} mm, " +
-                $"{(isStepper ? "step size" : "thread pitch")}={F(groundTruthHardware)} µm/{(isStepper ? "step" : "turn")}, " +
-                $"pixel={F(metadata.PixelSizeMicrons)} µm, focuser={F(metadata.FocuserStepSizeMicrons)} µm/step");
+                $"{(isStepper ? "step size" : "thread pitch")}={F(groundTruthHardware)} um/{(isStepper ? "step" : "turn")}, " +
+                $"focuser={F(metadata.FocuserStepSizeMicrons)} um/step");
+            Line($"Pixel size: {F(pixelSizeMicrons)} um effective ({pixelSizeProvenance})" +
+                (metadata.PixelSizeMicrons > 0 && Math.Abs(pixelSizeMicrons - metadata.PixelSizeMicrons) > EffectivePixelSize.DisagreementToleranceMicrons
+                    ? $"; metadata records {F(metadata.PixelSizeMicrons)} um" : string.Empty));
             Line($"Applied per screw step: {F(metadata.CalibrationAppliedAmount)} {(isStepper ? "steps" : "turns")}");
-            Line($"Expected Screw 1 angle: {F(metadata.ExpectedPositionAngleScrew1Deg)}°   Defocus-aware: {metadata.DefocusAwareDetectionNeeded}");
+            Line($"Expected Screw 1 angle: {F(metadata.ExpectedPositionAngleScrew1Deg)} deg   Defocus-aware: {metadata.DefocusAwareDetectionNeeded}");
             Line($"Detection settings source: {optimizationSource}");
             Line();
 
             Line("Per-run tilt plane:");
-            Line($"  {"Step",-10} {"A",10} {"B",10} {"dir°",8} {"tilt°",8} {"mean",10}  R²(C/TL/TR/BL/BR)");
+            Line($"  {"Step",-10} {"A",10} {"B",10} {"dir deg",8} {"tilt deg",8} {"mean",10}  R^2(C/TL/TR/BL/BR)");
             foreach (var s in perStep) {
                 double dir = NormalizeAngle(Math.Atan2(s.Gradient.A, -s.Gradient.B) * 180.0 / Math.PI);
                 var r2 = string.Join("/", Enumerable.Range(1, 5).Select(i => s.RegionRSquared[i].ToString("F2", CultureInfo.InvariantCulture)));
@@ -774,29 +905,29 @@ namespace TestApp {
             }
             Line();
 
-            Line("Calibrated screw angles (image-space, ° CW from top):");
-            Line($"  Screw 1: {F(calibration.Screw1AngleDegrees)}°  (expected {F(metadata.ExpectedPositionAngleScrew1Deg)}°, deviation {F(screw1Deviation)}°)");
-            Line($"  Screw 2: {F(calibration.Screw2AngleDegrees)}°");
-            Line($"  Screw 3: {F(calibration.Screw3AngleDegrees)}°");
+            Line("Calibrated screw angles (image-space, deg CW from top):");
+            Line($"  Screw 1: {F(calibration.Screw1AngleDegrees)} deg  (expected {F(metadata.ExpectedPositionAngleScrew1Deg)} deg, deviation {F(screw1Deviation)} deg)");
+            Line($"  Screw 2: {F(calibration.Screw2AngleDegrees)} deg");
+            Line($"  Screw 3: {F(calibration.Screw3AngleDegrees)} deg");
             if (metadata.NumberOfScrews == 4) {
-                Line($"  Screw 4: {F(calibration.Screw4AngleDegrees)}°");
+                Line($"  Screw 4: {F(calibration.Screw4AngleDegrees)} deg");
             }
-            Line($"  Raw measured Screw1->Screw2 gap: {F(calibration.RawAngleDiffDegrees)}° (ideal {(metadata.NumberOfScrews == 3 ? "120" : "90")}°)");
-            Line($"  Screw move directions: Screw1={F(calibration.Screw1DirectionDegrees)}°, Screw2={F(calibration.Screw2DirectionDegrees)}°");
+            Line($"  Raw measured Screw1->Screw2 gap: {F(calibration.RawAngleDiffDegrees)} deg (ideal {(metadata.NumberOfScrews == 3 ? "120" : "90")} deg)");
+            Line($"  Screw move directions: Screw1={F(calibration.Screw1DirectionDegrees)} deg, Screw2={F(calibration.Screw2DirectionDegrees)} deg");
             Line();
 
             Line($"Recovered {(isStepper ? "stepper step size" : "thread pitch")}: " +
-                $"{F(measuredHardware)} µm/{(isStepper ? "step" : "turn")}  " +
-                $"(ground truth {F(groundTruthHardware)}, Δ {(double.IsNaN(hardwarePctDelta) ? "n/a" : F(hardwarePctDelta) + "%")})");
-            Line($"Screw move magnitude ratio (larger/smaller): {F(calibration.MoveMagnitudeRatio)}× " +
-                "(should be ~1× for two equal calibration turns)");
+                $"{F(measuredHardware)} um/{(isStepper ? "step" : "turn")}  " +
+                $"(ground truth {F(groundTruthHardware)}, delta {(double.IsNaN(hardwarePctDelta) ? "n/a" : F(hardwarePctDelta) + "%")})");
+            Line($"Screw move magnitude ratio (larger/smaller): {F(calibration.MoveMagnitudeRatio)}x " +
+                "(should be ~1x for two equal calibration turns)");
             // A measured sign is always ±1; sign 0 is only reachable for a 4-step run whose metadata carried no
             // fallback sign (and a two-section format would misprint it as "+0"), so spell out the unmeasured cases.
             string curvatureSignText;
             if (inputs.HasCurvatureMeasurement) {
                 curvatureSignText = calibration.CurvatureSign.ToString("+0;-0", CultureInfo.InvariantCulture);
             } else if (calibration.CurvatureSign == 0) {
-                curvatureSignText = "0 (unknown — not measured, no fallback in metadata)";
+                curvatureSignText = "0 (unknown -- not measured, no fallback in metadata)";
             } else {
                 curvatureSignText = calibration.CurvatureSign.ToString("+0;-0", CultureInfo.InvariantCulture) +
                     " (not measured; carried from metadata)";
@@ -808,38 +939,121 @@ namespace TestApp {
             Line("Calibration confidence (signal vs noise from the per-step tilt vectors):");
             Line($"  Screw-move signal: {F(conf.ScrewMoveSignal)}   Noise floor: {F(conf.NoiseEstimate)}   SNR: {F(conf.SignalToNoise)}");
             if (inputs.HasCurvatureMeasurement) {
-                Line($"  Noise probes (should be « the signal) — AllInward piston residual: {F(conf.AllInwardTiltResidual)}, " +
+                Line($"  Noise probes (should be << the signal) -- AllInward piston residual: {F(conf.AllInwardTiltResidual)}, " +
                     $"re-baseline drift 1/2: {F(conf.Rebaseline1Drift)}/{F(conf.Rebaseline2Drift)}");
             } else {
                 // 4-step run: no curvature-direction steps were captured, so the AllInward residual and first
                 // re-baseline drift do not exist; the single re-baseline drift is the only noise probe.
-                Line($"  Noise probe (should be « the signal) — single re-baseline drift: {F(conf.Rebaseline2Drift)} (4-step run)");
+                Line($"  Noise probe (should be << the signal) -- single re-baseline drift: {F(conf.Rebaseline2Drift)} (4-step run)");
             }
-            Line($"  Predicted screw-direction uncertainty: ±{F(conf.PredictedAngleUncertaintyDeg)}°");
+            Line($"  Predicted screw-direction uncertainty: +/-{F(conf.PredictedAngleUncertaintyDeg)} deg");
             if (!conf.IsReliable) {
-                Line($"  NOTE: SNR {F(conf.SignalToNoise)} is below {F(TiltCalibrationCalculator.MinReliableSignalToNoise)} — the calibration is " +
+                Line($"  NOTE: SNR {F(conf.SignalToNoise)} is below {F(TiltCalibrationCalculator.MinReliableSignalToNoise)} -- the calibration is " +
                     "noise-dominated (insufficient or unstable signal). Re-capture on a star-rich field with a finer step; " +
                     "the recovered screw geometry from this run should not be applied.");
             }
             Line();
 
             // Alternative estimator: the per-star paraboloid tilt (the "calibrate from the sensor-model tilt" rewire).
-            Line("Per-star paraboloid tilt (alternative estimator — the robust sensor-model Gx/Gy):");
-            Line($"  {"Step",-12} {"A",10} {"B",10} {"stars",6} {"R²",7}  status");
+            Line("Per-star paraboloid tilt (alternative estimator -- the robust sensor-model Gx/Gy):");
+            Line($"  {"Step",-12} {"A",10} {"B",10} {"stars",6} {"R^2",7}  status");
             foreach (var ps in paraboloidSteps) {
                 Line(ps.Fitted
                     ? $"  {ps.Step,-12} {F(ps.Gradient.A),10} {F(ps.Gradient.B),10} {ps.StarsInModel,6} {F(ps.RSquared),7}  ok"
-                    : $"  {ps.Step,-12} {"—",10} {"—",10} {"—",6} {"—",7}  FAILED: {ps.Status}");
+                    : $"  {ps.Step,-12} {"--",10} {"--",10} {"--",6} {"--",7}  FAILED: {ps.Status}");
             }
             if (paraboloidCalibration?.Confidence != null) {
                 var pc = paraboloidCalibration.Confidence;
                 Line($"  Paraboloid calibration: SNR {F(pc.SignalToNoise)} (vs 4-corner {F(conf.SignalToNoise)}), " +
-                    $"screw gap {F(paraboloidCalibration.RawAngleDiffDegrees)}° (ideal {(metadata.NumberOfScrews == 3 ? "120" : "90")}°), " +
-                    $"move ratio {F(paraboloidCalibration.MoveMagnitudeRatio)}×, reliable={pc.IsReliable}");
+                    $"screw gap {F(paraboloidCalibration.RawAngleDiffDegrees)} deg (ideal {(metadata.NumberOfScrews == 3 ? "120" : "90")} deg), " +
+                    $"move ratio {F(paraboloidCalibration.MoveMagnitudeRatio)}x, reliable={pc.IsReliable}");
             } else {
                 int fitted = paraboloidSteps.Count(p => p.Fitted);
-                Line($"  Paraboloid calibration not computed — only {fitted}/{paraboloidSteps.Count} steps fitted. " +
-                    "The per-star model needs ≥9 stars matched across ≥5 frames; this field is too star-poor for it.");
+                Line($"  Paraboloid calibration not computed -- only {fitted}/{paraboloidSteps.Count} steps fitted. " +
+                    "The per-star model needs >=9 stars matched across >=5 frames; this field is too star-poor for it.");
+            }
+            Line();
+
+            // Estimator comparison (Task 7.2): physical-gradient-space move magnitudes for BOTH estimators, now
+            // that Step 7.1 makes the 4-corner (`calibration`/`inputs`) numbers honest (no more region-path ×0.62
+            // scale). Reuses the SAME shared helpers Calibrate() itself uses internally — Screw1Delta/Screw2Delta
+            // + PhysicalDelta, via ScrewMoveMagnitude — so this comparison can never drift from the wizard's math,
+            // and relDiff is computed the SAME way as EstimatorRelativeDifference (paraboloid vs. corner-AF as the
+            // reference), just kept per-screw here rather than collapsed to the pair's max.
+            double paraboloidMove1 = double.NaN, paraboloidMove2 = double.NaN;
+            double cornerMove1 = double.NaN, cornerMove2 = double.NaN;
+            double relDiff1 = double.NaN, relDiff2 = double.NaN;
+            double paraboloidHardwareMicrons = double.NaN;
+            if (paraboloidCalibration != null && pinputs != null) {
+                paraboloidMove1 = TiltCalibrationCalculator.ScrewMoveMagnitude(1, pinputs);
+                paraboloidMove2 = TiltCalibrationCalculator.ScrewMoveMagnitude(2, pinputs);
+                cornerMove1 = TiltCalibrationCalculator.ScrewMoveMagnitude(1, inputs);
+                cornerMove2 = TiltCalibrationCalculator.ScrewMoveMagnitude(2, inputs);
+                relDiff1 = cornerMove1 > 0 ? Math.Abs(paraboloidMove1 - cornerMove1) / cornerMove1 : double.NaN;
+                relDiff2 = cornerMove2 > 0 ? Math.Abs(paraboloidMove2 - cornerMove2) / cornerMove2 : double.NaN;
+                paraboloidHardwareMicrons = paraboloidCalibration.MeasuredHardwareMicrons;
+
+                Line("Estimator comparison (per-star paraboloid vs 4-corner region-AF; physical gradient-space move magnitudes):");
+                Line($"  Screw1 move: paraboloid={F(paraboloidMove1)}  corner-AF={F(cornerMove1)}  relDiff={F(relDiff1 * 100.0)}%");
+                Line($"  Screw2 move: paraboloid={F(paraboloidMove2)}  corner-AF={F(cornerMove2)}  relDiff={F(relDiff2 * 100.0)}%");
+                Line($"  Recovered {(isStepper ? "step size" : "pitch")}: paraboloid={F(paraboloidHardwareMicrons)} um/{(isStepper ? "step" : "turn")}  " +
+                    $"corner-AF={F(measuredHardware)} um/{(isStepper ? "step" : "turn")}");
+            } else {
+                Line("Estimator comparison not computed -- paraboloid calibration unavailable (see above).");
+            }
+            double pistonImpliedMicronsPerStep = TiltCalibrationCalculator.PistonImpliedMicronsPerStep(inputs);
+            Line($"Piston-implied hardware: {pistonImpliedMicronsPerStep:0.###} um/step");
+            Line();
+
+            // Curvature cross-check (Task 7.2): does the paraboloid's own K predict the same corner-vs-center sag
+            // the 4-corner region AF directly measured? K is SensorParaboloidModel's isotropic curvature
+            // coefficient — the surface's z += K·(x-X0)² + K·(y-Y0)² term, with x/y/z ALL IN SENSOR/FOCUSER
+            // MICRONS (SensorModel.FitParaboloidModel builds the solver with sensorSizeMicronsX/Y = pixels ×
+            // pixelSize and inFocusMicrons = focuserPosition × focuserStepMicrons) — so K·rEff² is already in
+            // MICRONS, no unit conversion needed on the predicted side. "measured" comes from THIS HARNESS'S OWN
+            // per-region re-detection + hyperbolic re-fit (RegionPositions, populated by MeasureTiltAsync/
+            // FitFinalFocus — always unweighted, "for robustness headless") — raw FOCUSER STEPS, so it needs ×
+            // FocuserStepMicrons before it is comparable to the predicted side. rEff is the corner-region's design
+            // point (the SAME cornerXNorm/cornerYNorm Step 7.1 regresses against, via CornerDesignPoint) converted
+            // to sensor microns — the radius the corner samples actually came from, not the true frame corner.
+            //
+            // COMPARABILITY CAVEAT (confirmed against ghilios_corrected's own 01_Baseline\...\attempt01\
+            // autofocus_report_Region{1..5}.json, which the wizard itself wrote during the live run): the region
+            // RECTS this harness uses are byte-identical to the wizard's own (both ±1/3-normalized boxes; verified
+            // OuterBoundary StartX/StartY/Width/Height match exactly at default ROI) — this is NOT a region-geometry
+            // mismatch. But the wizard's stored Region1 (center) CalculatedFocusPoint reads ~46 focuser steps higher
+            // than this harness's headless re-fit of the SAME frames, while the four corner regions differ by only
+            // 5-31 steps — so the design doc §4 sag (measured from the wizard's OWN stored per-region results:
+            // -147.2 steps / -39.6 µm on Baseline, ≈2× the paraboloid K's prediction) is NOT reproducible from
+            // RegionPositions here, because RegionPositions was never validated for ABSOLUTE per-region accuracy
+            // (only the SLOPE across the four corners was — see Step 7.1's recovered-step-size check, which is
+            // corner-only and excludes the center region entirely, and does land in the expected 2.0-2.2 range).
+            // The ratio below is therefore a same-run, self-consistent diagnostic (this harness's own measured sag
+            // vs. this harness's own paraboloid-predicted sag) — useful for noticing a large same-run disagreement,
+            // but its magnitude should NOT be expected to reproduce the design doc's live-AF-report-derived ×2.
+            var (cornerXNorm, cornerYNorm) = CornerDesignPoint(regions);
+            double sensorWidthMicrons = perStep[0].ImageSize.Width * pixelSizeMicrons;
+            double sensorHeightMicrons = perStep[0].ImageSize.Height * pixelSizeMicrons;
+            double rEffMicrons = Math.Sqrt(Math.Pow(cornerXNorm * sensorWidthMicrons, 2) + Math.Pow(cornerYNorm * sensorHeightMicrons, 2));
+            double rEffSquaredMicrons2 = rEffMicrons * rEffMicrons;
+
+            Line($"Curvature cross-check (this harness's OWN re-measured corner-AF sag vs. paraboloid K's predicted sag at rEff={F(rEffMicrons)} um):");
+            Line("  NOTE: \"measured\" is this harness's independent headless per-region re-fit, not the wizard's stored");
+            Line("  per-region AF results -- an absolute-position quantity like this sag is far more sensitive to that");
+            Line("  re-measurement noise than the slope-only 4-corner (A,B) tilt plane is, so this ratio is a same-run");
+            Line("  self-consistency check only; it is not expected to reproduce the design doc's section 4 finding.");
+            Line($"  {"Step",-10} {"measured um",12} {"predicted um",13} {"ratio",7}");
+            for (int i = 0; i < perStep.Count && i < paraboloidSteps.Count; i++) {
+                var s = perStep[i];
+                var ps = paraboloidSteps[i];
+                if (!ps.Fitted) {
+                    continue;
+                }
+                double cornerSagSteps = (s.RegionPositions[2] + s.RegionPositions[3] + s.RegionPositions[4] + s.RegionPositions[5]) / 4.0 - s.RegionPositions[1];
+                double measuredMicrons = cornerSagSteps * metadata.FocuserStepSizeMicrons;
+                double predictedMicrons = ps.K * rEffSquaredMicrons2;
+                double ratio = (predictedMicrons != 0 && double.IsFinite(predictedMicrons)) ? measuredMicrons / predictedMicrons : double.NaN;
+                Line($"  {s.Step,-10} {F(measuredMicrons),12} {F(predictedMicrons),13} {F(ratio),7}");
             }
             Line();
 
@@ -852,8 +1066,10 @@ namespace TestApp {
             bool hardwareOk = !hardwareProvided || (!double.IsNaN(hardwarePctDelta) && hardwarePctDelta <= 25.0);
             bool magnitudeOk = !double.IsNaN(calibration.MoveMagnitudeRatio) && calibration.MoveMagnitudeRatio <= 1.5;
             if (!magnitudeOk) {
-                Line("  NOTE: the two screw turns produced very unequal tilt changes — the recovered hardware/angles " +
-                    "are unreliable. Re-capture turning each screw the same amount.");
+                Line("  NOTE: the two screw turns produced very unequal tilt changes -- the recovered hardware/angles " +
+                    "are unreliable. Re-capture turning each screw the same amount. If the corner-AF cross-check " +
+                    "above disagrees with the paraboloid magnitudes, suspect the per-star fit before suspecting " +
+                    "the hardware.");
             }
             bool confidenceOk = conf.IsReliable;
             string V(bool ok, bool provided) => !provided ? "n/a" : (ok ? "PASS" : "FAIL");
@@ -896,9 +1112,23 @@ namespace TestApp {
                 paraboloid = new {
                     perStep = paraboloidSteps.Select(p => new {
                         p.Step, p.Fitted, p.Status, p.StarsInModel, p.RSquared,
-                        A = p.Gradient.A, B = p.Gradient.B, p.TiltAngleDeg
+                        A = p.Gradient.A, B = p.Gradient.B, p.TiltAngleDeg, p.K
                     }),
                     calibration = paraboloidCalibration
+                },
+                // Additive (Task 7.2): both estimators' physical-gradient-space move magnitudes and recovered
+                // hardware, plus the geometry-free piston probe. NaN fields when the paraboloid calibration
+                // could not be computed (see the "Estimator comparison not computed" report line above).
+                estimatorComparison = new {
+                    paraboloidMove1,
+                    paraboloidMove2,
+                    cornerMove1,
+                    cornerMove2,
+                    relDiff1,
+                    relDiff2,
+                    cornerHardwareMicrons = measuredHardware,
+                    paraboloidHardwareMicrons,
+                    pistonImpliedMicronsPerStep
                 },
                 verdict = new { angleOk, gapOk, hardwareOk, magnitudeOk, confidenceOk }
             };
@@ -949,11 +1179,11 @@ namespace TestApp {
 
         private static void PrintUsage() {
             Console.Error.WriteLine("Usage: TestApp tilt --dataset <folder> [--profile-id <guid>] [--out <dir>] [--reoptimize] [--max-evals <int>]");
-            Console.Error.WriteLine("  --dataset    (required) folder containing the 6 AF runs (Baseline, AllInward, ReBaseline1, Screw1, ReBaseline2, Screw2) — or 4 (Baseline, Screw1, ReBaseline2, Screw2) for a run saved without the curvature-direction steps.");
+            Console.Error.WriteLine("  --dataset    (required) folder containing the 6 AF runs (Baseline, AllInward, ReBaseline1, Screw1, ReBaseline2, Screw2) -- or 4 (Baseline, Screw1, ReBaseline2, Screw2) for a run saved without the curvature-direction steps.");
             Console.Error.WriteLine("  --profile-id (default active) NINA profile id (settings + focal length).");
             Console.Error.WriteLine("  --out        (default %LOCALAPPDATA%\\NINA\\Logs\\hf-diag\\tilt\\<timestamp>) output directory.");
             Console.Error.WriteLine("  --reoptimize force re-running star-detection optimization and overwrite the stored settings in metadata.");
-            Console.Error.WriteLine("  --debayer    debayer bayered frames to luminance before detection (matches the live app when the profile debayers); required to reproduce the wizard's per-star sensor-model tilt on a bayered run.");
+            Console.Error.WriteLine("  --debayer    OBSOLETE and ignored: detection always runs on the image the live app detects on (profile-gated debayer + the CFA hotpixel filter, both inside Detect).");
             Console.Error.WriteLine("  --max-evals  (optional) override the optimizer's MaxEvaluations budget.");
             Console.Error.WriteLine("Metadata lives at <parent>/<datasetName>.tilt.json; a template is written if it is missing.");
         }

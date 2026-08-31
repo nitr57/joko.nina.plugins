@@ -34,11 +34,15 @@ correction takes at most three commands.
    asks whether to disconnect it.
 
 While connected, a **Motor positions (steps)** grid shows each corner's current position counter,
-polled from the device. The corners are labeled with the device's own motor numbering (**TR ·
-Motor 1**, **TL · Motor 2**, **BR · Motor 3**, **BL · Motor 4**) and with the wizard screw number
-each corner maps to (screw 1 = TR, 2 = TL, 3 = BL, 4 = BR). The counters read "unknown" until the
-first successful position query, and during a calibration run each one also shows Δ, its change
-since the run started.
+polled from the device. Each cell names its corner and the screw it holds (**TR · M1**, **TL · M2**,
+**BL · M4**, **BR · M3** by default), with the motor number and the wizard screw number underneath.
+The counters read "unknown" until the first successful position query, and during a calibration run
+each one also shows Δ, its change since the run started.
+
+Selecting either EAT preset names the screws after its motors everywhere in HocusFocus, so the
+guidance table and the wizard prompts say "M4" rather than "Screw 3". Rename them under **Screw
+Labels** in the wizard settings if you prefer your own names; see [Naming your
+screws](tilt-adapter-wizard.md#naming-your-screws).
 
 The counters are **absolute** and stored in the adapter's EEPROM: they survive power cycles and do
 not reset between sessions, so they carry whatever position your earlier adjustments left them at.
@@ -56,12 +60,16 @@ you must do.
 - **Steps applied per screw** defaults to 150 steps for the EAT presets (270 µm at 1.8 µm per step),
   large enough that each calibration move stands well above measurement noise. The value must fit
   within the [safety limits](#safety-limits) before a run will start.
-- The first time you connect in a session, the wizard turns on **Measure direction** (the six-step
-  calibration) and notifies you. Leaving it on is recommended: the adapter's direction is then
-  measured with the same backfocus command that Automatic Adjustment later sends. If you turn it
-  off, backfocus moves keep an "(assumed direction)" warning.
+- The first time you connect in a session, the wizard turns on **Measure direction**, adding 2 steps
+  to the run, and notifies you. With **Measure final re-baseline** also at its default (on), a
+  freshly-connected device runs the full 7-step calibration. Leaving Measure direction on is
+  recommended: the adapter's direction is then measured with the same backfocus command that
+  Automatic Adjustment later sends. If you turn it off, backfocus moves keep an "(assumed direction)"
+  warning.
 - **Auto Run All** drives every remaining step without further clicks: the wizard sends the step's
-  move, runs the measurement, advances, and finishes with a restore move that returns every motor to
+  move, runs the measurement, and advances. With **Measure final re-baseline** on, the last
+  measurement step already restores and measures every motor, so the run finishes there; with it
+  off, the wizard finishes with an additional, unmeasured restore move that returns every motor to
   its starting position. To step through manually instead, use **Run This Step** (the **Run
   Measurement** button is relabeled while a motorized device is connected), which sends one step's
   move and measurement at a time.
@@ -110,10 +118,117 @@ before sending; there is no automatic undo.
 !!! note "One adjustment per measurement"
     After a plan executes, **Automatic Adjustment** stays disabled until a new Detailed Analysis
     completes, so the same measurement can never be applied twice and every adjustment is confirmed
-    by a fresh measurement before the next one. If the confirming run shows the tilt got *worse*
-    (a sign of a stale calibration or a camera rotated since calibration), the plugin says so and
-    offers to revert, sending the inverse of each move in reverse order. A failure partway through
-    a plan brings the same revert offer.
+    by a fresh measurement before the next one. A failure partway through a plan brings a revert offer.
+
+### If the confirming run says tilt got worse
+
+The plugin shows a red **"Tilt got worse after the last adjustment"** panel at the top of the Tilt Adapter
+Guidance section, quoting the tilt magnitude before and after and the number of moves that were sent. It stays
+there until you act, so you can look at the numbers before deciding. While it is up, **Automatic
+Adjustment** is disabled, so a second plan cannot be computed from a measurement you have not accepted.
+
+- **Revert the N moves** sends the inverse of each move, in reverse order, and then requires a fresh analysis
+  before adjusting again.
+- **Dismiss** accepts the worse state and re-enables Automatic Adjustment, so you can correct forward from it.
+
+Tilt getting worse usually means a stale calibration, a camera or adapter rotated since it was calibrated, or an
+incorrect screw-direction setting, all worth investigating before adjusting again. If the device disconnects while
+the panel is up, the panel stays and explains that reverting needs the device back.
+
+## Returning to an earlier measurement
+
+Every Aberration Inspector run in the current session records what the adapter looked like at the time, and the
+**Sensor Model Tilt Measurement History** grid gains two columns to make a row identifiable: **Time**, and
+**Pos** (✓ when motor positions were recorded, so a one-click return is possible).
+
+To find the run you want back, select candidates and read the Return panel: it states whether returning there
+would actually move anything, and by how much. That is a better answer than a "was this one adjusted?" marker
+could give, because it compares the measurements rather than tracking what the plugin happened to send, so it
+sees adjustments made by any means.
+
+Selecting a row is view-only (it shows that run's numbers and nothing more) and fills in a **Return to
+run #N** panel below the grid. That panel previews exactly what would be sent before you click anything:
+
+- **With recorded motor positions** (a motorized adapter that was connected at the time) the return is exact and
+  uses no calibration at all: it simply drives each motor back to the counter value recorded then. Click **Drive
+  Adapter to Run #N Positions** and approve the usual plan dialog.
+- **If the counters are unchanged but the measured tilt is not**, the adapter was moved by something other than
+  these motors: screws turned by hand, a re-seat, the vendor app, or the camera simulator's own tilt controls.
+  Driving the motors back would do nothing, so the panel says so and computes the move from the two fitted
+  models instead. On a motorized adapter you can still drive that.
+- **Without them** (a manual-screw adapter, or a run measured with nothing connected) the panel computes the
+  motion from the difference between that run's fitted model and the current one, and shows it as per-screw
+  turns. This needs no record of what you actually did between the runs, but it is only as good as the two fits,
+  and it assumes nothing but the tilt adjustment changed. The panel says so.
+
+!!! warning "Selecting an old run changes the guidance table"
+    While a past run is selected, the guidance above shows how to flatten the sensor **from that run's state**,
+    which is not how to get back to it. A note appears above the table saying so.
+
+!!! note "History is per session"
+    Runs are remembered for as long as NINA is running. After a restart the history is empty, so there is nothing
+    to return to, even though the adapter itself still knows where its motors are.
+
+## Manual adjustment
+
+Automatic Adjustment corrects a tilt the plugin has just measured. When you want to move the adapter
+yourself — to lift motors away from 0, to dial in backfocus, to apply a correction you worked out
+elsewhere, or to finish an adjustment that stopped partway — open **Manual adjustment** in the
+**Motorized Device Connection** section, directly under the motor positions. It is collapsed by
+default, and its header line says what it last did.
+
+Unlike Automatic Adjustment, it needs no measurement and no calibration: it drives the hardware
+directly, so it works as soon as the device is connected.
+
+Every move here is physical and is stored in the adapter's EEPROM. There is no automatic undo.
+
+### Single move
+
+Pick what to move on the 3×3 pad, which is laid out the way the sensor is imaged:
+
+|  |  |  |
+|---|---|---|
+| **TL** | **Top** | **TR** |
+| **Left** | **All** | **Right** |
+| **BL** | **Bottom** | **BR** |
+
+The four corners tilt along a diagonal, the four edges tilt one side against the other, and **All**
+moves every motor together — a backfocus change, not a tilt. Each is a single command to the device.
+
+Set **Direction** (`+` is the wizard's positive step direction; `−` is its opposite) and **Amount**
+in steps, and the preview below shows exactly what the click will do: which motors move and by how
+much, where all four will end up, how much of the travel window that leaves, and the change in
+microns. Because the adapter's corners are mechanically coupled, choosing `TR` also moves `BL` — the
+preview always shows both, so the coupling is visible before you send anything.
+
+**Send** issues the move. Nothing else changes, so repeating the same nudge is one more click. An
+amount larger than **Max steps per command** is sent as several commands in the same direction, and
+the button says how many.
+
+A move that would carry a motor outside the travel window is refused before anything is sent, and
+the panel names the motor and suggests the fix — usually an `All +` move to lift everything first.
+Positions that end near either end of the window are tagged **near 0** or **near max**; those are
+advisories, not refusals.
+
+### Target positions
+
+Switch **Mode** to **Target positions** to say where each motor should end up rather than how far to
+move it. The four boxes are filled in from the current positions; edit the ones you want to change
+and the panel shows the difference per corner and how many moves it will take.
+
+**Review moves…** decomposes the difference and opens the same **Review motor commands** dialog that
+[Automatic Adjustment](#automatic-adjustment) uses, with the same move list, residuals and warnings.
+Nothing is sent until you approve it there.
+
+!!! note "Four numbers, three degrees of freedom"
+    A tilt adapter can tilt the sensor plane and change its spacing, but it cannot **twist** it — no
+    rigid plane can. Most sets of four hand-typed positions ask for a little twist, and that part
+    simply cannot happen. When the request contains a whole step of twist or more, the panel says so
+    before you open the dialog and each corner shows the position it will actually reach.
+
+If a plan stops partway — a failed command, or **Stop after this move** — the moves already sent
+stay applied. Because the targets are absolute, pressing **Review moves…** again once the positions
+have re-synced re-plans from wherever the motors actually are, which finishes the remainder.
 
 ## Safety limits
 
@@ -146,9 +261,9 @@ The approval dialog shows the bias as its own move and warns that it is present.
 
 The bias is not free. Moving all four screws together *is* a backfocus change, so it shifts your
 backfocus by the bias amount, and that shift is included in the residuals the dialog reports. To
-avoid it, give the motors room to work before adjusting, so corrections have travel underneath
-them: raise the motors away from zero in the vendor's app, or apply a positive backfocus move of
-your own.
+avoid it, give the motors room to work before adjusting, so corrections have travel underneath them:
+send an `All` `+` move from [Manual adjustment](#manual-adjustment), or raise the motors away from
+zero in the vendor's app.
 
 ## The Simulator port
 
@@ -188,7 +303,13 @@ calibration ran but did not pass its own quality validation; re-run it under bet
 
 **Automatic Adjustment is disabled right after an adjustment.** That is the
 one-adjustment-per-measurement rule. Run a new Detailed Analysis; the button re-enables when it
-completes.
+completes. It is also disabled while a **"Tilt got worse"** panel is showing (revert or dismiss it first)
+and while an analysis is running.
+
+**The device disconnected on its own.** After 30 minutes with no activity the plugin shows an amber banner in
+the tilt panels counting down, and disconnects when it reaches zero. Clicking **Stay connected** cancels it
+and restarts the 30 minutes, as does simply moving the adapter or starting a run, which count as activity. If it
+did disconnect, the connection line says so with the time it happened; just connect again.
 
 **A move was refused by a limit.** The error says which limit. For **Max steps per command**, either
 reduce the amount being sent (for calibration, **Steps applied per screw**) or raise the limit. For

@@ -9,6 +9,53 @@ Build first:
 cmd.exe /c "dotnet build Joko.NINA.Plugins\TestApp\TestApp.csproj -c Debug --nologo"
 ```
 
+## Detection parity — every runner must detect on the image the app detects on
+
+**Non-negotiable.** A headless result is only worth anything if it predicts what a user sees, so every detecting
+runner loads `DiagnosticUtil.LoadRenderedImage` and detects through `StarDetector.Detect(IRenderedImage, …)` (or
+the plugin's own `RunEvaluationLoader.HocusFocusSplitFrameDetector` on the optimizer/AF-fit paths). Spec:
+`docs/headless-detection-parity-design.md`.
+
+**Why it matters.** For a **bayered** run the live app CFA hot-pixel filters and debayers *inside* `Detect`, at the
+caller's params. Detecting on the raw Bayer mosaic instead moved `bobp`'s landed `Sensitivity` from the wizard's
+`10.000` (27–31 min stars) to `0.0` at the search floor (52) — the harness could drive the gate to its floor and
+harvest unfiltered hot pixels as faint stars, an incentive that does not exist on the filtered image. **4 of 22**
+bank runs are bayered (`SorenVance`, `bobp`, `bobp_m101`, `timmer`); the other 18 are mono and byte-identical
+either way.
+
+Rules, in order of how easy they are to get wrong:
+
+- **Never CFA-filter or debayer at load time.** The representation is *params-dependent*: `HotpixelThreshold` and
+  `HotpixelThresholdingEnabled` are **searched optimizer axes**, and a load-time filter silently turns them into
+  no-ops (the probe watched the optimizer keep searching `0.0005 → 0.0015` against an image it could no longer
+  affect). Let `Detect` decide.
+- **Never use the "pre-filter, then set `HotpixelFiltering = false`" pattern.** It is not equivalent: live sets
+  `hotpixelFilterAlreadyApplied = true`, which the pre-filter pattern cannot, so `StarDetector.cs:549` runs a
+  **spatial** hot-pixel filter on the structure-detection source that live never applies — different structure map,
+  different candidates, and a clobbered `metrics.HotpixelCount`. `Detect(Mat, …)` hard-codes that flag false too.
+- **`saveLumChannel` must stay `false`** on every detection path (`RenderedImageLoading.ForDetection` pins it).
+  `true` flips `CvImageUtility.ToOpenCVMat`'s guard and makes the hotpixel-filtering-OFF branch read luminance
+  where live reads the mosaic. It belongs only to display helpers.
+- **Not for detection:** `DiagnosticUtil.LoadFloatMat` returns the frame exactly as stored (the mosaic, for a
+  bayered frame) and exists for the `.tif` carve-out — NINA's TIFF decoder normalizes by `1<<16` vs
+  `ushort.MaxValue`, and a TIFF has no CFA anyway. `LoadDebayeredFloatMat` is the same debayer **without** the CFA
+  filter, for surfaces a human/LLM reads (golden tiles, annotated overlays) and for `export-linear`, whose
+  detector-**independent** blind spots are the point.
+- `HeadlessDetectionParityGuardTests` enforces the above at the source level; `HeadlessDetectionParityTests` pins
+  the mechanism (mono byte-identity, `SaveLumChannel == false`, the hot-pixel axis still biting).
+
+**Costs, both inherent.** A bayered run holds an extra `Rgb48` `BitmapSource` (~+20% peak working set;
+`bobp_m101` 6.0 → 7.2 GB). `bobp`'s optimize phase went 87.6 s → ~300 s, and `tilt`'s 4-corner phase ~20 s → ~215 s
+per step (fixed params, five regions = five early keys, so one frame is filtered+debayered five times), because
+the CFA filter + debayer now run per early-context build rather than once at load — **do not "optimize" that
+back**, it is the same work the live wizard does, and hoisting it out of the loop is the load-time filtering the
+spec rejects. The legitimate speedup, if it is ever needed, is caching the prepared source image per (frame,
+hot-pixel params) inside `StarDetector`.
+
+**Per-filter caveat.** With per-filter star detection enabled, live resolves the captured filter's snapshot and a
+headless run cannot (it has no filter wheel, and seeding one would write to the profile). The runners warn to
+stderr when the profile has the feature on; their numbers are then profile-level, not what the app would use.
+
 ## Contamination diagnostic
 
 `TestApp` doubles as a self-contained, headless diagnostic for the contamination test. It runs detection with per-star diagnostics enabled and `RejectContaminatedStars=false` (so contaminated stars are retained for analysis).
@@ -66,12 +113,64 @@ Headless driver of the optimizer. Args:
 (default `%LOCALAPPDATA%\NINA\Logs\hf-diag\optimize\<timestamp>`), `--max-evals <int>` (override the
 optimizer budget; wizard default 250), `--annotate extremes|all` (default `extremes` = min/max-focuser frames
 only), `--labels <dir>` (label JSON dir; activates the recall/precision objective term), `--verbose` (restore
-TRACE logging; default INFO). `optimize` has **no** `--defocus-*` switches — the combined `DefocusAwareGates`
+TRACE logging; default INFO), `--cv-threads <n>` (cap OpenCV's parallel-for pool; `0` restores the default —
+the effective `Cv2.GetNumThreads()` is printed either way, so the knob cannot be silently disconnected).
+`optimize` has **no** `--defocus-*` switches — the combined `DefocusAwareGates`
 flag is in the optimizer's curated search set (`OptimizerVariable.CreateCuratedSet`), so the optimizer explores
 the relaxation itself (guarded by the objective's `SDefocusPrecision` near-focus penalty); to force the gates
 on for diagnosis, use `diagnose-labels`/`contamination`. It writes
 `optimized_settings.json` into **each focus run's source folder** (the review handoff) **and** the `--out`
 dir (or each per-run subfolder).
+
+> ### PINNING AN ARM: `--settings` **AND** `--profile-id`. BOTH. EVERY TIME.
+>
+> **`--settings <fixed path>` pins the DETECTOR knobs** (F42). Every build directory otherwise bootstraps its own
+> `harness_settings.json` from whatever the live profile holds at that moment, so two arms built minutes apart can
+> run different detectors.
+>
+> **`--profile-id <guid>` pins the FIT, and for six waves nobody passed it** (F57/F58). `AutoFocusOptions` was read
+> from whichever NINA profile happened to be ACTIVE, and four of its values reach the AF fit. On the machine that
+> produced waves 5–11, nine profiles partition **2 / 7** on `MaxOutlierRejections` alone — enough to move
+> `BaselineJ` (one evaluation of a fixed seed on fixed frames, no search) by **0.0144**, larger than any Δ`J` the
+> project has argued about. Wave 9's gate ran under `Default`, wave 10's under `astrodet`, and the resulting
+> discrepancy was attributed to a wavelet change for half a day.
+>
+> **The default is LRU-BY-LAST-LOAD, so an unpinned arm is seeded by whatever the previous arm pinned.**
+> `Profile.Load` stamps `LastUsed = Now` and saves; `TryLoad("")` takes the newest. The act of measuring rewrites
+> the default for the next measurement.
+>
+> **And concurrent unpinned processes each get a DIFFERENT profile.** NINA holds the `.profile` open
+> (`FileShare.Read`) while it is loaded, `SelectProfile` returns false for a locked one, and `TryLoad`'s
+> `SkipWhile` silently takes the next by `LastUsed`. That is F55's "nondeterminism": *N* concurrent `optimize`
+> processes ran under *N* different fits. **With `--profile-id` the same situation fails LOUDLY** ("No active NINA
+> profile could be loaded", non-zero exit) instead of returning a wrong number — which is the right trade, and is
+> why fan-out needs one profile copy per worker.
+>
+> Since wave 11 the harness reads the fit inputs from the **pinned settings file**, and every landing records
+> `ProfileId` **and** `FitInputs` (`MaxOutlierRejections=…;OutlierRejectionConfidence=…;…` — values, not a hash,
+> so a reader sees *which* one moved). Since wave 12 **every** harness runner does — `bank-verify`,
+> `synth-validate`, `inspect-align` and `tilt` build their fit through
+> `HarnessSettingsStore.BuildFitOptions`, print `FitInputs`, and a unit test fails the build if any `TestApp`
+> source constructs `AutoFocusOptions` from the profile again.
+>
+> **`ConcurrencyCheck` MUST BE READ ACROSS A WHOLE ARM, NOT OFF ONE LANDING.** `WaitOne(0)` is won by exactly one
+> of *N* contenders, so in any fan-out precisely one landing truthfully reports `exclusive`. One `concurrent`
+> anywhere condemns the arm; one `exclusive` proves nothing.
+>
+> ### FAN-OUT: AUTHORISED AT DEGREE 4, UNPINNED ONLY — AND IT BUYS 25 %, NOT 4× (wave 12)
+>
+> Wave 12 ran the eight gate runs at **fan-out 4** with four workers on **four different profiles** split 4/4 on
+> `MaxOutlierRejections`, and all eight landings reproduced the sequential values **bit-identically** (F55's
+> RULE A12). So:
+>
+> - **Fan-out is authorised AT DEGREE 4.** Nothing was measured at 8 or 48.
+> - **UNPINNED only.** `--profile-id` + fan-out still fails loudly, so a fanned-out arm relies on `--settings`
+>   carrying the fit inputs. **An arm that needs a specific profile still runs sequentially.**
+> - **It buys 1.33×, not 4×** (F60). Every run takes 1.45–2.55× longer under contention because `optimize`
+>   already saturates the machine. **Sequential remains the default;** fan-out is for a pass long enough that
+>   25 % of the wall clock is worth losing `--profile-id`.
+> - **Re-snapshot the profile set before any fan-out arm.** The fall-through set is the top *N* by `LastUsed`,
+>   and every pinned run reorders it — including the gate you just ran.
 
 - **Run discovery is attempt-anchored** (pure logic in `OptimizationRunDiscovery`): it recursively finds
   `attempt<NN>` folders (1–4 levels under `--runs`) that contain ≥3 distinct focuser positions, mirroring
@@ -155,3 +254,48 @@ the gates verbatim, keeping detection **bit-identical**. The three numeric knobs
 (`DefocusAwareGates`), guarded by the objective's `SDefocusPrecision` near-focus precision penalty (multiplicative,
 = 1.0 when no star is relaxation-admitted ⇒ objective bit-identical when off). See
 `docs/star-detection-optimization-wizard-results.md` (F2/F3 + cache-health notes).
+
+## Synthetic-camera render benchmark (`bench-simrender`)
+
+Times the simulator's render pipeline on a real ASTAP star field, and reports the PSF kernel-cache
+cardinality — the quantity that actually grows when the cache key gains axes.
+
+```
+TestApp bench-simrender [--catalog "C:\Program Files\astap"] [--field dense-wide,dense,sparse|all]
+                        [--defocus-steps 0,150,350] [--aberr A0,A1,A2] [--arms off,on-zero,on,on-strong]
+                        [--corner-astig 15] [--corner-astig-strong 40] [--limit-mag 17] [--exposure 5]
+                        [--iters 5] [--warmup 1] [--census] [--kernel-ladder] [--with-detection]
+                        [--csv <path>]
+```
+
+**Read `kernelGen` and `kernels`, not just `total`.** Development is 50–90 % of a 61 MP render, so the
+wall clock is an insensitive instrument for anything the PSF does.
+
+Sub-modes, cheapest first:
+
+- `--kernel-ladder` — times `PsfKernelGenerator` alone across R = 8…240 px and fits the log-log scaling
+  exponent, circular vs elliptical. Seconds, no catalog needed. **Run it first** after any change to kernel
+  generation: a separable convolution holds ~2, a direct 2-D one shows ~4.
+- `--census` — star and kernel counts with no timing. Use it to check a pointing is as dense as intended
+  before spending eight minutes on the matrix.
+- (default) the full timing matrix, ~8 min at `--iters 5 --field all`.
+- `--with-detection` — runs a real `StarDetector.Detect` loop alongside every timed render, emulating the
+  contention a render actually meets in NINA (the camera prefetches the next frame while the previous
+  autofocus point is still being detected, both through the shared CPU governor).
+
+Fields are named pointings + optics on the QHY600/IMX455: `dense-wide` (γ Cygni at 530 mm f/5, ~35k on-frame
+stars — the headline), `dense` (same sky at 1000 mm), `sparse` (North Galactic Pole, identical optics to
+`dense` so only the star count differs), `dense-oversampled` (2000 mm f/8, the kernel-radius stress). At
+1000 mm a 61 MP frame covers only 2.8 sq deg and the G18 catalog stops at mag 18, which is why the dense
+field is the widefield one.
+
+Arms: `off` (isotropic), `on-zero` (enabled at ratio 0 — a **verification** arm that must measure identical
+to `off`), `on` (shipped ratio), `on-strong` (stress). Aberration configs `A0` clean / `A1` backfocus only /
+`A2` tilt + backfocus.
+
+**Run in Release**; the banner warns otherwise and Debug numbers are not comparable. Timing lives here rather
+than in the unit suite because it needs the ASTAP database and is flaky by construction; what the suite
+guards instead is kernel-cache cardinality and byte bounds
+(`StarFieldCompositorTests.Render_KernelCacheCardinality_StaysBounded`), which is what actually regresses.
+
+Results and the gate analysis: `docs/camera-simulator-astigmatism-results.md`.

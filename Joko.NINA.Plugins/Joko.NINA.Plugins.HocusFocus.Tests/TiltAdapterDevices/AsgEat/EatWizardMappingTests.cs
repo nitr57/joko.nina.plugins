@@ -53,6 +53,17 @@ public class EatWizardMappingTests {
         });
     }
 
+    [Test]
+    public void AllInward_DescriptionDoesNotClaimAPhysicalDirection() {
+        var move = EatWizardMapping.MoveForStep(WizardStep.AllInward, 150);
+        Assert.Multiple(() => {
+            Assert.That(move.Description, Does.Contain("All Motors"));
+            Assert.That(move.Description, Does.Not.Contain("Inward"));
+            Assert.That(move.Steps, Is.EqualTo(150), "wording only — the move itself is unchanged");
+            Assert.That(move.Axis, Is.EqualTo(TiltMoveAxis.Backfocus), "wording only — the axis is unchanged");
+        });
+    }
+
     [TestCase(150)]
     [TestCase(30)]
     public void MoveForStep_ReBaseline1_MatchesWizardInstruction(int n) {
@@ -187,6 +198,33 @@ public class EatWizardMappingTests {
         }
 
         Assert.That(total, Is.EqualTo(new double[] { 0, 0, 0, 0 }));
+    }
+
+    // --- Optional measured final re-baseline (Task 6): ReBaseline3 substitutes for Complete's restore move ---
+
+    [TestCase(150)]
+    public void FullSequence_WithFinalRebaseline_SumsToZeroPerCorner(int n) {
+        var executedSteps = new[] { WizardStep.AllInward, WizardStep.ReBaseline1, WizardStep.Screw1,
+                                    WizardStep.ReBaseline2, WizardStep.Screw2, WizardStep.ReBaseline3,
+                                    WizardStep.Complete };
+        var total = new double[] { 0, 0, 0, 0 };
+        foreach (var step in executedSteps) {
+            var move = EatWizardMapping.MoveForStep(step, n, measuredFinalRebaseline: true);
+            if (move == null) continue;   // Complete is a no-move when ReBaseline3 already restored
+            for (int i = 0; i < 4; i++) { total[i] += move.PerCornerSteps[i]; }
+        }
+        Assert.That(total, Is.EqualTo(new double[] { 0, 0, 0, 0 }));
+    }
+
+    [Test]
+    public void ReBaseline3_IsDiagonalBRestore_AndCompleteBecomesNoMove() {
+        var rb3 = EatWizardMapping.MoveForStep(WizardStep.ReBaseline3, 150, measuredFinalRebaseline: true);
+        Assert.Multiple(() => {
+            Assert.That(rb3.Axis, Is.EqualTo(TiltMoveAxis.DiagonalB));
+            Assert.That(rb3.Steps, Is.EqualTo(-150));
+            Assert.That(EatWizardMapping.MoveForStep(WizardStep.Complete, 150, measuredFinalRebaseline: true), Is.Null);
+            Assert.That(EatWizardMapping.MoveForStep(WizardStep.Complete, 150, measuredFinalRebaseline: false).Steps, Is.EqualTo(-150));
+        });
     }
 
     // --- InverseMove ---

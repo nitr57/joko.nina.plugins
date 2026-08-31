@@ -10,6 +10,9 @@
 
 #endregion "copyright"
 
+using NINA.Joko.Plugins.HocusFocus.AutoFocus.Replay;
+using NINA.Joko.Plugins.HocusFocus.StarDetection;
+using NINA.Joko.Plugins.HocusFocus.Interfaces;
 using NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization;
 using NINA.Joko.Plugins.HocusFocus.Utility;
 using NUnit.Framework;
@@ -41,6 +44,59 @@ public class OptimizationSummaryTests {
             Assert.That(changed.StepSizeText, Is.EqualTo("150 → 105"));
             Assert.That(changed.OffsetStepsText, Is.EqualTo("4 (unchanged)"));
         });
+    }
+
+    /// <summary>
+    /// F49(c): a capped recommendation must say what it is converging TOWARD and that it terminates. The field
+    /// session behind F49/F51 accepted "capped by this sweep's width; re-run auto-focus to refine" four times —
+    /// 100 → 214 → 459 → 474 → 482, at 30–120 minutes a run — and experienced a converging sequence as a runaway.
+    /// </summary>
+    [Test]
+    public void StepSizeText_Capped_NamesTheTargetTheRatioAndThatItTerminates() {
+        var s = new OptimizationSummary {
+            CurrentStepSize = 214, RecommendedStepSize = 459, CurrentOffsetSteps = 4, RecommendedOffsetSteps = 4,
+            StepSizeWasCapped = true, StepSizeSampledHfrRange = 1.84, StepSizeCappedGrowthRatio = 1.5 * 5 / 3.5
+        };
+        Assert.Multiple(() => {
+            Assert.That(s.StepSizeText, Does.StartWith("214 → 459"), "the recommendation itself still leads");
+            Assert.That(s.StepSizeText, Does.Contain("1.8×"), "what this sweep MEASURED — no extrapolation in it");
+            Assert.That(s.StepSizeText, Does.Contain("3×"), "F49(c): say what it is converging toward");
+            Assert.That(s.StepSizeText, Does.Contain("2.1×"), "and by how much each run moves — exact, not projected");
+            Assert.That(s.StepSizeText, Does.Contain("partial step"), "the cap is deliberate, not a failure");
+            // The number a user would most like and the one that cannot honestly be given: a run COUNT would have
+            // to come from the extrapolated half-width, which is the quantity the cap exists to distrust.
+            Assert.That(s.StepSizeText, Does.Not.Contain("more run"));
+        });
+    }
+
+    /// <summary>
+    /// Each clause is dropped when its quantity is unavailable rather than filled with a guess — and the
+    /// sentence still has to say the useful thing. This is the state a caller that never measured HFRs produces.
+    /// </summary>
+    [Test]
+    public void StepSizeText_Capped_WithoutMeasurements_StillSaysWhatTheCapMeans() {
+        var s = new OptimizationSummary {
+            CurrentStepSize = 214, RecommendedStepSize = 459, StepSizeWasCapped = true,
+            StepSizeSampledHfrRange = double.NaN, StepSizeCappedGrowthRatio = double.NaN
+        };
+        Assert.Multiple(() => {
+            Assert.That(s.StepSizeText, Does.Contain("partial step"));
+            Assert.That(s.StepSizeText, Does.Contain("3×"), "the target is a constant and is always available");
+            Assert.That(s.StepSizeText, Does.Contain("re-run auto-focus to refine"));
+            Assert.That(s.StepSizeText, Does.Not.Contain("NaN"), "never print a missing measurement at the user");
+            Assert.That(s.StepSizeText, Does.Not.Contain("each run widens"), "no ratio means no ratio claim");
+        });
+    }
+
+    /// <summary>An UNCAPPED recommendation is byte-identical to what it has always been: the note is the cap's,
+    /// not the recommendation's, and an uncapped run has nothing extra to explain.</summary>
+    [Test]
+    public void StepSizeText_NotCapped_IsUnchangedByAnyOfThis() {
+        var s = new OptimizationSummary {
+            CurrentStepSize = 150, RecommendedStepSize = 105, StepSizeWasCapped = false,
+            StepSizeSampledHfrRange = 4.2, StepSizeCappedGrowthRatio = 1.714
+        };
+        Assert.That(s.StepSizeText, Is.EqualTo("150 → 105"));
     }
 
     [Test]
@@ -296,6 +352,253 @@ public class OptimizationSummaryTests {
             Assert.That(s.DetectionBinningPendingApply, Is.True);
             Assert.That(s.DetectionBinningDiffers, Is.True);
             Assert.That(s.DetectionBinningText, Is.EqualTo("1x1 -> 2x2 (applied on Accept; measured in-focus HFR 8.4 px)"));
+        });
+    }
+
+    /// <summary>
+    /// F20 part 1 — the entry's actual title. An undersampled rig (D01_ultrawide_40mm: fit vertex 0.762 px against
+    /// the 1.2 px default gate) must report that its stars are smaller than the minimum HFR.
+    /// </summary>
+    [Test]
+    public void HasUndersampledStars_FiresWhenTheVertexIsAtOrBelowTheGate() {
+        var s = new OptimizationSummary { MeasuredInFocusHfr = 0.762, VariantMinHfr = 1.2, RunDetectionBinning = 1 };
+        Assert.That(s.HasUndersampledStars, Is.True);
+    }
+
+    /// <summary>D05_tec140_1000mm, the control: vertex 1.804 px, well clear of the gate. Must stay silent.</summary>
+    [Test]
+    public void HasUndersampledStars_StaysSilentOnAWellSampledRig() {
+        var s = new OptimizationSummary { MeasuredInFocusHfr = 1.804, VariantMinHfr = 1.2, RunDetectionBinning = 1 };
+        Assert.That(s.HasUndersampledStars, Is.False);
+    }
+
+    /// <summary>
+    /// F38 — the summary reports in CAPTURED pixels while the gate is BINNED, so the flag has to convert. A 2.2 px
+    /// captured vertex clears a 1.2 px gate at 1x1 and does NOT at 2x2, where it is really 1.1 binned px. Shares
+    /// MinHfrSeed.IsBelowGate with the seed so the two can never disagree.
+    /// </summary>
+    [Test]
+    public void HasUndersampledStars_ConvertsCapturedPixelsIntoTheGatesBinnedSpace() {
+        var unbinned = new OptimizationSummary { MeasuredInFocusHfr = 2.2, VariantMinHfr = 1.2, RunDetectionBinning = 1 };
+        var binned = new OptimizationSummary { MeasuredInFocusHfr = 2.2, VariantMinHfr = 1.2, RunDetectionBinning = 2 };
+        Assert.Multiple(() => {
+            Assert.That(unbinned.HasUndersampledStars, Is.False, "2.2 px clears a 1.2 px gate at 1x1");
+            Assert.That(binned.HasUndersampledStars, Is.True, "the same 2.2 px is 1.1 binned px at 2x2");
+        });
+    }
+
+    /// <summary>
+    /// A summary built before this feature (or by a test that does not exercise it) carries NaN for both operands
+    /// and must not fire — the note is an assertion about a measurement, so no measurement means no note.
+    /// </summary>
+    [Test]
+    public void HasUndersampledStars_StaysSilentWithoutAMeasurement() {
+        Assert.Multiple(() => {
+            Assert.That(new OptimizationSummary().HasUndersampledStars, Is.False);
+            Assert.That(new OptimizationSummary { MeasuredInFocusHfr = 0.5 }.HasUndersampledStars, Is.False);
+            Assert.That(new OptimizationSummary { VariantMinHfr = 1.2 }.HasUndersampledStars, Is.False);
+        });
+    }
+
+    /// <summary>
+    /// The flag follows the VARIANT, which is the whole reason it is named that way: on the Current view the gate
+    /// is the user's own hand-set value. A user who raised MinHFR themselves must be told their own gate is what
+    /// emptied the curve, not the optimizer's.
+    /// </summary>
+    [Test]
+    public void HasUndersampledStars_FollowsTheVariantsOwnGate() {
+        var optimizedClears = new OptimizationSummary {
+            MeasuredInFocusHfr = 1.5, VariantMinHfr = 1.2, BaselineMinHfr = 3.0, RunDetectionBinning = 1
+        };
+        var currentDoesNot = new OptimizationSummary {
+            MeasuredInFocusHfr = 1.5, VariantMinHfr = 3.0, BaselineMinHfr = 3.0, RunDetectionBinning = 1
+        };
+        Assert.Multiple(() => {
+            Assert.That(optimizedClears.HasUndersampledStars, Is.False);
+            Assert.That(currentDoesNot.HasUndersampledStars, Is.True);
+        });
+    }
+}
+
+/// <summary>
+/// The bank's NINA-loadable settings handoff (<c>hocusfocus_star_detection.json</c>): a run folder must be able to
+/// carry its optimizer landing in a form the app's Import and the AF-replay override can both apply correctly.
+/// </summary>
+[TestFixture]
+public class OptimizedLandingExportTests {
+
+    private static OptimizedStarDetectionSettings Landing() => new OptimizedStarDetectionSettings {
+        BrightnessSensitivity = 17.67,
+        MinHFR = 0.7,
+        StarClippingMultiplier = 2.0,
+        StructureLayers = 6,
+        StarPeakResponse = 0.68
+    };
+
+    /// <summary>
+    /// THE defect this guards. If the landing is written only into the nested optimizedSettings block, both
+    /// consumers silently apply the BASELINE instead: StarDetectionOptions' import copies the flat knobs last (so
+    /// flat wins), and the AF-replay in-memory override reads the flat knobs only and never looks at the nested DTO.
+    /// Neither errors. So the flat layer must carry the landing too.
+    /// </summary>
+    [Test]
+    public void FromOptimizedLanding_WritesTheLandingIntoTheFLATKnobs_NotOnlyTheNestedBlock() {
+        var baseOptions = new StarDetectionSettingsSnapshot {
+            BrightnessSensitivity = 10.0, MinHFR = 1.2, StarClippingMultiplier = 5.0, StructureLayers = 4
+        };
+
+        var export = StarDetectionSettingsExport.FromOptimizedLanding(baseOptions, Landing());
+
+        Assert.Multiple(() => {
+            Assert.That(export.StarDetection.BrightnessSensitivity, Is.EqualTo(17.67), "flat Sensitivity must be the landing");
+            Assert.That(export.StarDetection.MinHFR, Is.EqualTo(0.7), "flat MinHFR must be the landing");
+            Assert.That(export.StarDetection.StarClippingMultiplier, Is.EqualTo(2.0));
+            Assert.That(export.StarDetection.StructureLayers, Is.EqualTo(6));
+            Assert.That(export.StarDetection.OptimizedSettings?.BrightnessSensitivity, Is.EqualTo(17.67), "and the nested block too");
+        });
+    }
+
+    /// <summary>Importing it must land the user where a wizard Accept would.</summary>
+    [Test]
+    public void FromOptimizedLanding_LandsInTheOptimizedMode() {
+        var export = StarDetectionSettingsExport.FromOptimizedLanding(
+            new StarDetectionSettingsSnapshot(), Landing());
+        Assert.Multiple(() => {
+            Assert.That(export.StarDetection.UseOptimizedSettings, Is.True);
+            Assert.That(export.StarDetection.UseAdvanced, Is.False);
+            Assert.That(export.FileType, Is.EqualTo(StarDetectionSettingsExport.ExpectedFileType));
+        });
+    }
+
+    /// <summary>
+    /// Knobs the curated axes do NOT cover must come from the options the optimize actually ran with — a landing
+    /// replayed against a different detection binning or PSF model is not the configuration that was measured.
+    /// </summary>
+    [Test]
+    public void FromOptimizedLanding_KeepsTheNonAxisKnobsFromTheRun() {
+        var baseOptions = new StarDetectionSettingsSnapshot {
+            DetectionBinning = DetectionBinningEnum.Bin2, ContaminationSensitivity = 7.5
+        };
+        var export = StarDetectionSettingsExport.FromOptimizedLanding(baseOptions, Landing());
+        Assert.Multiple(() => {
+            Assert.That(export.StarDetection.DetectionBinning, Is.EqualTo(DetectionBinningEnum.Bin2));
+            Assert.That(export.StarDetection.ContaminationSensitivity, Is.EqualTo(7.5));
+        });
+    }
+
+    /// <summary>
+    /// THE INVARIANT. Every curated axis must have a same-named, same-typed, settable property on the flat snapshot,
+    /// so adding an axis to the optimizer cannot silently produce a handoff file that drops it. If this fails, the
+    /// new axis needs a matching option property (or an entry in the DTO's NonKnobFields if it describes the run
+    /// rather than the detector).
+    /// </summary>
+    [Test]
+    public void EveryCuratedAxisRoundTripsIntoASettingsSnapshot() {
+        var unmapped = OptimizedStarDetectionSettings.UnmappedKnobs(typeof(StarDetectionSettingsSnapshot));
+        Assert.That(unmapped, Is.Empty, "curated axes with no matching option property: " + string.Join(", ", unmapped));
+    }
+
+    /// <summary>The envelope must survive a round trip through disk, or the bank stores something unreadable.</summary>
+    [Test]
+    public void FromOptimizedLanding_RoundTripsThroughJson() {
+        var export = StarDetectionSettingsExport.FromOptimizedLanding(
+            new StarDetectionSettingsSnapshot(), Landing());
+        var reloaded = StarDetectionSettingsExport.Deserialize(export.Serialize());
+        Assert.Multiple(() => {
+            Assert.That(reloaded.StarDetection.BrightnessSensitivity, Is.EqualTo(17.67));
+            Assert.That(reloaded.StarDetection.MinHFR, Is.EqualTo(0.7));
+            Assert.That(reloaded.StarDetection.UseOptimizedSettings, Is.True);
+        });
+    }
+
+    /// <summary>
+    /// The check <c>bank-export-settings</c> runs before it writes anything, exercised here on a landing with
+    /// EVERY curated axis moved off its default. <see cref="OptimizedStarDetectionSettings.UnmappedKnobs"/> proves
+    /// each axis has somewhere to land; this proves each axis's VALUE actually arrives — a property that would
+    /// pass the mapping check and still be wrong if a knob were written to the nested block only.
+    /// </summary>
+    [Test]
+    public void DiffKnobs_IsEmptyAfterAFullRoundTrip_WithEveryAxisMovedOffItsDefault() {
+        var landing = new OptimizedStarDetectionSettings {
+            BrightnessSensitivity = 17.67, StarClippingMultiplier = 2.0, NoiseClippingMultiplier = 3.875,
+            StarPeakResponse = 0.68, MaxDistortion = 0.26, MinHFR = 0.7, StarCenterTolerance = 0.275,
+            StructureLayers = 6, NoiseReductionRadius = 4, MinStarBoundingBoxSize = 7,
+            HotpixelThresholdingEnabled = true, HotpixelThreshold = 0.002,
+            DefocusAwareGates = true, DefocusDistortionSizeReference = 28.75, DefocusDistortionMinFactor = 0.3,
+            DefocusCenteringToleranceFactor = 2.5, DefocusAwareStructure = true, StructureLayerBoost = 3,
+            DefocusAwareDonutDetection = true, DonutMorphCloseSize = 7, LocallyAdaptiveBinarization = true,
+            AdaptiveNoiseBlockSize = 64, DonutMinAnnularityHoleFraction = 0.2, DonutMaxStreakEccentricity = 1.5,
+            DonutSaturationBloomRadius = 3.0
+        };
+
+        var reloaded = StarDetectionSettingsExport.Deserialize(
+            StarDetectionSettingsExport.FromOptimizedLanding(new StarDetectionSettingsSnapshot(), landing).Serialize());
+
+        var diffs = landing.DiffKnobs(reloaded.StarDetection);
+        Assert.That(diffs, Is.Empty, "curated axes that did not survive the round trip: " + string.Join(", ", diffs));
+    }
+
+    /// <summary>
+    /// The F32 bookkeeping fields describe the SEARCH (which candidates were eligible), not the detector, so they
+    /// must be registered as non-knobs. An unregistered one would be hunted for as a live option property, and
+    /// <see cref="OptimizedStarDetectionSettings.UnmappedKnobs"/> would start failing for a field that has no
+    /// business being on the options object at all.
+    /// </summary>
+    [Test]
+    public void KeepFloorBookkeepingIsNotTreatedAsADetectorKnob() {
+        var landing = Landing();
+        landing.MinDetectionKeepFraction = 0.5;
+        landing.LandingDetectionKeepFraction = 0.63;
+
+        var snapshot = new StarDetectionSettingsSnapshot();
+        landing.ApplyToFlatOptions(snapshot);
+
+        Assert.Multiple(() => {
+            Assert.That(OptimizedStarDetectionSettings.UnmappedKnobs(typeof(StarDetectionSettingsSnapshot)), Is.Empty);
+            Assert.That(landing.DiffKnobs(snapshot), Is.Empty,
+                "the keep-floor fields must not participate in the knob mapping at all");
+        });
+    }
+
+    /// <summary>
+    /// An unconstrained landing records NO floor — there was none — but DOES record what it kept.
+    ///
+    /// <para>The asymmetry is deliberate and was corrected mid-wave. Gating both fields on the floor made the
+    /// control arm unable to report its own keep fraction, which is the exact number that decides whether a floor
+    /// would have bound on that run: the control could not be classified without re-running it. F32 spent two
+    /// waves reconstructing this quantity by hand from stored landings, which is the argument for storing it.</para>
+    /// </summary>
+    [Test]
+    public void UnconstrainedLanding_RecordsWhatItKeptButNoFloor() {
+        var dto = OptimizedStarDetectionSettings.FromParams(
+            new StarDetectorParams(), runCount: 1, baselineJ: 0.9, finalJ: 0.95,
+            recommendedStepSize: 50, recommendedOffsetSteps: 4,
+            provenance: null, minDetectionKeepFraction: null, landingDetectionKeepFraction: 0.62);
+
+        var json = Newtonsoft.Json.JsonConvert.SerializeObject(dto);
+
+        Assert.Multiple(() => {
+            Assert.That(json, Does.Not.Contain("MinDetectionKeepFraction"), "no floor was in force");
+            Assert.That(json, Does.Contain("LandingDetectionKeepFraction"), "what it kept is measurable either way");
+            Assert.That(dto.LandingDetectionKeepFraction, Is.EqualTo(0.62));
+        });
+    }
+
+    /// <summary>An unmeasurable keep fraction is omitted rather than written as NaN — no JSON reader should have
+    /// to handle a NaN, and an absent field already reads correctly as "there was nothing to measure".</summary>
+    [Test]
+    public void UnmeasurableKeepFraction_IsOmittedRatherThanWrittenAsNaN() {
+        var dto = OptimizedStarDetectionSettings.FromParams(
+            new StarDetectorParams(), runCount: 1, baselineJ: 0.9, finalJ: 0.95,
+            recommendedStepSize: 50, recommendedOffsetSteps: 4,
+            provenance: null, minDetectionKeepFraction: 0.5, landingDetectionKeepFraction: double.NaN);
+
+        var json = Newtonsoft.Json.JsonConvert.SerializeObject(dto);
+
+        Assert.Multiple(() => {
+            Assert.That(json, Does.Contain("MinDetectionKeepFraction"), "the floor WAS in force and must be recorded");
+            Assert.That(json, Does.Not.Contain("LandingDetectionKeepFraction"));
+            Assert.That(json, Does.Not.Contain("NaN"));
         });
     }
 }

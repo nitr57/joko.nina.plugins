@@ -1,4 +1,4 @@
-<ResourceDictionary
+﻿<ResourceDictionary
     x:Class="NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard.DataTemplates"
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
@@ -6,7 +6,8 @@
     xmlns:ninactrl="clr-namespace:NINA.CustomControlLibrary;assembly=NINA.CustomControlLibrary"
     xmlns:rules="clr-namespace:NINA.Core.Utility.ValidationRules;assembly=NINA.Core"
     xmlns:s="clr-namespace:System;assembly=mscorlib"
-    xmlns:interfaces="clr-namespace:NINA.Joko.Plugins.HocusFocus.Interfaces">
+    xmlns:interfaces="clr-namespace:NINA.Joko.Plugins.HocusFocus.Interfaces"
+    xmlns:local="clr-namespace:NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard">
     <ResourceDictionary.MergedDictionaries>
         <ResourceDictionary Source="../Resources/OptionsDataTemplates.xaml" />
         <ResourceDictionary Source="../Resources/SharedTooltips.xaml" />
@@ -59,8 +60,8 @@
                 <Border Grid.Row="0" Grid.Column="0" Margin="0,0,2,2" Padding="6,4"
                     BorderBrush="{StaticResource BorderBrush}" BorderThickness="1" CornerRadius="3">
                     <StackPanel>
-                        <TextBlock FontWeight="Bold" Text="TL · Motor 2" />
-                        <TextBlock FontSize="10" Opacity="0.7" Text="Wizard screw 2" />
+                        <TextBlock FontWeight="Bold" Text="{Binding ScrewPositionTopLeftHeading}" TextTrimming="CharacterEllipsis" />
+                        <TextBlock FontSize="10" Opacity="0.7" Text="Motor 2 · wizard screw 2" />
                         <TextBlock Margin="0,2,0,0" Text="{Binding ScrewPositionTopLeftDisplay}" />
                     </StackPanel>
                 </Border>
@@ -68,8 +69,8 @@
                 <Border Grid.Row="0" Grid.Column="1" Margin="2,0,0,2" Padding="6,4"
                     BorderBrush="{StaticResource BorderBrush}" BorderThickness="1" CornerRadius="3">
                     <StackPanel>
-                        <TextBlock FontWeight="Bold" Text="TR · Motor 1" />
-                        <TextBlock FontSize="10" Opacity="0.7" Text="Wizard screw 1" />
+                        <TextBlock FontWeight="Bold" Text="{Binding ScrewPositionTopRightHeading}" TextTrimming="CharacterEllipsis" />
+                        <TextBlock FontSize="10" Opacity="0.7" Text="Motor 1 · wizard screw 1" />
                         <TextBlock Margin="0,2,0,0" Text="{Binding ScrewPositionTopRightDisplay}" />
                     </StackPanel>
                 </Border>
@@ -77,8 +78,8 @@
                 <Border Grid.Row="1" Grid.Column="0" Margin="0,2,2,0" Padding="6,4"
                     BorderBrush="{StaticResource BorderBrush}" BorderThickness="1" CornerRadius="3">
                     <StackPanel>
-                        <TextBlock FontWeight="Bold" Text="BL · Motor 4" />
-                        <TextBlock FontSize="10" Opacity="0.7" Text="Wizard screw 3" />
+                        <TextBlock FontWeight="Bold" Text="{Binding ScrewPositionBottomLeftHeading}" TextTrimming="CharacterEllipsis" />
+                        <TextBlock FontSize="10" Opacity="0.7" Text="Motor 4 · wizard screw 3" />
                         <TextBlock Margin="0,2,0,0" Text="{Binding ScrewPositionBottomLeftDisplay}" />
                     </StackPanel>
                 </Border>
@@ -86,22 +87,586 @@
                 <Border Grid.Row="1" Grid.Column="1" Margin="2,2,0,0" Padding="6,4"
                     BorderBrush="{StaticResource BorderBrush}" BorderThickness="1" CornerRadius="3">
                     <StackPanel>
-                        <TextBlock FontWeight="Bold" Text="BR · Motor 3" />
-                        <TextBlock FontSize="10" Opacity="0.7" Text="Wizard screw 4" />
+                        <TextBlock FontWeight="Bold" Text="{Binding ScrewPositionBottomRightHeading}" TextTrimming="CharacterEllipsis" />
+                        <TextBlock FontSize="10" Opacity="0.7" Text="Motor 3 · wizard screw 4" />
                         <TextBlock Margin="0,2,0,0" Text="{Binding ScrewPositionBottomRightDisplay}" />
                     </StackPanel>
                 </Border>
             </Grid>
-            <!--  Mapping made visible (not tooltip-only) so a user watching the physical adapter can tell
-                  which corner should be moving.  -->
+            <!--  Each cell now carries its own corner / motor / wizard-screw identity (and the user's name for
+                  the screw), so this line no longer restates the mapping: that would be a fourth place to keep
+                  in sync. What is left is the one thing the cells cannot say: what Δ is measured against.  -->
             <TextBlock
                 Margin="0,3,0,0"
                 FontSize="10"
                 FontStyle="Italic"
                 Opacity="0.7"
                 TextWrapping="Wrap"
-                Text="Screw 1 = TR, 2 = TL, 3 = BL, 4 = BR (matches the wizard). Δ is the change since this run started." />
+                Text="Each cell shows the adapter corner, its motor number, and the wizard screw it matches. Δ is the change since this run started." />
         </StackPanel>
+    </DataTemplate>
+
+    <!--
+        ============================ Manual adjustment (DataContext = TiltAdapterManualAdjustmentVM) =========
+        Hand control of the connected motorized adapter. Collapsed by default (IsExpanded is TwoWay so a click
+        sticks for the session; the VM's getter force-opens it while a send runs or an undismissed failure is on
+        screen). Two modes: a 3×3 pad that sends exactly one generator command, and absolute target positions
+        that decompose through the same planner + approval dialog the inspector's Automatic Adjustment uses.
+
+        Visibility is driven by Style.Triggers throughout, matching the rest of this file — a directly-set
+        Visibility attribute would win over the trigger, and every local TextBlock.Style carries
+        BasedOn="{StaticResource StandardTextBlock}" per the THEME HAZARD note at the top of this file.
+    -->
+    <DataTemplate x:Key="HF_TiltManualAdjustmentPanel">
+        <Expander Margin="0,8,0,0" IsExpanded="{Binding IsExpanded, Mode=TwoWay}">
+            <Expander.Header>
+                <WrapPanel>
+                    <TextBlock FontWeight="Bold" Text="Manual adjustment" />
+                    <TextBlock Margin="8,0,0,0" Opacity="0.6" Text="{Binding SummaryText}" />
+                </WrapPanel>
+            </Expander.Header>
+            <StackPanel Margin="4,6,0,0">
+
+                <!--  No undo: the counters live in the device's EEPROM and there is no abort command.  -->
+                <TextBlock
+                    Margin="0,0,0,6"
+                    FontStyle="Italic"
+                    Opacity="0.75"
+                    Text="{Binding CautionText}"
+                    TextWrapping="Wrap" />
+
+                <!--  Disconnected: the whole body collapses to one line.  -->
+                <TextBlock Opacity="0.7" Text="{Binding NotConnectedText}" TextWrapping="Wrap">
+                    <TextBlock.Style>
+                        <Style TargetType="TextBlock" BasedOn="{StaticResource StandardTextBlock}">
+                            <Setter Property="Visibility" Value="Collapsed" />
+                            <Style.Triggers>
+                                <DataTrigger Binding="{Binding IsDeviceConnected}" Value="False">
+                                    <Setter Property="Visibility" Value="Visible" />
+                                </DataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </TextBlock.Style>
+                </TextBlock>
+
+                <StackPanel>
+                    <StackPanel.Style>
+                        <Style TargetType="StackPanel">
+                            <Setter Property="Visibility" Value="Collapsed" />
+                            <Style.Triggers>
+                                <DataTrigger Binding="{Binding IsDeviceConnected}" Value="True">
+                                    <Setter Property="Visibility" Value="Visible" />
+                                </DataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </StackPanel.Style>
+
+                    <!--  Mode switch. Caption is a sibling TextBlock, never control Content.  -->
+                    <WrapPanel Margin="0,0,0,6">
+                        <TextBlock VerticalAlignment="Center" Text="Mode" />
+                        <RadioButton
+                            Margin="8,0,0,0"
+                            VerticalAlignment="Center"
+                            AutomationProperties.Name="Single move mode"
+                            Content="Single move"
+                            GroupName="HFManualAdjustMode"
+                            IsChecked="{Binding IsSingleMoveMode, Mode=TwoWay}"
+                            ToolTip="Send one adjustment now: a corner, a side, or all four motors together." />
+                        <RadioButton
+                            Margin="10,0,0,0"
+                            VerticalAlignment="Center"
+                            AutomationProperties.Name="Target positions mode"
+                            Content="Target positions"
+                            GroupName="HFManualAdjustMode"
+                            IsChecked="{Binding IsTargetPositionsMode, Mode=TwoWay}"
+                            ToolTip="Type where each motor should end, review the moves it takes to get there, then send them." />
+                    </WrapPanel>
+
+                    <!--  ================================ Single move ================================  -->
+                    <StackPanel>
+                        <StackPanel.Style>
+                            <Style TargetType="StackPanel">
+                                <Setter Property="Visibility" Value="Collapsed" />
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding IsSingleMoveMode}" Value="True">
+                                        <Setter Property="Visibility" Value="Visible" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </StackPanel.Style>
+
+                        <TextBlock Margin="0,0,0,3" Text="What to move" />
+                        <!--  3×3 pad laid out as the sensor is imaged: corners drive the diagonal axes, edges
+                              the edge axes, centre the backfocus axis. The selection ring is drawn by the
+                              wrapping Border rather than relying on the theme's ToggleButton checked chrome.  -->
+                        <ItemsControl HorizontalAlignment="Left" ItemsSource="{Binding PadItems}">
+                            <ItemsControl.ItemsPanel>
+                                <ItemsPanelTemplate>
+                                    <UniformGrid Columns="3" Rows="3" />
+                                </ItemsPanelTemplate>
+                            </ItemsControl.ItemsPanel>
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <Border Margin="1" BorderThickness="2" CornerRadius="4">
+                                        <Border.Style>
+                                            <Style TargetType="Border">
+                                                <Setter Property="BorderBrush" Value="Transparent" />
+                                                <Style.Triggers>
+                                                    <DataTrigger Binding="{Binding IsSelected}" Value="True">
+                                                        <Setter Property="BorderBrush" Value="{StaticResource PrimaryBrush}" />
+                                                    </DataTrigger>
+                                                </Style.Triggers>
+                                            </Style>
+                                        </Border.Style>
+                                        <ToggleButton
+                                            MinWidth="62"
+                                            AutomationProperties.Name="{Binding Target.AutomationName}"
+                                            IsChecked="{Binding IsSelected, Mode=TwoWay}"
+                                            ToolTip="{Binding Tooltip}">
+                                            <TextBlock Margin="8,5" HorizontalAlignment="Center" Text="{Binding Target.Label}">
+                                                <TextBlock.Style>
+                                                    <Style TargetType="TextBlock" BasedOn="{StaticResource StandardTextBlock}">
+                                                        <Setter Property="Foreground" Value="{StaticResource ButtonForegroundBrush}" />
+                                                        <Style.Triggers>
+                                                            <DataTrigger Binding="{Binding IsSelected}" Value="True">
+                                                                <Setter Property="FontWeight" Value="Bold" />
+                                                            </DataTrigger>
+                                                        </Style.Triggers>
+                                                    </Style>
+                                                </TextBlock.Style>
+                                            </TextBlock>
+                                        </ToggleButton>
+                                    </Border>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+
+                        <!--  Direction. Deliberately "+ / −" and never "up / down": which way a positive step
+                              physically moves a corner is rig-dependent, which is why the approval dialog also
+                              speaks signed steps. The legend under the preview carries the meaning.  -->
+                        <WrapPanel Margin="0,8,0,0">
+                            <TextBlock VerticalAlignment="Center" Text="Direction" />
+                            <RadioButton
+                                Margin="8,0,0,0"
+                                VerticalAlignment="Center"
+                                AutomationProperties.Name="Positive direction"
+                                Content="+"
+                                GroupName="HFManualAdjustDirection"
+                                IsChecked="{Binding PositiveDirection, Mode=TwoWay}"
+                                ToolTip="The wizard's positive step direction (clockwise / tighten) on the highlighted motors; the coupled motors move the opposite way." />
+                            <RadioButton
+                                Margin="10,0,0,0"
+                                VerticalAlignment="Center"
+                                AutomationProperties.Name="Negative direction"
+                                Content="−"
+                                GroupName="HFManualAdjustDirection"
+                                IsChecked="{Binding NegativeDirection, Mode=TwoWay}"
+                                ToolTip="The opposite of the wizard's positive step direction on the highlighted motors." />
+                        </WrapPanel>
+
+                        <WrapPanel Margin="0,6,0,0">
+                            <TextBlock VerticalAlignment="Center" Text="Amount" ToolTip="{Binding AmountTooltip}" />
+                            <TextBox
+                                MinWidth="60"
+                                Margin="8,0,0,0"
+                                VerticalAlignment="Center"
+                                AutomationProperties.Name="Move amount in device steps"
+                                Text="{Binding AmountText, UpdateSourceTrigger=LostFocus}"
+                                ToolTip="{Binding AmountTooltip}" />
+                            <TextBlock Margin="6,0,0,0" VerticalAlignment="Center" Text="steps" />
+                            <TextBlock
+                                Margin="8,0,0,0"
+                                VerticalAlignment="Center"
+                                FontStyle="Italic"
+                                Opacity="0.6"
+                                Text="{Binding AmountMicronsHint}" />
+                        </WrapPanel>
+
+                        <!--  Nothing picked yet: no preview, no Send.  -->
+                        <TextBlock Margin="0,8,0,0" Opacity="0.6" Text="{Binding NoSelectionText}">
+                            <TextBlock.Style>
+                                <Style TargetType="TextBlock" BasedOn="{StaticResource StandardTextBlock}">
+                                    <Setter Property="Visibility" Value="Visible" />
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding PreviewVisible}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed" />
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </TextBlock.Style>
+                        </TextBlock>
+
+                        <!--  Preview: what this click will do, before it is clicked. There is no undo, so the
+                              consequence has to be unmistakable here.  -->
+                        <Border
+                            Margin="0,8,0,0"
+                            Padding="6"
+                            BorderBrush="{StaticResource BorderBrush}"
+                            BorderThickness="1"
+                            CornerRadius="3">
+                            <Border.Style>
+                                <Style TargetType="Border">
+                                    <Setter Property="Visibility" Value="Collapsed" />
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding PreviewVisible}" Value="True">
+                                            <Setter Property="Visibility" Value="Visible" />
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </Border.Style>
+                            <StackPanel>
+                                <!--  Kind badge + semantic line, with the wire command demoted to an
+                                      auditability chip on the right (same hierarchy as the approval dialog).  -->
+                                <DockPanel>
+                                    <Border
+                                        Margin="0,0,6,0"
+                                        Padding="5,1"
+                                        DockPanel.Dock="Left"
+                                        BorderBrush="{StaticResource BorderBrush}"
+                                        BorderThickness="1"
+                                        CornerRadius="2">
+                                        <TextBlock FontSize="10" Text="{Binding PreviewKindLabel}" />
+                                    </Border>
+                                    <TextBlock
+                                        Margin="6,0,0,0"
+                                        DockPanel.Dock="Right"
+                                        FontFamily="Consolas"
+                                        FontSize="10"
+                                        Opacity="0.55"
+                                        Text="{Binding PreviewWireCommand}"
+                                        ToolTip="{Binding PreviewWireCommandTooltip}" />
+                                    <TextBlock FontWeight="SemiBold" Text="{Binding PreviewSemanticText}" TextWrapping="Wrap" />
+                                </DockPanel>
+
+                                <!--  Predicted end positions for ALL FOUR motors, in the same 2×2 layout as the
+                                      live grid above — this is what makes the mechanical coupling (clicking TR
+                                      also moves BL) visible before every send.  -->
+                                <ItemsControl Margin="0,6,0,0" HorizontalAlignment="Left" MinWidth="280" ItemsSource="{Binding PreviewCells}">
+                                    <ItemsControl.ItemsPanel>
+                                        <ItemsPanelTemplate>
+                                            <UniformGrid Columns="2" Rows="2" />
+                                        </ItemsPanelTemplate>
+                                    </ItemsControl.ItemsPanel>
+                                    <ItemsControl.ItemTemplate>
+                                        <DataTemplate>
+                                            <Border Margin="1" Padding="5,3" BorderBrush="{StaticResource BorderBrush}" BorderThickness="1" CornerRadius="3">
+                                                <StackPanel ToolTip="{Binding Tooltip}">
+                                                    <TextBlock FontSize="10" Opacity="0.7" Text="{Binding Heading}" />
+                                                    <TextBlock Text="{Binding ValueText}">
+                                                        <TextBlock.Style>
+                                                            <Style TargetType="TextBlock" BasedOn="{StaticResource StandardTextBlock}">
+                                                                <Setter Property="Opacity" Value="0.6" />
+                                                                <Style.Triggers>
+                                                                    <DataTrigger Binding="{Binding IsMoving}" Value="True">
+                                                                        <Setter Property="Opacity" Value="1.0" />
+                                                                        <Setter Property="FontWeight" Value="Bold" />
+                                                                    </DataTrigger>
+                                                                </Style.Triggers>
+                                                            </Style>
+                                                        </TextBlock.Style>
+                                                    </TextBlock>
+                                                    <!--  Limit state is a TEXT tag, never colour alone.  -->
+                                                    <TextBlock FontSize="10" Text="{Binding LimitTag}">
+                                                        <TextBlock.Style>
+                                                            <Style TargetType="TextBlock" BasedOn="{StaticResource StandardTextBlock}">
+                                                                <Setter Property="Visibility" Value="Collapsed" />
+                                                                <Setter Property="Foreground" Value="{StaticResource HF_AlertWarningAccentBrush}" />
+                                                                <Style.Triggers>
+                                                                    <DataTrigger Binding="{Binding HasLimitTag}" Value="True">
+                                                                        <Setter Property="Visibility" Value="Visible" />
+                                                                    </DataTrigger>
+                                                                    <DataTrigger Binding="{Binding IsBlocking}" Value="True">
+                                                                        <Setter Property="Foreground" Value="{StaticResource HF_AlertErrorAccentBrush}" />
+                                                                        <Setter Property="FontWeight" Value="Bold" />
+                                                                    </DataTrigger>
+                                                                </Style.Triggers>
+                                                            </Style>
+                                                        </TextBlock.Style>
+                                                    </TextBlock>
+                                                </StackPanel>
+                                            </Border>
+                                        </DataTemplate>
+                                    </ItemsControl.ItemTemplate>
+                                </ItemsControl>
+
+                                <TextBlock Margin="0,6,0,0" Text="{Binding ConsequenceText}" TextWrapping="Wrap" />
+                                <TextBlock
+                                    Margin="0,3,0,0"
+                                    FontSize="10"
+                                    Opacity="0.6"
+                                    Text="{Binding LegendText}"
+                                    TextWrapping="Wrap" />
+
+                                <!--  Positions unknown is advisory here, not blocking: the controller still
+                                      enforces the travel window, just against a possibly-stale estimate.  -->
+                                <TextBlock
+                                    Margin="0,6,0,0"
+                                    Foreground="{StaticResource HF_AlertWarningAccentBrush}"
+                                    Text="{Binding PositionsUnknownAdvisory}"
+                                    TextWrapping="Wrap">
+                                    <TextBlock.Style>
+                                        <Style TargetType="TextBlock" BasedOn="{StaticResource StandardTextBlock}">
+                                            <Setter Property="Visibility" Value="Collapsed" />
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding PositionsUnknownAdvisoryVisible}" Value="True">
+                                                    <Setter Property="Visibility" Value="Visible" />
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </TextBlock.Style>
+                                </TextBlock>
+
+                                <TextBlock
+                                    Margin="0,6,0,0"
+                                    Foreground="{StaticResource HF_AlertWarningAccentBrush}"
+                                    Text="{Binding SendDisabledReason}"
+                                    TextWrapping="Wrap">
+                                    <TextBlock.Style>
+                                        <Style TargetType="TextBlock" BasedOn="{StaticResource StandardTextBlock}">
+                                            <Setter Property="Visibility" Value="Collapsed" />
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding SendDisabledReasonVisible}" Value="True">
+                                                    <Setter Property="Visibility" Value="Visible" />
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </TextBlock.Style>
+                                </TextBlock>
+
+                                <DockPanel Margin="0,6,0,0">
+                                    <Button
+                                        DockPanel.Dock="Right"
+                                        AutomationProperties.Name="Send the previewed move"
+                                        Command="{Binding SendCommand}">
+                                        <TextBlock Margin="12,5" Foreground="{StaticResource ButtonForegroundBrush}" Text="{Binding SendButtonText}" />
+                                    </Button>
+                                    <TextBlock VerticalAlignment="Center" Opacity="0.7" Text="{Binding MoveCountAndDurationText}" />
+                                </DockPanel>
+                            </StackPanel>
+                        </Border>
+                    </StackPanel>
+
+                    <!--  ============================== Target positions ==============================  -->
+                    <StackPanel>
+                        <StackPanel.Style>
+                            <Style TargetType="StackPanel">
+                                <Setter Property="Visibility" Value="Collapsed" />
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding IsTargetPositionsMode}" Value="True">
+                                        <Setter Property="Visibility" Value="Visible" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </StackPanel.Style>
+
+                        <TextBlock Margin="0,0,0,6" Opacity="0.7" Text="{Binding TargetModeCaption}" TextWrapping="Wrap" />
+
+                        <ItemsControl HorizontalAlignment="Left" MinWidth="300" ItemsSource="{Binding TargetCells}">
+                            <ItemsControl.ItemsPanel>
+                                <ItemsPanelTemplate>
+                                    <UniformGrid Columns="2" Rows="2" />
+                                </ItemsPanelTemplate>
+                            </ItemsControl.ItemsPanel>
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <Border Margin="1" Padding="5,4" BorderBrush="{StaticResource BorderBrush}" BorderThickness="1" CornerRadius="3">
+                                        <StackPanel>
+                                            <TextBlock FontWeight="Bold" Text="{Binding Heading}" />
+                                            <TextBlock FontSize="10" Opacity="0.7" Text="{Binding WizardScrewCaption}" />
+                                            <TextBlock Margin="0,2,0,0" FontSize="10" Opacity="0.7" Text="{Binding NowText}" />
+                                            <DockPanel Margin="0,3,0,0">
+                                                <TextBlock VerticalAlignment="Center" DockPanel.Dock="Left" Text="Target" />
+                                                <TextBox
+                                                    MinWidth="60"
+                                                    Margin="5,0,0,0"
+                                                    VerticalAlignment="Center"
+                                                    AutomationProperties.Name="{Binding Heading}"
+                                                    Text="{Binding TargetText, UpdateSourceTrigger=LostFocus}">
+                                                    <TextBox.Style>
+                                                        <Style TargetType="TextBox">
+                                                            <Style.Triggers>
+                                                                <DataTrigger Binding="{Binding HasError}" Value="True">
+                                                                    <Setter Property="BorderBrush" Value="{StaticResource NotificationErrorBrush}" />
+                                                                    <Setter Property="BorderThickness" Value="2" />
+                                                                </DataTrigger>
+                                                            </Style.Triggers>
+                                                        </Style>
+                                                    </TextBox.Style>
+                                                </TextBox>
+                                            </DockPanel>
+                                            <TextBlock Margin="0,3,0,0" FontWeight="SemiBold" Text="{Binding DeltaText}">
+                                                <TextBlock.Style>
+                                                    <Style TargetType="TextBlock" BasedOn="{StaticResource StandardTextBlock}">
+                                                        <Setter Property="Visibility" Value="Collapsed" />
+                                                        <Style.Triggers>
+                                                            <DataTrigger Binding="{Binding HasDelta}" Value="True">
+                                                                <Setter Property="Visibility" Value="Visible" />
+                                                            </DataTrigger>
+                                                        </Style.Triggers>
+                                                    </Style>
+                                                </TextBlock.Style>
+                                            </TextBlock>
+                                            <!--  Only present when the request contains twist: the position this
+                                                  motor will actually reach, which is not the one typed above.  -->
+                                            <TextBlock FontSize="10" Foreground="{StaticResource HF_AlertWarningAccentBrush}" Text="{Binding WillReachText}">
+                                                <TextBlock.Style>
+                                                    <Style TargetType="TextBlock" BasedOn="{StaticResource StandardTextBlock}">
+                                                        <Setter Property="Visibility" Value="Collapsed" />
+                                                        <Style.Triggers>
+                                                            <DataTrigger Binding="{Binding HasWillReach}" Value="True">
+                                                                <Setter Property="Visibility" Value="Visible" />
+                                                            </DataTrigger>
+                                                        </Style.Triggers>
+                                                    </Style>
+                                                </TextBlock.Style>
+                                            </TextBlock>
+                                        </StackPanel>
+                                    </Border>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+
+                        <TextBlock Margin="0,6,0,0" Text="{Binding TargetHintText}" TextWrapping="Wrap">
+                            <TextBlock.Style>
+                                <Style TargetType="TextBlock" BasedOn="{StaticResource StandardTextBlock}">
+                                    <Setter Property="Visibility" Value="Collapsed" />
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding TargetHintVisible}" Value="True">
+                                            <Setter Property="Visibility" Value="Visible" />
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding TargetHintIsError}" Value="True">
+                                            <Setter Property="Foreground" Value="{StaticResource HF_AlertErrorAccentBrush}" />
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </TextBlock.Style>
+                        </TextBlock>
+
+                        <!--  Four numbers, three degrees of freedom: a rigid plane cannot twist.  -->
+                        <Border
+                            Margin="0,6,0,0"
+                            Padding="6"
+                            BorderBrush="{StaticResource NotificationWarningBrush}"
+                            BorderThickness="1"
+                            CornerRadius="3">
+                            <Border.Style>
+                                <Style TargetType="Border">
+                                    <Setter Property="Visibility" Value="Collapsed" />
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding TwistWarningVisible}" Value="True">
+                                            <Setter Property="Visibility" Value="Visible" />
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </Border.Style>
+                            <StackPanel>
+                                <TextBlock FontWeight="Bold" Text="{Binding TwistWarningTitle}" />
+                                <TextBlock Margin="0,2,0,0" Text="{Binding TwistWarningBody}" TextWrapping="Wrap" />
+                            </StackPanel>
+                        </Border>
+
+                        <TextBlock
+                            Margin="0,6,0,0"
+                            Foreground="{StaticResource HF_AlertWarningAccentBrush}"
+                            Text="{Binding ReviewDisabledReason}"
+                            TextWrapping="Wrap">
+                            <TextBlock.Style>
+                                <Style TargetType="TextBlock" BasedOn="{StaticResource StandardTextBlock}">
+                                    <Setter Property="Visibility" Value="Collapsed" />
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding ReviewDisabledReasonVisible}" Value="True">
+                                            <Setter Property="Visibility" Value="Visible" />
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </TextBlock.Style>
+                        </TextBlock>
+
+                        <WrapPanel Margin="0,6,0,0">
+                            <Button
+                                AutomationProperties.Name="Reset targets to the current positions"
+                                Command="{Binding ResetToCurrentCommand}"
+                                ToolTip="Fill every target from the current motor positions.">
+                                <TextBlock Margin="12,5" Foreground="{StaticResource ButtonForegroundBrush}" Text="Reset to current" />
+                            </Button>
+                            <Button
+                                Margin="8,0,0,0"
+                                AutomationProperties.Name="Review the moves these targets require"
+                                Command="{Binding ReviewMovesCommand}"
+                                ToolTip="Decomposes the difference between the targets and the current positions, then opens the move-approval dialog. Nothing is sent until you approve it there.">
+                                <TextBlock Margin="12,5" Foreground="{StaticResource ButtonForegroundBrush}" Text="{Binding ReviewButtonText}" />
+                            </Button>
+                        </WrapPanel>
+                    </StackPanel>
+
+                    <!--  ============================== Status / result ==============================  -->
+                    <DockPanel Margin="0,8,0,0">
+                        <DockPanel.Style>
+                            <Style TargetType="DockPanel">
+                                <Setter Property="Visibility" Value="Collapsed" />
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding ProgressVisible}" Value="True">
+                                        <Setter Property="Visibility" Value="Visible" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </DockPanel.Style>
+                        <Button
+                            Margin="8,0,0,0"
+                            DockPanel.Dock="Right"
+                            AutomationProperties.Name="Stop after the move now in flight"
+                            Command="{Binding StopCommand}"
+                            ToolTip="{Binding StopButtonTooltip}">
+                            <TextBlock Margin="12,5" Foreground="{StaticResource ButtonForegroundBrush}" Text="{Binding StopButtonText}" />
+                        </Button>
+                        <TextBlock VerticalAlignment="Center" Text="{Binding ProgressText}" TextWrapping="Wrap" />
+                    </DockPanel>
+
+                    <TextBlock Margin="0,8,0,0" FontStyle="Italic" Opacity="0.75" Text="{Binding SuccessText}" TextWrapping="Wrap">
+                        <TextBlock.Style>
+                            <Style TargetType="TextBlock" BasedOn="{StaticResource StandardTextBlock}">
+                                <Setter Property="Visibility" Value="Collapsed" />
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding SuccessVisible}" Value="True">
+                                        <Setter Property="Visibility" Value="Visible" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </TextBlock.Style>
+                    </TextBlock>
+
+                    <!--  Stopped / failed. Stays until dismissed, and the VM keeps the expander open while it is
+                          here, so a failure can never be hidden by a collapse.  -->
+                    <Border Margin="0,8,0,0" Padding="6" BorderThickness="1" CornerRadius="3">
+                        <Border.Style>
+                            <Style TargetType="Border">
+                                <Setter Property="Visibility" Value="Collapsed" />
+                                <Setter Property="BorderBrush" Value="{StaticResource NotificationWarningBrush}" />
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding ResultVisible}" Value="True">
+                                        <Setter Property="Visibility" Value="Visible" />
+                                    </DataTrigger>
+                                    <DataTrigger Binding="{Binding ResultIsError}" Value="True">
+                                        <Setter Property="BorderBrush" Value="{StaticResource NotificationErrorBrush}" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </Border.Style>
+                        <StackPanel>
+                            <TextBlock FontWeight="Bold" Text="{Binding ResultTitle}" TextWrapping="Wrap" />
+                            <TextBlock Margin="0,3,0,0" Text="{Binding ResultBody}" TextWrapping="Wrap" />
+                            <Button
+                                Margin="0,6,0,0"
+                                HorizontalAlignment="Left"
+                                AutomationProperties.Name="Dismiss this result"
+                                Command="{Binding DismissResultCommand}">
+                                <TextBlock Margin="12,5" Foreground="{StaticResource ButtonForegroundBrush}" Text="Dismiss" />
+                            </Button>
+                        </StackPanel>
+                    </Border>
+                </StackPanel>
+            </StackPanel>
+        </Expander>
     </DataTemplate>
 
     <!--
@@ -125,11 +690,11 @@
     -->
     <DataTemplate x:Key="HF_TiltScrewDiagram">
         <StackPanel>
-        <Canvas Width="200" Height="200">
+        <Canvas Width="260" Height="260">
             <!--  Sensor rectangle — 3:2 aspect ratio, 90×60  -->
             <Rectangle
-                Canvas.Left="55"
-                Canvas.Top="70"
+                Canvas.Left="85"
+                Canvas.Top="100"
                 Width="90"
                 Height="60"
                 Fill="Transparent"
@@ -143,25 +708,25 @@
                 StrokeDashArray="4,4"
                 StrokeThickness="0.75"
                 X1="0"
-                X2="200"
-                Y1="100"
-                Y2="100" />
+                X2="260"
+                Y1="130"
+                Y2="130" />
             <Line
                 Opacity="0.5"
                 Stroke="{StaticResource PrimaryBrush}"
                 StrokeDashArray="4,4"
                 StrokeThickness="0.75"
-                X1="100"
-                X2="100"
+                X1="130"
+                X2="130"
                 Y1="0"
-                Y2="200" />
+                Y2="260" />
 
             <!--  Screw connection polygon — long-dash lines  -->
             <ItemsControl
                 Canvas.Left="0"
                 Canvas.Top="0"
-                Width="200"
-                Height="200"
+                Width="260"
+                Height="260"
                 ItemsSource="{Binding ScrewConnectionLines}">
                 <ItemsControl.ItemsPanel>
                     <ItemsPanelTemplate>
@@ -187,8 +752,8 @@
             <ItemsControl
                 Canvas.Left="0"
                 Canvas.Top="0"
-                Width="200"
-                Height="200"
+                Width="260"
+                Height="260"
                 ItemsSource="{Binding ScrewDiagramItems}">
                 <ItemsControl.ItemsPanel>
                     <ItemsPanelTemplate>
@@ -219,29 +784,65 @@
                 </ItemsControl.ItemTemplate>
             </ItemsControl>
 
+            <!--  Screw names, just outside each circle. The circle keeps the wizard number (24px leaves no
+                  room for a name); this is where "M4" or "Top Left" appears. Placement comes from the VM,
+                  which keeps names clear of the sensor rectangle and of one another. Width is fixed so the
+                  blocks stay centred under their screws; anything longer ellipsizes and the full name is
+                  still on the tooltip.  -->
+            <ItemsControl
+                Canvas.Left="0"
+                Canvas.Top="0"
+                Width="260"
+                Height="260"
+                ItemsSource="{Binding ScrewDiagramItems}">
+                <ItemsControl.ItemsPanel>
+                    <ItemsPanelTemplate>
+                        <Canvas IsItemsHost="True" />
+                    </ItemsPanelTemplate>
+                </ItemsControl.ItemsPanel>
+                <ItemsControl.ItemContainerStyle>
+                    <Style>
+                        <Setter Property="Canvas.Left" Value="{Binding LabelX}" />
+                        <Setter Property="Canvas.Top" Value="{Binding LabelY}" />
+                    </Style>
+                </ItemsControl.ItemContainerStyle>
+                <ItemsControl.ItemTemplate>
+                    <DataTemplate>
+                        <TextBlock
+                            Width="64"
+                            FontSize="9"
+                            Foreground="{StaticResource PrimaryBrush}"
+                            Text="{Binding Label}"
+                            TextAlignment="Center"
+                            TextTrimming="CharacterEllipsis"
+                            ToolTip="{Binding Label}" />
+                    </DataTemplate>
+                </ItemsControl.ItemTemplate>
+            </ItemsControl>
+
             <!--  Orientation markers (Style A) — anchored only in screw-free zones: the central-top
-                  band (x∈[93,115], y∈[43,56]) and the rectangle interior are empty for all 3- and
+                  band (x∈[123,145], y∈[73,86]) and the rectangle interior are empty for all 3- and
                   4-screw layouts and any calibration rotation, so they never collide with a screw
                   circle. The clockwise cue lives in the caption below (collision-proof).  -->
             <!--  0° = straight up: up-chevron + label just below the 12-o'clock screw  -->
             <Path
-                Canvas.Left="93"
-                Canvas.Top="46"
+                Canvas.Left="123"
+                Canvas.Top="76"
                 Width="14"
                 Height="10"
                 Data="M0,10 L7,0 L14,10 Z"
                 Fill="{StaticResource PrimaryBrush}"
                 Stretch="Uniform" />
             <TextBlock
-                Canvas.Left="110"
-                Canvas.Top="43"
+                Canvas.Left="140"
+                Canvas.Top="73"
                 FontSize="10"
                 Foreground="{StaticResource PrimaryBrush}"
                 Text="0°" />
             <!--  The rectangle depicts IMAGE orientation, not the physical adapter  -->
             <TextBlock
-                Canvas.Left="70"
-                Canvas.Top="74"
+                Canvas.Left="100"
+                Canvas.Top="104"
                 FontSize="9"
                 Foreground="{StaticResource PrimaryBrush}"
                 Opacity="0.75"
@@ -250,7 +851,7 @@
         <!--  Caption: states all three orientation facts; the clockwise icon renders inline (via the
               ⟳ sentinel) here where it cannot collide with a rotated screw circle.  -->
         <TextBlock
-            MaxWidth="200"
+            MaxWidth="260"
             Margin="0,4,0,0"
             FontSize="10"
             Foreground="{StaticResource PrimaryBrush}"
@@ -269,15 +870,15 @@
     <DataTemplate x:Key="HF_TiltScrewCalibrationInfo">
         <StackPanel>
             <UniformGrid Margin="0,2" VerticalAlignment="Center" Columns="2">
-                <TextBlock HorizontalAlignment="Center" Text="Screw 1" />
+                <TextBlock HorizontalAlignment="Center" Text="{Binding Screw1DisplayName}" TextTrimming="CharacterEllipsis" ToolTip="{Binding Screw1DisplayName}" />
                 <TextBlock HorizontalAlignment="Center" Text="{Binding PhysicalScrew1AngleDegrees, StringFormat={}{0:F1}°}" />
             </UniformGrid>
             <UniformGrid Margin="0,2" VerticalAlignment="Center" Columns="2">
-                <TextBlock HorizontalAlignment="Center" Text="Screw 2" />
+                <TextBlock HorizontalAlignment="Center" Text="{Binding Screw2DisplayName}" TextTrimming="CharacterEllipsis" ToolTip="{Binding Screw2DisplayName}" />
                 <TextBlock HorizontalAlignment="Center" Text="{Binding PhysicalScrew2AngleDegrees, StringFormat={}{0:F1}°}" />
             </UniformGrid>
             <UniformGrid Margin="0,2" VerticalAlignment="Center" Columns="2">
-                <TextBlock HorizontalAlignment="Center" Text="Screw 3" />
+                <TextBlock HorizontalAlignment="Center" Text="{Binding Screw3DisplayName}" TextTrimming="CharacterEllipsis" ToolTip="{Binding Screw3DisplayName}" />
                 <TextBlock HorizontalAlignment="Center" Text="{Binding PhysicalScrew3AngleDegrees, StringFormat={}{0:F1}°}" />
             </UniformGrid>
             <!--  Screw 4 row — collapses when ScrewCount == 3  -->
@@ -292,7 +893,7 @@
                         </Style.Triggers>
                     </Style>
                 </UniformGrid.Style>
-                <TextBlock HorizontalAlignment="Center" Text="Screw 4" />
+                <TextBlock HorizontalAlignment="Center" Text="{Binding Screw4DisplayName}" TextTrimming="CharacterEllipsis" ToolTip="{Binding Screw4DisplayName}" />
                 <TextBlock HorizontalAlignment="Center" Text="{Binding PhysicalScrew4AngleDegrees, StringFormat={}{0:F1}°}" />
             </UniformGrid>
             <!--  Curvature row — the arrow shows how the curvature effect responds to clockwise screw turns  -->
@@ -300,7 +901,7 @@
                 Margin="0,2"
                 VerticalAlignment="Center"
                 Columns="2"
-                ToolTip="The direction of the curvature response to clockwise screw turns (+ steps for stepper motors). Set by the adapter direction in the Measurement settings, or measured by a 6-step calibration run.">
+                ToolTip="The direction of the curvature response to clockwise screw turns (+ steps for stepper motors). Set by the adapter direction in the Measurement settings, or measured by a calibration run with direction measurement enabled.">
                 <UniformGrid.Style>
                     <Style TargetType="UniformGrid">
                         <Setter Property="Visibility" Value="Collapsed" />
@@ -426,12 +1027,22 @@
                                     Text="{Binding TiltDeviceStatusText}" />
                             </StackPanel>
 
+                            <!--  Idle auto-disconnect countdown: the primary home, right where the connection is
+                                  managed. The manual-adjustment panel nests in this same group box, so it is
+                                  covered for free.  -->
+                            <ContentControl Content="{Binding IdleCountdown}" />
+
                             <!--  Live per-corner motor positions + Δ (shared template; also rendered in the
                                   running and complete panels). Self-gates on IsTiltDeviceConnected.  -->
                             <ContentControl
                                 Margin="0,8,0,0"
                                 Content="{Binding}"
                                 ContentTemplate="{StaticResource HF_TiltDevicePositionsGrid}" />
+
+                            <!--  Manual adjustment: hand control of the connected adapter. Sits directly under
+                                  the positions grid because that grid is the shared state both of its modes read
+                                  against, and above the safety limits it enforces. Collapsed by default.  -->
+                            <ContentControl Content="{Binding ManualAdjustment}" ContentTemplate="{StaticResource HF_TiltManualAdjustmentPanel}" />
 
                             <!--  Persisted per-profile device safety limits (project invariant: every
                                   persisted option gets a UI control — these three were deferred here
@@ -555,6 +1166,143 @@
                         <TextBox MinWidth="60" IsEnabled="{Binding IsManualDevice}" Text="{Binding ScrewRadiusMillimetersValue, UpdateSourceTrigger=LostFocus}" />
                     </UniformGrid>
 
+                    <!--  Screw labels: the names this rig's screws go by, used by every tilt surface.
+                          Deliberately NOT gated on IsManualDevice like the hardware fields above: renaming
+                          an EAT's motors is the primary use case, and the labels are stored per device
+                          family, so each preset shows and edits its own set.  -->
+                    <Expander Margin="0,10,0,0" Header="Screw Labels">
+                        <StackPanel Margin="0,5,0,0">
+                            <TextBlock
+                                Margin="0,0,0,5"
+                                FontStyle="Italic"
+                                Opacity="0.7"
+                                Text="Optional names for your screws — used everywhere HocusFocus refers to them. Leave a box blank to use the name shown in it. Each device keeps its own names, so switching adapters brings the right set back."
+                                TextWrapping="Wrap" />
+                            <UniformGrid Margin="0,2" VerticalAlignment="Center" Columns="2">
+                                <TextBlock VerticalAlignment="Center" Text="Screw 1" />
+                                <Grid>
+                                    <TextBox
+                                        x:Name="Screw1LabelBox"
+                                        MinWidth="90"
+                                        MaxLength="{Binding ScrewLabelMaxLength}"
+                                        Text="{Binding Screw1Label, UpdateSourceTrigger=LostFocus}" />
+                                    <!--  Greyed default showing through an empty box, so a blank field visibly IS the name that will be used.  -->
+                                    <TextBlock
+                                        Margin="6,0,0,0"
+                                        VerticalAlignment="Center"
+                                        IsHitTestVisible="False"
+                                        Opacity="0.5"
+                                        Text="{Binding Screw1LabelHint}">
+                                        <TextBlock.Style>
+                                            <Style BasedOn="{StaticResource StandardTextBlock}" TargetType="TextBlock">
+                                                <Setter Property="Visibility" Value="Collapsed" />
+                                                <Style.Triggers>
+                                                    <DataTrigger Binding="{Binding Text, ElementName=Screw1LabelBox}" Value="">
+                                                        <Setter Property="Visibility" Value="Visible" />
+                                                    </DataTrigger>
+                                                </Style.Triggers>
+                                            </Style>
+                                        </TextBlock.Style>
+                                    </TextBlock>
+                                </Grid>
+                            </UniformGrid>
+                            <UniformGrid Margin="0,2" VerticalAlignment="Center" Columns="2">
+                                <TextBlock VerticalAlignment="Center" Text="Screw 2" />
+                                <Grid>
+                                    <TextBox
+                                        x:Name="Screw2LabelBox"
+                                        MinWidth="90"
+                                        MaxLength="{Binding ScrewLabelMaxLength}"
+                                        Text="{Binding Screw2Label, UpdateSourceTrigger=LostFocus}" />
+                                    <!--  Greyed default showing through an empty box, so a blank field visibly IS the name that will be used.  -->
+                                    <TextBlock
+                                        Margin="6,0,0,0"
+                                        VerticalAlignment="Center"
+                                        IsHitTestVisible="False"
+                                        Opacity="0.5"
+                                        Text="{Binding Screw2LabelHint}">
+                                        <TextBlock.Style>
+                                            <Style BasedOn="{StaticResource StandardTextBlock}" TargetType="TextBlock">
+                                                <Setter Property="Visibility" Value="Collapsed" />
+                                                <Style.Triggers>
+                                                    <DataTrigger Binding="{Binding Text, ElementName=Screw2LabelBox}" Value="">
+                                                        <Setter Property="Visibility" Value="Visible" />
+                                                    </DataTrigger>
+                                                </Style.Triggers>
+                                            </Style>
+                                        </TextBlock.Style>
+                                    </TextBlock>
+                                </Grid>
+                            </UniformGrid>
+                            <UniformGrid Margin="0,2" VerticalAlignment="Center" Columns="2">
+                                <TextBlock VerticalAlignment="Center" Text="Screw 3" />
+                                <Grid>
+                                    <TextBox
+                                        x:Name="Screw3LabelBox"
+                                        MinWidth="90"
+                                        MaxLength="{Binding ScrewLabelMaxLength}"
+                                        Text="{Binding Screw3Label, UpdateSourceTrigger=LostFocus}" />
+                                    <!--  Greyed default showing through an empty box, so a blank field visibly IS the name that will be used.  -->
+                                    <TextBlock
+                                        Margin="6,0,0,0"
+                                        VerticalAlignment="Center"
+                                        IsHitTestVisible="False"
+                                        Opacity="0.5"
+                                        Text="{Binding Screw3LabelHint}">
+                                        <TextBlock.Style>
+                                            <Style BasedOn="{StaticResource StandardTextBlock}" TargetType="TextBlock">
+                                                <Setter Property="Visibility" Value="Collapsed" />
+                                                <Style.Triggers>
+                                                    <DataTrigger Binding="{Binding Text, ElementName=Screw3LabelBox}" Value="">
+                                                        <Setter Property="Visibility" Value="Visible" />
+                                                    </DataTrigger>
+                                                </Style.Triggers>
+                                            </Style>
+                                        </TextBlock.Style>
+                                    </TextBlock>
+                                </Grid>
+                            </UniformGrid>
+                            <UniformGrid Margin="0,2" VerticalAlignment="Center" Columns="2">
+                                <UniformGrid.Style>
+                                    <Style TargetType="UniformGrid">
+                                        <Setter Property="Visibility" Value="Visible" />
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding TiltAdapterOptions.ScrewCount}" Value="3">
+                                                <Setter Property="Visibility" Value="Collapsed" />
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </UniformGrid.Style>
+                                <TextBlock VerticalAlignment="Center" Text="Screw 4" />
+                                <Grid>
+                                    <TextBox
+                                        x:Name="Screw4LabelBox"
+                                        MinWidth="90"
+                                        MaxLength="{Binding ScrewLabelMaxLength}"
+                                        Text="{Binding Screw4Label, UpdateSourceTrigger=LostFocus}" />
+                                    <!--  Greyed default showing through an empty box, so a blank field visibly IS the name that will be used.  -->
+                                    <TextBlock
+                                        Margin="6,0,0,0"
+                                        VerticalAlignment="Center"
+                                        IsHitTestVisible="False"
+                                        Opacity="0.5"
+                                        Text="{Binding Screw4LabelHint}">
+                                        <TextBlock.Style>
+                                            <Style BasedOn="{StaticResource StandardTextBlock}" TargetType="TextBlock">
+                                                <Setter Property="Visibility" Value="Collapsed" />
+                                                <Style.Triggers>
+                                                    <DataTrigger Binding="{Binding Text, ElementName=Screw4LabelBox}" Value="">
+                                                        <Setter Property="Visibility" Value="Visible" />
+                                                    </DataTrigger>
+                                                </Style.Triggers>
+                                            </Style>
+                                        </TextBlock.Style>
+                                    </TextBlock>
+                                </Grid>
+                            </UniformGrid>
+                        </StackPanel>
+                    </Expander>
+
                     <!--  Editable per-session fields (kept together, always editable)  -->
                     <UniformGrid Margin="0,5" VerticalAlignment="Center" Columns="2">
                         <TextBlock VerticalAlignment="Center" Text="Measurements to average"
@@ -593,6 +1341,7 @@
                         Text="Measurement" />
                     <Grid Margin="0,2">
                         <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
                             <RowDefinition Height="Auto" />
                             <RowDefinition Height="Auto" />
                             <RowDefinition Height="Auto" />
@@ -762,6 +1511,29 @@
                             Opacity="0.7"
                             Text="Adds 2 extra measurement steps (6 instead of 4 — about 50% longer) to determine the direction automatically. Turn on if you don't know how your adapter behaves, or to verify the setting above."
                             TextWrapping="Wrap" />
+
+                        <TextBlock
+                            Grid.Row="4"
+                            Grid.Column="0"
+                            Margin="0,2,5,2"
+                            VerticalAlignment="Center"
+                            Text="Measure final re-baseline (recommended)"
+                            ToolTip="Adds one extra measurement step after the final restore move so screw 2's move is referenced symmetrically, cancelling drift between steps the same way screw 1's move already is." />
+                        <CheckBox
+                            Grid.Row="4"
+                            Grid.Column="1"
+                            HorizontalAlignment="Left"
+                            VerticalAlignment="Center"
+                            IsChecked="{Binding TiltAdapterOptions.MeasureFinalRebaseline}" />
+                        <TextBlock
+                            Grid.Row="4"
+                            Grid.Column="2"
+                            Margin="8,2,0,2"
+                            VerticalAlignment="Center"
+                            FontStyle="Italic"
+                            Opacity="0.7"
+                            Text="Adds 1 extra measurement step (~4 more minutes) so screw 2's move cancels drift between steps like screw 1's already does. Turn off to skip this extra measurement."
+                            TextWrapping="Wrap" />
                     </Grid>
 
                     <!--  Calibrate + Replay side by side  -->
@@ -881,12 +1653,81 @@
                                 Content="{Binding}" />
                         </Grid>
 
+                        <!--  [CRITICAL GATE] Automation is blocked for a calibration that is not device-linked or
+                              not confidence-checked. Clearing those markers used to be entirely silent — a user
+                              who corrected one angle by hand after a device-driven run lost Automatic Adjustment
+                              with no message and no way back short of repeating the calibration. Filled badge
+                              rather than the quiet outlined style because this CARRIES AN ACTION and explains a
+                              capability that has disappeared (same reasoning as the idle-countdown banner in
+                              AutoFocus/DataTemplates.xaml).  -->
+                        <Border Margin="0,10,0,0" Visibility="{Binding AutomationTrustBannerVisible, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}"
+                            Style="{StaticResource HF_AlertWarningBadge}">
+                            <StackPanel>
+                                <TextBlock
+                                    MaxWidth="520"
+                                    HorizontalAlignment="Left"
+                                    FontWeight="Bold"
+                                    Foreground="{StaticResource HF_AlertWarningTextBrush}"
+                                    Text="Automatic Adjustment is disabled"
+                                    TextWrapping="Wrap" />
+                                <TextBlock
+                                    MaxWidth="520"
+                                    Margin="0,3,0,0"
+                                    HorizontalAlignment="Left"
+                                    Foreground="{StaticResource HF_AlertWarningTextBrush}"
+                                    Text="This calibration was entered or edited by hand, so HocusFocus cannot verify that your screw numbering matches the device's motor wiring. Re-run the wizard with the device connected, or trust this calibration explicitly using the button below."
+                                    TextWrapping="Wrap" />
+
+                                <!--  Step 1: arm.  -->
+                                <Button
+                                    Margin="0,6,0,0"
+                                    HorizontalAlignment="Left"
+                                    Command="{Binding TrustCalibrationCommand}"
+                                    Visibility="{Binding IsTrustCalibrationPending, Converter={StaticResource InverseBooleanToVisibilityCollapsedConverter}}">
+                                    <TextBlock
+                                        Margin="10,5,10,5"
+                                        Foreground="{StaticResource ButtonForegroundBrush}"
+                                        Text="Trust This Calibration for Automation" />
+                                </Button>
+
+                                <!--  Step 2: the risk, then confirm or back out.  -->
+                                <StackPanel Visibility="{Binding IsTrustCalibrationPending, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}">
+                                    <TextBlock
+                                        MaxWidth="520"
+                                        Margin="0,6,0,0"
+                                        HorizontalAlignment="Left"
+                                        FontWeight="Bold"
+                                        Foreground="{StaticResource HF_AlertWarningTextBrush}"
+                                        Text="If your screw numbering does not match the device's motor wiring, Automatic Adjustment will drive the adapter unattended in the wrong direction and make tilt worse. Before trusting it, use Manual adjustment to move one screw a small amount and confirm the corner that actually moves is the one you expect for that screw label — then it is safe."
+                                        TextWrapping="Wrap" />
+                                    <WrapPanel Margin="0,6,0,0">
+                                        <Button
+                                            AutomationProperties.Name="Confirm trusting this calibration for automation"
+                                            Command="{Binding ConfirmTrustCalibrationCommand}">
+                                            <TextBlock
+                                                Margin="10,5,10,5"
+                                                Foreground="{StaticResource ButtonForegroundBrush}"
+                                                Text="Yes, trust it" />
+                                        </Button>
+                                        <Button
+                                            Margin="6,0,0,0"
+                                            AutomationProperties.Name="Cancel trusting this calibration"
+                                            Command="{Binding CancelTrustCalibrationCommand}">
+                                            <TextBlock
+                                                Margin="10,5,10,5"
+                                                Foreground="{StaticResource ButtonForegroundBrush}"
+                                                Text="Cancel" />
+                                        </Button>
+                                    </WrapPanel>
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
                         <Button
                             Margin="0,10,0,0"
                             HorizontalAlignment="Left"
                             Command="{Binding ClearCalibrationCommand}"
                             ToolTip="Clears the saved calibration (screw angles and the calibrated/manual flags), returning this pane to &quot;No calibration saved.&quot; The device selection and its configured hardware/direction are kept — re-run the wizard or use Manual Calibration Entry to set a new one.">
-                            <TextBlock Margin="6,2" Text="Clear Calibration" />
+                            <TextBlock Margin="6,2" Foreground="{StaticResource ButtonForegroundBrush}" Text="Clear Calibration" />
                         </Button>
                     </StackPanel>
 
@@ -983,7 +1824,21 @@
                     <TextBlock
                         Margin="0,1,0,6"
                         FontWeight="Bold"
-                        Text="{Binding StepTitle}" />
+                        Text="{Binding StepTitle}">
+                        <!--  The tooltip is about the all-motors step SPECIFICALLY, and this one TextBlock renders
+                              every step's title, so it must be scoped. Unscoped it would tell a user hovering
+                              "Move Screw 1" about a different step's mechanics — a smaller version of the
+                              text-does-not-match-the-hardware confusion this task exists to remove.  -->
+                        <TextBlock.Style>
+                            <Style BasedOn="{StaticResource StandardTextBlock}" TargetType="TextBlock">
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding CurrentStep}" Value="{x:Static local:WizardStep.AllInward}">
+                                        <Setter Property="ToolTip" Value="Moving every screw or motor together changes backfocus, and this step measures which way the adapter plate actually travels. A '+' step is not assumed to be inward — determining that direction is the point of the step." />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </TextBlock.Style>
+                    </TextBlock>
 
                     <TextBlock
                         Margin="0,0,0,10"
@@ -1067,6 +1922,10 @@
                         </Button>
                     </StackPanel>
 
+                    <!--  Idle countdown in the running view too: measurements do not hold the device lease, so a
+                          user who steps away between calibration steps can hit the countdown with this view up.  -->
+                    <ContentControl Content="{Binding IdleCountdown}" />
+
                     <!--  Connection status carried into the running view (B.10): a mid-run disconnect otherwise
                           only surfaces when the next move fails. Shown while connected (with the positions).  -->
                     <TextBlock
@@ -1094,14 +1953,12 @@
                         Content="{Binding}"
                         ContentTemplate="{StaticResource HF_TiltDevicePositionsGrid}" />
 
-                    <!--  Device connection warning: shown when Run Measurement is visible but devices are not connected  -->
-                    <TextBlock
-                        Margin="0,0,0,4"
-                        Foreground="{StaticResource NotificationErrorBrush}"
-                        Text="{Binding ConnectionWarningText}"
-                        TextWrapping="Wrap">
-                        <TextBlock.Style>
-                            <Style BasedOn="{StaticResource StandardTextBlock}" TargetType="TextBlock">
+                    <!--  Device connection warning: shown when Run Measurement is visible but devices are not
+                          connected. The BORDER owns the visibility trigger, not the TextBlock — otherwise the
+                          filled badge would render as an empty red pill whenever the text is blank.  -->
+                    <Border Margin="0,0,0,4">
+                        <Border.Style>
+                            <Style TargetType="Border" BasedOn="{StaticResource HF_AlertErrorBadge}">
                                 <Setter Property="Visibility" Value="Collapsed" />
                                 <Style.Triggers>
                                     <MultiDataTrigger>
@@ -1114,8 +1971,12 @@
                                     </MultiDataTrigger>
                                 </Style.Triggers>
                             </Style>
-                        </TextBlock.Style>
-                    </TextBlock>
+                        </Border.Style>
+                        <TextBlock
+                            Foreground="{StaticResource HF_AlertErrorTextBrush}"
+                            Text="{Binding ConnectionWarningText}"
+                            TextWrapping="Wrap" />
+                    </Border>
 
                     <!--  Measurement progress area: visible while measuring  -->
                     <StackPanel>
@@ -1221,7 +2082,7 @@
                         <StackPanel>
                             <TextBlock
                                 Margin="0,0,0,6"
-                                Foreground="{StaticResource NotificationErrorBrush}"
+                                Foreground="{StaticResource HF_AlertErrorAccentBrush}"
                                 Text="{Binding MeasurementFailureText}"
                                 TextWrapping="Wrap" />
                             <Button
@@ -1265,12 +2126,9 @@
                           started as a device-driven run) — survives the advance to Complete (below), so it is
                           rendered there too.  -->
                     <Border
-                        Margin="0,6,0,0"
-                        Padding="5"
-                        BorderBrush="{StaticResource NotificationErrorBrush}"
-                        BorderThickness="1">
+                        Margin="0,6,0,0">
                         <Border.Style>
-                            <Style TargetType="Border">
+                            <Style TargetType="Border" BasedOn="{StaticResource HF_AlertErrorBadge}">
                                 <Setter Property="Visibility" Value="Collapsed" />
                                 <Style.Triggers>
                                     <DataTrigger Binding="{Binding HasDeviceLinkDroppedWarning}" Value="True">
@@ -1280,19 +2138,16 @@
                             </Style>
                         </Border.Style>
                         <TextBlock
-                            Foreground="{StaticResource NotificationErrorBrush}"
+                            Foreground="{StaticResource HF_AlertErrorTextBrush}"
                             Text="{Binding DeviceLinkDroppedWarningText}"
                             TextWrapping="Wrap" />
                     </Border>
 
                     <!--  Consistency warning (shown when tilt measurements across runs diverge)  -->
                     <Border
-                        Margin="0,6,0,0"
-                        Padding="5"
-                        BorderBrush="{StaticResource NotificationErrorBrush}"
-                        BorderThickness="1">
+                        Margin="0,6,0,0">
                         <Border.Style>
-                            <Style TargetType="Border">
+                            <Style TargetType="Border" BasedOn="{StaticResource HF_AlertErrorBadge}">
                                 <Setter Property="Visibility" Value="Collapsed" />
                                 <Style.Triggers>
                                     <DataTrigger Binding="{Binding HasMeasurementConsistencyWarning}" Value="True">
@@ -1302,7 +2157,7 @@
                             </Style>
                         </Border.Style>
                         <TextBlock
-                            Foreground="{StaticResource NotificationErrorBrush}"
+                            Foreground="{StaticResource HF_AlertErrorTextBrush}"
                             Text="{Binding MeasurementConsistencyWarningText}"
                             TextWrapping="Wrap" />
                     </Border>
@@ -1441,12 +2296,9 @@
                     <!--  Device-link dropped mid-run: it survives the advance to Complete (the step panel that
                           raised it is already hidden), so it must render here too  -->
                     <Border
-                        Margin="0,5"
-                        Padding="5"
-                        BorderBrush="{StaticResource NotificationErrorBrush}"
-                        BorderThickness="1">
+                        Margin="0,5">
                         <Border.Style>
-                            <Style TargetType="Border">
+                            <Style TargetType="Border" BasedOn="{StaticResource HF_AlertErrorBadge}">
                                 <Setter Property="Visibility" Value="Collapsed" />
                                 <Style.Triggers>
                                     <DataTrigger Binding="{Binding HasDeviceLinkDroppedWarning}" Value="True">
@@ -1456,7 +2308,7 @@
                             </Style>
                         </Border.Style>
                         <TextBlock
-                            Foreground="{StaticResource NotificationErrorBrush}"
+                            Foreground="{StaticResource HF_AlertErrorTextBrush}"
                             Text="{Binding DeviceLinkDroppedWarningText}"
                             TextWrapping="Wrap" />
                     </Border>
@@ -1464,12 +2316,9 @@
                     <!--  Consistency warning raised by the final step's repeats: it survives the advance to
                           Complete (the step panel that raised it is already hidden), so it must render here too  -->
                     <Border
-                        Margin="0,5"
-                        Padding="5"
-                        BorderBrush="{StaticResource NotificationErrorBrush}"
-                        BorderThickness="1">
+                        Margin="0,5">
                         <Border.Style>
-                            <Style TargetType="Border">
+                            <Style TargetType="Border" BasedOn="{StaticResource HF_AlertErrorBadge}">
                                 <Setter Property="Visibility" Value="Collapsed" />
                                 <Style.Triggers>
                                     <DataTrigger Binding="{Binding HasMeasurementConsistencyWarning}" Value="True">
@@ -1479,19 +2328,16 @@
                             </Style>
                         </Border.Style>
                         <TextBlock
-                            Foreground="{StaticResource NotificationErrorBrush}"
+                            Foreground="{StaticResource HF_AlertErrorTextBrush}"
                             Text="{Binding MeasurementConsistencyWarningText}"
                             TextWrapping="Wrap" />
                     </Border>
 
                     <!--  Re-baseline drift warning (an undo between moves left residual tilt)  -->
                     <Border
-                        Margin="0,5"
-                        Padding="5"
-                        BorderBrush="{StaticResource NotificationErrorBrush}"
-                        BorderThickness="1">
+                        Margin="0,5">
                         <Border.Style>
-                            <Style TargetType="Border">
+                            <Style TargetType="Border" BasedOn="{StaticResource HF_AlertErrorBadge}">
                                 <Setter Property="Visibility" Value="Collapsed" />
                                 <Style.Triggers>
                                     <DataTrigger Binding="{Binding HasRebaselineDriftWarning}" Value="True">
@@ -1501,7 +2347,7 @@
                             </Style>
                         </Border.Style>
                         <TextBlock
-                            Foreground="{StaticResource NotificationErrorBrush}"
+                            Foreground="{StaticResource HF_AlertErrorTextBrush}"
                             Text="{Binding RebaselineDriftWarningText}"
                             TextWrapping="Wrap" />
                     </Border>
@@ -1523,7 +2369,7 @@
                             </Style>
                         </Border.Style>
                         <TextBlock
-                            Foreground="{StaticResource NotificationErrorBrush}"
+                            Foreground="{StaticResource HF_AlertErrorAccentBrush}"
                             Text="{Binding ConfidenceWarningText}"
                             TextWrapping="Wrap" />
                     </Border>
@@ -1587,6 +2433,37 @@
                             <TextBlock Text="Saved" />
                             <TextBlock Text="{Binding SavedHardwareDisplay}" />
                         </UniformGrid>
+
+                        <!--  Self-labeling ("Piston-implied: ...") row, not a label/value pair, so it is a
+                              direct child of this StackPanel rather than another UniformGrid cell.  -->
+                        <TextBlock Margin="0,4,0,0" Text="{Binding PistonPitchDisplay}">
+                            <TextBlock.Style>
+                                <Style BasedOn="{StaticResource StandardTextBlock}" TargetType="TextBlock">
+                                    <Setter Property="Visibility" Value="Collapsed" />
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding HasPistonPitch}" Value="True">
+                                            <Setter Property="Visibility" Value="Visible" />
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </TextBlock.Style>
+                        </TextBlock>
+
+                        <!--  Self-labeling ("Corner-AF cross-check: ...") row, mirrors the piston row above
+                              (Task 5): the corner-region AF plane's independent estimate of the same
+                              hardware, not a label/value pair.  -->
+                        <TextBlock Margin="0,4,0,0" Text="{Binding CornerCrossCheckDisplay}">
+                            <TextBlock.Style>
+                                <Style BasedOn="{StaticResource StandardTextBlock}" TargetType="TextBlock">
+                                    <Setter Property="Visibility" Value="Collapsed" />
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding HasCornerCrossCheck}" Value="True">
+                                            <Setter Property="Visibility" Value="Visible" />
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </TextBlock.Style>
+                        </TextBlock>
 
                         <Button
                             Margin="0,8,0,2"

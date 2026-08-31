@@ -26,12 +26,21 @@ namespace TestApp {
 
     /// <summary>
     /// Writes a linear, mono, 16-bit FITS sidecar (<c>&lt;frame&gt;.linear.fits</c>) for every AF sweep frame in
-    /// every discovered run, using NINA's own loader (<see cref="DiagnosticUtil.LoadFloatMat"/>) — which reads BOTH
-    /// FITS and XISF and debayers Bayered frames to luminance. This lets the detector-independent golden reference
-    /// (<c>tools/golden/snr_ref.py</c>, which only parses mono FITS) cover the bank's XISF and Bayered runs, not
-    /// just the mono-FITS ones. The exported pixels are the SAME linear luminance the HocusFocus detector consumes,
-    /// scaled [0,1]→[0,65535], so the reference operates on the data the detector sees. Idempotent: skips frames
-    /// whose sidecar already exists unless <c>--overwrite</c>. Read-only on the source frames.
+    /// every discovered run, using NINA's own loader (<see cref="DiagnosticUtil.LoadDebayeredFloatMat"/>) — which
+    /// reads BOTH FITS and XISF and debayers Bayered frames to luminance. This lets the detector-independent golden
+    /// reference (<c>tools/golden/snr_ref.py</c>, which only parses mono FITS) cover the bank's XISF and Bayered
+    /// runs, not just the mono-FITS ones. "Linear" means no MTF/auto-stretch — it does NOT mean no debayer: a
+    /// reference computed on a Bayer mosaic while HocusFocus detects on luminance scores every mosaic-only find as
+    /// an HF recall gap HF could never close.
+    ///
+    /// <para><b>Deliberately NOT CFA hotpixel filtered</b>, unlike the detector's own OSC path. The reference's
+    /// value is having blind spots that differ from the detector's, and hot-pixel rejection is already assigned to
+    /// the LLM montage QA step (<c>.claude/docs/golden-star-set.md</c>). So the export shares the detector's
+    /// DEBAYER but not its filtering, which is exactly what <c>LoadDebayeredFloatMat</c> is.</para>
+    ///
+    /// <para>Idempotent: skips frames whose sidecar already exists unless <c>--overwrite</c>. Read-only on the
+    /// source frames. Regenerate the sidecars for the four bayered bank runs — they were exported from the
+    /// mosaic before this was fixed.</para>
     /// </summary>
     public static class ExportLinearRunner {
 
@@ -66,7 +75,7 @@ namespace TestApp {
                         continue;
                     }
                     try {
-                        using var mat = await DiagnosticUtil.LoadFloatMat(frame.Path, profileService);
+                        using var mat = await DiagnosticUtil.LoadDebayeredFloatMat(frame.Path, profileService);
                         WriteMonoFits16(outPath, mat);
                         written++;
                         Console.WriteLine($"      Focuser {frame.FocuserPosition}: {mat.Width}x{mat.Height} -> {Path.GetFileName(outPath)}");
@@ -81,51 +90,22 @@ namespace TestApp {
 
         /// <summary>Writes a minimal standard FITS (BITPIX=16, BZERO=32768 unsigned convention, big-endian data)
         /// from a CV_32F [0,1] Mat scaled to [0,65535] — exactly the layout tools/golden/snr_ref.py parses
-        /// (reads '>i2', applies BSCALE*value+BZERO). Header + data are zero-padded to 2880-byte FITS blocks.</summary>
+        /// (reads '>i2', applies BSCALE*value+BZERO). Thin adapter over <see cref="MonoFits16Writer"/> (converts
+        /// the Mat to a ushort[] and delegates the actual byte layout) so there is exactly one implementation of
+        /// it. Passes NO extra cards: snr_ref.py only tolerates the minimal card set this produces.</summary>
         private static void WriteMonoFits16(string path, Mat mat32f) {
             int w = mat32f.Width, h = mat32f.Height;
-            // [0,1] float -> [0,65535] ushort -> store as int16 with BZERO=32768 (val - 32768), big-endian.
-            var bytes = new byte[w * h * 2];
+            // [0,1] float -> [0,65535] ushort; MonoFits16Writer does the BZERO/big-endian encoding.
+            var pixels = new ushort[(long)w * h];
             unsafe {
                 var src = (float*)mat32f.DataPointer;
                 long n = (long)w * h;
                 for (long i = 0; i < n; ++i) {
                     var v = src[i];
-                    int u = (int)Math.Round(Math.Max(0f, Math.Min(1f, v)) * 65535f);
-                    short s = (short)(u - 32768);          // unsigned->signed via BZERO offset
-                    bytes[i * 2] = (byte)((s >> 8) & 0xFF); // big-endian (FITS)
-                    bytes[i * 2 + 1] = (byte)(s & 0xFF);
+                    pixels[i] = (ushort)Math.Round(Math.Max(0f, Math.Min(1f, v)) * 65535f);
                 }
             }
-            using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
-            WriteHeader(fs, w, h);
-            fs.Write(bytes, 0, bytes.Length);
-            PadToBlock(fs);
-        }
-
-        private static void WriteHeader(FileStream fs, int w, int h) {
-            var sb = new System.Text.StringBuilder();
-            void Card(string s) => sb.Append(s.PadRight(80).Substring(0, 80));
-            Card("SIMPLE  =                    T / HocusFocus linear export");
-            Card("BITPIX  =                   16");
-            Card("NAXIS   =                    2");
-            Card($"NAXIS1  = {w,20}");
-            Card($"NAXIS2  = {h,20}");
-            Card("BZERO   =                32768");
-            Card("BSCALE  =                    1");
-            Card("END");
-            var header = sb.ToString();
-            int pad = (2880 - (header.Length % 2880)) % 2880;
-            header += new string(' ', pad);
-            var hb = System.Text.Encoding.ASCII.GetBytes(header);
-            fs.Write(hb, 0, hb.Length);
-        }
-
-        private static void PadToBlock(FileStream fs) {
-            int rem = (int)(fs.Position % 2880);
-            if (rem != 0) {
-                fs.Write(new byte[2880 - rem], 0, 2880 - rem);
-            }
+            MonoFits16Writer.Write(path, pixels, w, h, Array.Empty<FitsCard>());
         }
     }
 }

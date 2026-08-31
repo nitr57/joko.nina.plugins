@@ -15,23 +15,86 @@
     </ResourceDictionary.MergedDictionaries>
 
     <!--  Tooltips  -->
-    <TextBlock x:Key="SDOpt_SourceMode_Tooltip" Text="Replay optimizes against a saved auto-focus run (recommended). Live triggers a fresh auto-focus that saves its frames, then optimizes against those." />
+    <TextBlock x:Key="SDOpt_SourceMode_Tooltip" Text="Live (the default) triggers a fresh auto-focus that saves its frames, then optimizes against those. Replay optimizes against an auto-focus run you have already saved." />
     <TextBlock x:Key="SDOpt_OptimizeMode_Tooltip" Text="Optimize runs the parameter search and recommends improved settings. Use current settings skips the search entirely and jumps straight to a summary built from your current settings, so you can review (and label) today's detection without an optimization pass. Either way, after reviewing you can still run Optimize with feedback to recover the stars you labeled." />
     <TextBlock x:Key="SDOpt_StartFromCurrent_Tooltip" Text="When checked, the optimizer SEEDS from your current settings instead of the fully-default settings, so it refines your existing setup rather than re-deriving from scratch. Useful when you've already hand-tuned detection and want incremental improvement. The search still only accepts changes that improve on your current settings, and improvement is reported against them. Leave unchecked to explore from the defaults (recommended for a first run). Only applies in Optimize mode." />
     <TextBlock x:Key="SDOpt_FeedbackBreakdown_Tooltip" Text="How your labels map to the detector's gates: each row is the gate that rejected the stars you marked, and the setting change that would recover them — bounded so it doesn't admit too many unlabeled candidates (precision). Optimize with feedback starts the optimizer from these recommendations." />
-    <TextBlock x:Key="SDOpt_ApplyStepSize_Tooltip" Text="When checked, clicking Accept also writes the recommended auto-focus step size and offset steps to the active profile, and for a live sweep the exposure it captured with. The step size is sized so a sweep lands several measurement points across the focus-sensitive region of the curve. Disabled when these already match your current settings (nothing to apply)." />
+    <TextBlock x:Key="SDOpt_ApplyStepSize_Tooltip" Text="When checked, clicking Accept also writes the recommended auto-focus step size and offset steps to the active profile, and for a live sweep the exposure it captured with. The step size is sized so a sweep lands several measurement points across the focus-sensitive region of the curve. When per-filter star detection is enabled, the step size, offset steps and live sweep exposure all go to the TARGET FILTER instead of the profile, so optimizing one filter no longer overwrites the settings every other filter uses. Disabled when these already match your current settings (nothing to apply)." />
     <TextBlock x:Key="SDOpt_Review_Tooltip" Text="Optional: review the optimized detector boxes over every loaded frame and label any missed, falsely-accepted, or wrongly-rejected stars. The labels are saved next to the run and can drive a future re-optimization. Reviewing is not required — you can Accept directly." />
     <TextBlock x:Key="SDOpt_ReOptimize_Tooltip" Text="Re-run the optimization using the labels you just made in Review. Your missed / wrongly-rejected stars steer the optimizer to recover them (recall), and your should-reject stars steer it to exclude them (precision). The run is re-read from disk and the search re-runs, landing on an updated summary you can review again or accept." />
     <TextBlock x:Key="SDOpt_Variant_Tooltip" Text="Switch the chart and the summary below between your current settings, the optimized settings, and (after Optimize with feedback) the feedback-optimized settings. Accept applies whichever variant is shown (Current can't be accepted — it's your baseline)." />
     <TextBlock x:Key="SDOpt_DonutDetection_Tooltip" Text="When checked, the optimizer is allowed to recover out-of-focus DONUT stars — heavily defocused stars that appear as hollow rings — which the detector otherwise drops (they fragment or fail the fill-ratio test). It also unlocks diffraction-spike and saturated-bloom suppression so a bright star's rays aren't mistaken for stars. Recommended for telescopes with a central obstruction (Newtonians/SCTs) whose defocused stars become donuts; leave OFF for refractors (defocused stars are filled disks, not rings). Saved to your profile and default OFF. When OFF, star detection is exactly as before." />
     <TextBlock x:Key="SDOpt_Inspection_Tooltip" Text="When checked, the optimizer favors detecting MANY MORE stars spread across the frame, which the aberration inspector needs to measure sensor tilt and field curvature. It does this by trading away a little auto-focus-curve sharpness for star count — but the fit is bounded: settings that make the focus curve noticeably worse than your current settings are penalized, so focus stays usable. Leave OFF to optimize purely for the tightest auto-focus curve (the default). Only applies in Optimize mode; nothing is saved until you Accept." />
+    <TextBlock x:Key="SDOpt_ImportRunSettings_Tooltip" Text="Load the star detection settings a previous optimization saved next to this run's frames, and apply them to your current settings. You are shown exactly what would change before anything is applied. This is never done automatically: your current settings are what the wizard measures its improvement against, so silently replacing them would change what the reported improvement means." />
     <TextBlock x:Key="SDOpt_Continue_Tooltip" Text="Run another optimization pass starting from the settings just found, giving the search a fresh chance to refine further (it resets its step sizes, so it can make larger moves again). Useful when the last pass looks like it stopped just short. Limited to 3 total passes; the Changed parameters table shows the value of each setting after every pass." />
     <TextBlock x:Key="SDOpt_LiveExposure_Tooltip" Text="The exposure for every frame of the sweep, starting from your profile's auto-focus exposure. Make it long enough that stars stay visible out at the defocused ends of the sweep. Narrowband filters usually need a longer exposure to start. After a good result you can adopt this exposure into your profile from the summary." />
     <TextBlock x:Key="SDOpt_LiveSaveFolder_Tooltip" Text="The captured frames are saved here, in a timestamped AutoFocus_… subfolder, then loaded back like a saved run so the optimizer can search them. A folder is required before Start. Choosing one also saves it as your Hocus Focus auto-focus save path." />
     <TextBlock x:Key="SDOpt_TargetFilter_Tooltip" Text="Per-filter star detection is enabled, so this run tunes ONE filter's settings set. The baseline and 'current settings' come from this filter's set; a live sweep moves the wheel to this filter and exposes through it; and Accept writes the optimized result into this filter's set." />
     <TextBlock x:Key="SDOpt_CaptureBinning_Tooltip" Text="NINA's Auto Focus Binning: how the camera bins when it captures the sweep frames. Set in NINA's Options, and per filter in the filter wheel settings. It should match the binning you image at. Detection binning below is applied on top of this, in software, for star detection only." />
     <TextBlock x:Key="SDOpt_DetectionBinningRec_Tooltip" Text="Recommended from this run's fitted in-focus HFR, using the detector's 2 to 4 pixel calibration target. Optimize again re-runs the search on the same frames at the recommended factor; nothing is saved until you Accept, which applies the factor and the re-tuned settings together." />
+    <TextBlock x:Key="SDOpt_StarSignal_Tooltip" Text="Brightness Sensitivity is the acceptance gate a candidate must clear to count as a star: its brightness above the local background, divided by the local noise. It ranges from 0 to 50 and the shipped default is 10, so a value near the bottom means almost anything above the noise was admitted — whether the optimizer landed there or you set it by hand. The recommended exposure is what would put this run's stars back at the default gate, assuming sky noise dominates, so quadrupling the exposure doubles S/N. It scales from the exposure the run's own frames were captured with, or from your profile's auto-focus exposure when the frames record none. One run never recommends more than 30 s per frame, and derives at most 4x the current exposure before that number is rounded up to a practical exposure-time step — which can land the shown value a little past 4x, but never past 30 s." />
+    <TextBlock x:Key="SDOpt_CaptureNewSweep_Tooltip" Text="Captures a whole new auto-focus sweep at this exposure and re-runs the optimization on the fresh frames — the only way to fix a run whose stars were too faint, since no setting recovers signal the frames never had. It takes new exposures and moves the focuser, so it costs a full sweep of sky time. The box starts at the recommended exposure and is yours to change. Any detection binning change you have already re-optimized at still applies. Nothing is saved until you Accept the new result." />
     <TextBlock x:Key="SDOpt_FocusRecovery_Tooltip" Text="Widens the live sweep by this many extra steps on EACH side, so the auto-focus curve can still bracket focus when you start well off focus. The extra far-from-focus frames are down-weighted in the fit and exempt from the star-count requirements, so they help find focus without skewing it. Set 0 to disable recovery." />
+
+    <!--  Themed button whose label is a plain string Content. Visually identical to NINA's StandardButton (same
+          theme brushes, same border/corner radii, same hover / pressed / disabled behaviour) — the ONLY change is
+          that the label is guaranteed to paint in ButtonForegroundBrush.
+
+          Why a whole Style is needed for that: a string Content is rendered by a TextBlock the ContentPresenter
+          generates, and NINA.WPF.Base ships a KEYLESS TextBlock style (Resources/Styles/TextBlock.xaml, BasedOn
+          StandardTextBlock => Foreground = PrimaryBrush) in Application.Resources. A style setter outranks an
+          inherited value, so that generated label ignores the button's own Foreground and paints PrimaryBrush —
+          and NINA's StandardButton deliberately sets Foreground = ButtonBackgroundBrush (its own buttons carry
+          Path icons that supply ButtonForegroundBrush themselves), so nothing else corrects it either. On the
+          "Dark" and "Alternative Custom" schemas PrimaryBrush and ButtonBackgroundBrush are the SAME colour
+          (#FF550C18), so the label rendered at 1.00:1 — literally invisible.
+
+          The empty style in ContentPresenter.Resources is found first (nearest dictionary wins the implicit-style
+          lookup) and carries no Foreground, so the inherited value — TextElement.Foreground below, i.e. the
+          button's own Foreground — reaches the glyph again. Setting Foreground on the Button alone does NOT
+          work, and neither does an implicit TextBlock style in this dictionary: a control-scope implicit style
+          does not reach template-generated content at all. Same fix, same reason, as HF_ReviewToolbarButton in
+          StarDetection/Optimization/Review/StarReviewControl.xaml.
+
+          The triggers keep Foreground on ButtonForegroundBrush in every state: NINA's own triggers re-point
+          Foreground at the (selected) background brush on hover/press, which would re-hide the label here.  -->
+    <Style x:Key="HF_TextButton" TargetType="Button">
+        <Setter Property="Background" Value="{StaticResource ButtonBackgroundBrush}" />
+        <Setter Property="Foreground" Value="{StaticResource ButtonForegroundBrush}" />
+        <Setter Property="BorderThickness" Value="0" />
+        <Setter Property="FontSize" Value="15" />
+        <Setter Property="SnapsToDevicePixels" Value="True" />
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="Button">
+                    <Border BorderBrush="{StaticResource BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="0">
+                        <Border x:Name="Fill" Background="{TemplateBinding Background}" CornerRadius="1">
+                            <ContentPresenter
+                                Margin="0"
+                                HorizontalAlignment="Center"
+                                VerticalAlignment="{TemplateBinding VerticalContentAlignment}"
+                                TextElement.Foreground="{TemplateBinding Foreground}">
+                                <ContentPresenter.Resources>
+                                    <Style TargetType="TextBlock" />
+                                </ContentPresenter.Resources>
+                            </ContentPresenter>
+                        </Border>
+                    </Border>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="Fill" Property="Background" Value="{StaticResource ButtonBackgroundSelectedBrush}" />
+                        </Trigger>
+                        <Trigger Property="IsPressed" Value="True">
+                            <Setter TargetName="Fill" Property="Background" Value="{StaticResource ButtonBackgroundBrush}" />
+                        </Trigger>
+                        <Trigger Property="IsEnabled" Value="False">
+                            <Setter Property="Opacity" Value="0.4" />
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
 
     <!--  Auto-focus curve chart for ONE settings variant. The Summary panel hosts this via a ContentControl bound to
           SelectedCurve, so toggling the variant rebuilds the plot from a fresh OptimizationCurve instance (a robust
@@ -249,7 +312,11 @@
               lives on the scrollable body below, NOT here: keeping a MinHeight floor on the root grid prevented it
               from shrinking to a smaller window, so the bottom row (footer buttons) overflowed and clipped. With the
               floor gone the grid shrinks to the window, the body scrolls, and the footer stays pinned.  -->
-        <Grid Margin="10" local:ClampWindowToWorkArea.Enabled="True">
+        <Grid
+            Margin="10"
+            local:ClampWindowToWorkArea.Enabled="True"
+            local:ClampWindowToWorkArea.FitContent="True"
+            local:ClampWindowToWorkArea.Suspended="{Binding ShowProgress}">
             <Grid.Style>
                 <Style TargetType="Grid">
                     <Setter Property="Width" Value="640" />
@@ -431,7 +498,8 @@
                                         Width="80"
                                         Command="{Binding DataContext.BrowseSourceCommand, RelativeSource={RelativeSource AncestorType=ItemsControl}}"
                                         CommandParameter="{Binding RelativeSource={RelativeSource AncestorType=ContentPresenter}, Path=(ItemsControl.AlternationIndex)}"
-                                        Content="Browse…" />
+                                        Content="Browse…"
+                                        Style="{StaticResource HF_TextButton}" />
                                     <TextBlock
                                         Width="440"
                                         Margin="8,0,0,0"
@@ -606,6 +674,7 @@
                                 Width="80"
                                 Command="{Binding BrowseSaveFolderCommand}"
                                 Content="Browse…"
+                                Style="{StaticResource HF_TextButton}"
                                 ToolTip="{StaticResource SDOpt_LiveSaveFolder_Tooltip}" />
                             <TextBlock
                                 Width="360"
@@ -635,6 +704,15 @@
                         HorizontalAlignment="Center"
                         Text="{Binding CaptureContextText}"
                         Visibility="{Binding IsCapturing, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
+                    <!--  F79 — frames done INSIDE the current evaluation. Shown only while the search is in a
+                          context-rebuilding step, which is the only step long enough for the evaluation counter to
+                          look stuck. This is what distinguishes "working" from "hung".  -->
+                    <TextBlock
+                        Margin="0,0,0,6"
+                        HorizontalAlignment="Center"
+                        Opacity="0.75"
+                        Text="{Binding EvaluationFrameProgressText, Mode=OneWay}"
+                        Visibility="{Binding HasEvaluationFrameProgress, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
                     <ProgressBar
                         Height="18"
                         IsIndeterminate="{Binding IsProgressIndeterminate}"
@@ -663,6 +741,40 @@
                         Margin="0,2,0,0"
                         HorizontalAlignment="Center"
                         Text="{Binding ProgressImprovementText}"
+                        Visibility="{Binding IsOptimizing, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
+                    <!--  F52 — the search's COST, which the count and the clock above cannot convey: what a step is
+                          costing, an upper bound on what is left, and (only when true) why it is expensive right now.
+                          The ADVICE half is the separate row further down (SearchExposureAdvice): facts about cost
+                          need no statistic and are these rows; advice needs one, and now has it (F52 (c)).  -->
+                    <TextBlock
+                        Margin="0,2,0,0"
+                        HorizontalAlignment="Center"
+                        Opacity="0.75"
+                        Text="{Binding ProgressTimingText, Mode=OneWay}"
+                        Visibility="{Binding IsOptimizing, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
+                    <!--  F52(c) — the one piece of ADVICE, and the only row here that tells the user to consider
+                          stopping. Computed from the SEED evaluation, which runs before the search does, so the
+                          answer to "should I abort?" was available in the first minute rather than after two hours.
+                          Hidden whenever the sweep's wings are healthy: a note that always fires says nothing.
+                          It names Cancel (which exists) and says what Cancel costs in the same sentence, because
+                          not knowing that is why the user sat through the two hours.  -->
+                    <TextBlock
+                        MaxWidth="520"
+                        Margin="0,6,0,0"
+                        HorizontalAlignment="Center"
+                        Text="{Binding SearchExposureAdvice, Mode=OneWay}"
+                        TextAlignment="Center"
+                        TextWrapping="Wrap"
+                        Visibility="{Binding HasSearchExposureAdvice, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
+                    <TextBlock
+                        MaxWidth="520"
+                        Margin="0,6,0,0"
+                        HorizontalAlignment="Center"
+                        FontStyle="Italic"
+                        Opacity="0.6"
+                        Text="{Binding ProgressAbortNote, Mode=OneWay}"
+                        TextAlignment="Center"
+                        TextWrapping="Wrap"
                         Visibility="{Binding IsOptimizing, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
                 </StackPanel>
 
@@ -719,6 +831,33 @@
                             TextWrapping="Wrap"
                             Text="{Binding OptimizerNoImprovementNote, Mode=OneWay}"
                             Visibility="{Binding ShowNoImprovementNote, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
+
+                        <!--  Low-signal warning: the run's Sensitivity gate landed at its search floor, so the curve
+                              below is drawn from detections that barely cleared the noise. It sits ABOVE the chart
+                              because Accept lives in the footer outside this ScrollViewer and is always reachable —
+                              a plausible-looking curve can otherwise be accepted without ever scrolling to the Star
+                              signal block. The page's ONLY colored element, and deliberately the WARNING brush, not
+                              the error one: the result is usable, just low-confidence. No icon.  -->
+                        <TextBlock
+                            Margin="0,0,0,8"
+                            FontStyle="Italic"
+                            Foreground="{StaticResource HF_AlertWarningAccentBrush}"
+                            Text="{Binding LowSignalChartNote, Mode=OneWay}"
+                            TextWrapping="Wrap"
+                            Visibility="{Binding HasExposureBlock, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
+
+                        <!--  F20 — the minimum-HFR gate emptying the curve's CORE. A sibling of the note above and
+                              placed for the same reason (Accept is outside the ScrollViewer), but a DIFFERENT gate
+                              with a different remedy, so it is deliberately not folded into the Star signal block,
+                              whose contract covers Sensitivity only. Both can be visible at once: an undersampled
+                              rig can also be running a floored Sensitivity, and each names its own knob.  -->
+                        <TextBlock
+                            Margin="0,0,0,8"
+                            FontStyle="Italic"
+                            Foreground="{StaticResource HF_AlertWarningAccentBrush}"
+                            Text="{Binding UndersampledStarsChartNote, Mode=OneWay}"
+                            TextWrapping="Wrap"
+                            Visibility="{Binding HasUndersampledStarsNote, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
 
                         <!--  Auto-focus curve for the selected variant (rebuilt on toggle via the ContentControl).  -->
                         <Border
@@ -791,12 +930,54 @@
                             </ItemsControl>
                         </StackPanel>
 
+                        <!--  Star signal: the head of the recommendation region, placed ABOVE the auto-focus and
+                              detection-binning blocks because it impugns the numbers both of them are derived from —
+                              a run whose gate sat at the floor measured its curve from low-confidence detections.
+                              It also sits next to the auto-focus block's exposure row, which is the setting it is
+                              talking about. Structure copies the detection-binning block below: bold header, a
+                              Width=200 label/value row, the wrapped consequence, then the action row.  -->
+                        <StackPanel
+                            Margin="0,8,0,8"
+                            Visibility="{Binding HasExposureBlock, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}">
+                            <TextBlock Margin="0,0,0,2" FontWeight="Bold" Text="Star signal" />
+                            <!--  Hidden when the run could not support a derived number (too few usable frames, no
+                                  per-star SNRs, or no known exposure to scale from) — the body below still carries
+                                  the diagnosis, which is the part that always applies.
+                                  The LABEL carries the general background (what the gate is, the target, the caps);
+                                  the VALUE carries this run's own derivation, bound per-run — the same split the
+                                  sweep page's detection-binning row already uses. The body paragraph deliberately
+                                  holds neither: it is capped at the diagnosis plus one instruction.  -->
+                            <StackPanel Margin="0,2" Orientation="Horizontal"
+                                        Visibility="{Binding HasRecommendedExposure, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}">
+                                <TextBlock
+                                    Width="200"
+                                    Text="Recommended exposure"
+                                    ToolTip="{StaticResource SDOpt_StarSignal_Tooltip}" />
+                                <TextBlock
+                                    Text="{Binding RecommendedExposureText, Mode=OneWay}"
+                                    ToolTip="{Binding ExposureDerivationDetail, Mode=OneWay}" />
+                            </StackPanel>
+                            <TextBlock
+                                MaxWidth="560"
+                                Margin="0,4,0,4"
+                                HorizontalAlignment="Left"
+                                Text="{Binding ExposureBodyText, Mode=OneWay}"
+                                TextWrapping="Wrap"
+                                Visibility="{Binding HasExposureBody, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
+                        </StackPanel>
+
                         <!--  Auto-focus block: the recommended step size / offset steps PLUS the toggle that applies
                               them on Accept, grouped so the toggle's purpose is obvious.  -->
                         <TextBlock Margin="0,8,0,2" FontWeight="Bold" Text="Auto-focus settings" />
+                        <!--  StepSizeText carries the "NOT measured: ... [reason]" wording when the recommender
+                              could not use the fit, so a HELD step reads as a non-measurement instead of as a
+                              recommendation that happened to agree. It wraps because that sentence is long.  -->
                         <StackPanel Orientation="Horizontal" Margin="0,2">
                             <TextBlock Width="200" Text="Recommended step size" />
-                            <TextBlock Text="{Binding Summary.StepSizeText, Mode=OneWay}" />
+                            <TextBlock
+                                MaxWidth="560"
+                                Text="{Binding Summary.StepSizeText, Mode=OneWay}"
+                                TextWrapping="Wrap" />
                         </StackPanel>
                         <StackPanel Orientation="Horizontal" Margin="0,2">
                             <TextBlock Width="200" Text="Recommended offset steps" />
@@ -822,8 +1003,67 @@
                                 Margin="6,0,0,0"
                                 VerticalAlignment="Center"
                                 IsEnabled="{Binding CanApplyRecommendedStepSize}"
-                                Text="Apply these auto-focus settings to my profile when I click Accept"
+                                Text="{Binding ApplyRecommendedSettingsLabel}"
                                 ToolTip="{StaticResource SDOpt_ApplyStepSize_Tooltip}" />
+                        </StackPanel>
+
+                        <!--  F51 — the re-run action: capture a fresh sweep AT THE RECOMMENDED SETTINGS and
+                              re-optimize on it. IT LIVES HERE, not in the Star signal block where it used to,
+                              for two reasons that cost a user two unwanted Accepts:
+                                * that block's visibility is HasLowStarSignal (Sensitivity <= 1.0), so on a
+                                  healthy-gate run with a step-size recommendation the button was hidden along
+                                  with a block that was about something else entirely; and
+                                * its own condition was IncreasesExposure, which is exactly what F19's saturation
+                                  makes false on a rich field — so the button disappeared precisely when the run
+                                  most needed re-running.
+                              Beside the step-size/offset rows is also where it BELONGS: those are the values the
+                              re-capture now carries (F51(b)), and the exposure row sits directly above it.
+                              ShowCaptureNewSweep still hides the WHOLE row whenever the MODE makes re-capturing
+                              inapplicable — Replay, which has no rig, and "use current settings", which has
+                              nothing to re-tune; both are fixed on Select Source for the life of the Summary, so
+                              a button disabled by either would sit dead all run. Only TRANSIENT unavailability
+                              (disconnected camera/focuser, no save folder) leaves it visible and DISABLED via the
+                              command's CanExecute, where the control can come back.
+                              RE-CAPTURING IS NOT ADOPTING: this writes nothing: Accept is still the only writer.
+                              The box is editable and LostFocus-bound, so THE BUTTON LABEL DELIBERATELY CARRIES NO
+                              NUMBER: a numbered label goes stale the instant the user starts typing and then
+                              contradicts the box beside it. Consequence in the label, value in the box — do not
+                              "fix" this by interpolating the seconds into the button.  -->
+                        <StackPanel
+                            Margin="0,0,0,8"
+                            Visibility="{Binding ShowCaptureNewSweep, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}">
+                            <TextBlock
+                                MaxWidth="560"
+                                Margin="0,0,0,4"
+                                HorizontalAlignment="Left"
+                                Text="{Binding CaptureNewSweepCarriesText, Mode=OneWay}"
+                                TextWrapping="Wrap" />
+                            <StackPanel Margin="0,2" Orientation="Horizontal">
+                                <TextBlock
+                                    Width="200"
+                                    VerticalAlignment="Center"
+                                    Text="New sweep exposure"
+                                    ToolTip="{StaticResource SDOpt_CaptureNewSweep_Tooltip}" />
+                                <ninactrl:UnitTextBox
+                                    MinWidth="80"
+                                    HorizontalAlignment="Left"
+                                    VerticalAlignment="Center"
+                                    ToolTip="{StaticResource SDOpt_CaptureNewSweep_Tooltip}"
+                                    Unit="s">
+                                    <Binding Path="RecaptureExposureSeconds" UpdateSourceTrigger="LostFocus">
+                                        <Binding.ValidationRules>
+                                            <rules:GreaterThanZeroRule />
+                                        </Binding.ValidationRules>
+                                    </Binding>
+                                </ninactrl:UnitTextBox>
+                                <Button
+                                    Margin="8,0,0,0"
+                                    VerticalAlignment="Center"
+                                    Command="{Binding CaptureNewSweepCommand}"
+                                    ToolTip="{StaticResource SDOpt_CaptureNewSweep_Tooltip}">
+                                    <TextBlock Margin="12,6" Foreground="{StaticResource ButtonForegroundBrush}" Text="Capture a new sweep and optimize" />
+                                </Button>
+                            </StackPanel>
                         </StackPanel>
 
                         <!--  Detection binning: a first-class recommendation, structurally parallel to the
@@ -856,9 +1096,26 @@
                                 HorizontalAlignment="Left"
                                 Command="{Binding OptimizeAgainAtRecommendedBinningCommand}"
                                 Visibility="{Binding ShowOptimizeAgainAtRecommendedBinning, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}">
-                                <TextBlock Margin="12,6" Text="{Binding OptimizeAgainAtRecommendedBinningText}" />
+                                <TextBlock Margin="12,6" Foreground="{StaticResource ButtonForegroundBrush}" Text="{Binding OptimizeAgainAtRecommendedBinningText}" />
                             </Button>
                         </StackPanel>
+
+                        <!--  F32 — when this landing took the SHEDDING CORNER, say that another pass is likely to
+                              beat it. The mechanism F32 chased since wave 3 is real (the shedding corner is a
+                              greedy trap, not a rational trade), but wave 9's confirmation arm refuted the
+                              proposed FIX — a keep floor — on three pre-registered rules, and measured the
+                              alternative as strictly better: restarts recovered 228% of the floor's median gain.
+                              "Continue optimizing" IS a restart, it was always on screen, and nothing told the
+                              user when it was worth pressing. Hidden unless the landing actually shed and a round
+                              remains, so it cannot become noise.  -->
+                        <TextBlock
+                            MaxWidth="560"
+                            Margin="0,8,0,4"
+                            HorizontalAlignment="Left"
+                            FontStyle="Italic"
+                            Text="{Binding ContinueOptimizingAdviceText, Mode=OneWay}"
+                            TextWrapping="Wrap"
+                            Visibility="{Binding HasContinueOptimizingAdvice, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
 
                         <!--  Changed parameters table  -->
                         <TextBlock
@@ -942,6 +1199,7 @@
                                         HorizontalAlignment="Left"
                                         Command="{Binding ReOptimizeCommand}"
                                         Content="Optimize with feedback"
+                                        Style="{StaticResource HF_TextButton}"
                                         ToolTip="{StaticResource SDOpt_ReOptimize_Tooltip}" />
                                 </StackPanel>
 
@@ -1013,14 +1271,43 @@
             </Grid>
             </ScrollViewer>
 
-            <!--  Error banner  -->
-            <TextBlock
-                Grid.Row="2"
-                Margin="0,8,0,0"
-                Foreground="{StaticResource NotificationErrorBrush}"
-                Text="{Binding ErrorMessage}"
-                TextWrapping="Wrap"
-                Visibility="{Binding HasError, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
+            <!--  Error banner, and the recovery-widened notice. Both live in row 2 inside a StackPanel rather than
+                  taking a row each: each collapses when it has nothing to say, and they are mutually exclusive in
+                  practice (an error returns to SelectSource, the notice only ever accompanies a run that
+                  proceeded), so stacking costs no layout and leaves the grid's row definitions alone.  -->
+            <StackPanel Grid.Row="2" Orientation="Vertical">
+                <!--  The BORDER carries the visibility, not the TextBlock: a filled badge whose text is blank
+                      would otherwise render as an empty red pill.  -->
+                <Border
+                    Margin="0,8,0,0"
+                    Style="{StaticResource HF_AlertErrorBadge}"
+                    Visibility="{Binding HasError, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}">
+                    <TextBlock
+                        Foreground="{StaticResource HF_AlertErrorTextBrush}"
+                        Text="{Binding ErrorMessage}"
+                        TextWrapping="Wrap" />
+                </Border>
+
+                <!--  Not an error: the run continued, but on FEWER positions than the user asked for, so the
+                      exclusion has to be visible rather than silently applied.  -->
+                <TextBlock
+                    Margin="0,8,0,0"
+                    Foreground="{StaticResource HF_AlertWarningAccentBrush}"
+                    Text="{Binding RecoveryWidenedNotice}"
+                    TextWrapping="Wrap"
+                    Visibility="{Binding HasRecoveryWidenedNotice, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
+
+                <!--  F43. Also not an error: the sweep could not be fitted at the default minimum-HFR gate, so the
+                      gate was lowered to obtain a curve and the search was seeded there. Shown because the wizard is
+                      then reporting results from a gate the user did not choose — and on a short focal length that
+                      gate is the single setting they most need to know about.  -->
+                <TextBlock
+                    Margin="0,8,0,0"
+                    Foreground="{StaticResource HF_AlertWarningAccentBrush}"
+                    Text="{Binding MinHfrRescueNotice}"
+                    TextWrapping="Wrap"
+                    Visibility="{Binding HasMinHfrRescueNotice, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
+            </StackPanel>
 
             <!--  Footer: navigation. Exactly one step's buttons show at a time; while busy only Cancel shows.  -->
             <StackPanel
@@ -1035,6 +1322,7 @@
                     Margin="0,0,8,0"
                     Command="{Binding CancelCommand}"
                     Content="Cancel"
+                    Style="{StaticResource HF_TextButton}"
                     Visibility="{Binding ShowProgress, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
 
                 <!--  SelectSource: Start (Close is the shared button below).  -->
@@ -1043,6 +1331,7 @@
                     Margin="0,0,8,0"
                     Command="{Binding StartCommand}"
                     Content="Start"
+                    Style="{StaticResource HF_TextButton}"
                     Visibility="{Binding ShowSelectSource, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
 
                 <!--  Summary (results) page: Back, Review, Accept. Accept is always shown but disabled (via CanAccept)
@@ -1052,12 +1341,14 @@
                     Margin="0,0,8,0"
                     Command="{Binding BackCommand}"
                     Content="Back"
+                    Style="{StaticResource HF_TextButton}"
                     Visibility="{Binding ShowSummary, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
                 <Button
                     Width="120"
                     Margin="0,0,8,0"
                     Command="{Binding ReviewCommand}"
                     Content="Review frames"
+                    Style="{StaticResource HF_TextButton}"
                     ToolTip="{StaticResource SDOpt_Review_Tooltip}"
                     Visibility="{Binding ShowSummary, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
                 <!--  Continue optimizing: another pass from the current best. Disabled (greyed) once 3 passes have
@@ -1067,13 +1358,25 @@
                     Margin="0,0,8,0"
                     Command="{Binding ContinueOptimizationCommand}"
                     Content="Continue optimizing"
+                    Style="{StaticResource HF_TextButton}"
                     ToolTip="{StaticResource SDOpt_Continue_Tooltip}"
                     Visibility="{Binding ShowSummary, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
+                <!--  Import this run's saved settings: shown only when a loaded run actually carries a settings
+                      handoff, so it never appears as a dead control on a run that has never been optimized.  -->
+                <Button
+                    Width="150"
+                    Margin="0,0,8,0"
+                    Command="{Binding ImportRunSettingsCommand}"
+                    Content="Use run's settings"
+                    Style="{StaticResource HF_TextButton}"
+                    ToolTip="{StaticResource SDOpt_ImportRunSettings_Tooltip}"
+                    Visibility="{Binding CanImportRunSettings, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
                 <Button
                     Width="90"
                     Margin="0,0,8,0"
                     Command="{Binding AcceptCommand}"
                     Content="Accept"
+                    Style="{StaticResource HF_TextButton}"
                     Visibility="{Binding ShowSummary, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
 
                 <!--  Review (labeling) page: Back to summary + Optimize with feedback (enabled once anything is
@@ -1083,12 +1386,14 @@
                     Margin="0,0,8,0"
                     Command="{Binding BackToSummaryCommand}"
                     Content="Back to summary"
+                    Style="{StaticResource HF_TextButton}"
                     Visibility="{Binding ShowReview, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
                 <Button
                     Width="180"
                     Margin="0,0,8,0"
                     Command="{Binding ReOptimizeCommand}"
                     Content="Optimize with feedback"
+                    Style="{StaticResource HF_TextButton}"
                     ToolTip="{StaticResource SDOpt_ReOptimize_Tooltip}"
                     Visibility="{Binding ShowReview, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}" />
 
@@ -1100,7 +1405,7 @@
                     <Button.Style>
                         <!--  BasedOn the theme's implicit Button style so Close matches the other footer buttons'
                               font/look (a style without BasedOn would drop the NINA default style).  -->
-                        <Style TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+                        <Style TargetType="Button" BasedOn="{StaticResource HF_TextButton}">
                             <Setter Property="Visibility" Value="Collapsed" />
                             <Style.Triggers>
                                 <DataTrigger Binding="{Binding ShowSelectSource}" Value="True">

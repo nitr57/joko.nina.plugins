@@ -1,6 +1,7 @@
-using System;
+﻿using System;
 using Newtonsoft.Json;
 using NINA.Joko.Plugins.HocusFocus.Interfaces;
+using NINA.Joko.Plugins.HocusFocus.StarDetection;
 using NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization;
 using NUnit.Framework;
 
@@ -34,9 +35,15 @@ public class OptimizedStarDetectionSettingsTests {
     }
 
     [Test]
-    public void DefaultSchemaVersion_IsTwo() {
-        // v2 added the defocus-aware axes (master + donut/spike knobs).
-        Assert.That(new OptimizedStarDetectionSettings().SchemaVersion, Is.EqualTo(2));
+    public void DefaultSchemaVersion_IsCurrent() {
+        // v2 added the defocus-aware axes (master + donut/spike knobs); v3 added the optional Provenance block
+        // (F30) and changed no knob semantics. Asserted against the constant as well as the literal, so the next
+        // bump does not silently pass while leaving the default behind.
+        Assert.Multiple(() => {
+            Assert.That(new OptimizedStarDetectionSettings().SchemaVersion,
+                Is.EqualTo(OptimizedStarDetectionSettings.CurrentSchemaVersion));
+            Assert.That(OptimizedStarDetectionSettings.CurrentSchemaVersion, Is.EqualTo(3));
+        });
     }
 
     [Test]
@@ -113,7 +120,7 @@ public class OptimizedStarDetectionSettingsTests {
             Assert.That(dto.FinalJ, Is.EqualTo(0.4));
             Assert.That(dto.RecommendedStepSize, Is.EqualTo(25));
             Assert.That(dto.RecommendedOffsetSteps, Is.EqualTo(6));
-            Assert.That(dto.SchemaVersion, Is.EqualTo(2));
+            Assert.That(dto.SchemaVersion, Is.EqualTo(OptimizedStarDetectionSettings.CurrentSchemaVersion));
             Assert.That(dto.CreatedAtUtc, Is.InRange(before, after));
             Assert.That(dto.CreatedAtUtc.Kind, Is.EqualTo(DateTimeKind.Utc));
         });
@@ -134,6 +141,150 @@ public class OptimizedStarDetectionSettingsTests {
             Assert.That(clone, Is.Not.SameAs(original));
             Assert.That(original.BrightnessSensitivity, Is.EqualTo(3.3));
             Assert.That(clone.BrightnessSensitivity, Is.EqualTo(99.0));
+        });
+    }
+
+    // ── F30: a landing must say which invocation produced it ────────────────────────────────────────────────
+
+    [Test]
+    public void FromParams_WithoutProvenance_OmitsTheBlockEntirely() {
+        // A snapshot written by the SHIPPING plugin has no argv and no harness settings file. It must stay
+        // byte-identical to before this field existed, and a reader must see "unattributable" rather than a
+        // fabricated producer.
+        var dto = OptimizedStarDetectionSettings.FromParams(new StarDetectorParams(), 1, 0.5, 0.9, 10, 4);
+        var json = JsonConvert.SerializeObject(dto);
+
+        Assert.Multiple(() => {
+            Assert.That(dto.Provenance, Is.Null);
+            Assert.That(json, Does.Not.Contain("Provenance"));
+        });
+    }
+
+    [Test]
+    public void FromParams_WithProvenance_RoundTripsTheInvocation() {
+        var prov = new OptimizerProvenance {
+            Producer = "TestApp optimize",
+            CommandLine = "optimize --per-run --runs D:\\SyntheticAutofocusBank --donut",
+            SettingsFingerprint = "a1b2c3d4e5f6",
+            ProducerVersion = "3.4.0.1"
+        };
+        var dto = OptimizedStarDetectionSettings.FromParams(new StarDetectorParams(), 17, 0.5, 0.9, 10, 4, prov);
+        var round = JsonConvert.DeserializeObject<OptimizedStarDetectionSettings>(JsonConvert.SerializeObject(dto));
+
+        Assert.Multiple(() => {
+            // THE point of F30: the two F23 arms differed only by a flag, and this is where that shows.
+            Assert.That(round.Provenance.CommandLine, Does.Contain("--donut"));
+            Assert.That(round.Provenance.Producer, Is.EqualTo("TestApp optimize"));
+            Assert.That(round.Provenance.SettingsFingerprint, Is.EqualTo("a1b2c3d4e5f6"));
+            Assert.That(round.SchemaVersion, Is.EqualTo(OptimizedStarDetectionSettings.CurrentSchemaVersion));
+        });
+    }
+
+    [Test]
+    public void FromParams_CopiesProvenance_SoTheProducerCannotMutateAStoredLanding() {
+        var prov = new OptimizerProvenance { CommandLine = "optimize --per-run" };
+        var dto = OptimizedStarDetectionSettings.FromParams(new StarDetectorParams(), 1, 0.0, 0.0, 1, 1, prov);
+        prov.CommandLine = "optimize --per-run --donut"; // the caller reuses one instance across the batch
+
+        Assert.That(dto.Provenance.CommandLine, Is.EqualTo("optimize --per-run"),
+            "a landing records the invocation as it was when written");
+    }
+
+    [Test]
+    public void Clone_DeepCopiesProvenance_NotJustTheReference() {
+        // MemberwiseClone is shallow: without an explicit copy every clone would ALIAS one provenance instance,
+        // and a mutation through any of them would rewrite the history of all the others.
+        var original = OptimizedStarDetectionSettings.FromParams(
+            new StarDetectorParams(), 1, 0.0, 0.0, 1, 1, new OptimizerProvenance { CommandLine = "original" });
+        var clone = original.Clone();
+        clone.Provenance.CommandLine = "mutated";
+
+        Assert.Multiple(() => {
+            Assert.That(clone.Provenance, Is.Not.SameAs(original.Provenance));
+            Assert.That(original.Provenance.CommandLine, Is.EqualTo("original"));
+        });
+    }
+
+    [Test]
+    public void ASchemaV2File_StillLoads_WithNoProvenance() {
+        // Forward/backward knob compatibility: v3 added only metadata, so every landing already on disk must
+        // still deserialize — reporting "no provenance" rather than failing or inventing one.
+        const string v2 = "{\"BrightnessSensitivity\":3.3,\"SchemaVersion\":2,\"RunCount\":4}";
+        var dto = JsonConvert.DeserializeObject<OptimizedStarDetectionSettings>(v2);
+
+        Assert.Multiple(() => {
+            Assert.That(dto.SchemaVersion, Is.EqualTo(2));
+            Assert.That(dto.BrightnessSensitivity, Is.EqualTo(3.3));
+            Assert.That(dto.Provenance, Is.Null);
+        });
+    }
+
+    [Test]
+    public void Provenance_ToString_SkipsWhatIsUnset() {
+        Assert.Multiple(() => {
+            Assert.That(new OptimizerProvenance().ToString(), Is.EqualTo("(no provenance)"));
+            Assert.That(new OptimizerProvenance { Producer = "TestApp optimize", CommandLine = "--donut" }.ToString(),
+                Is.EqualTo("TestApp optimize | --donut"));
+        });
+    }
+
+    /// <summary>
+    /// F53. <see cref="OptimizerProvenance.ProducerVersion"/> used to claim it identified the build; it cannot,
+    /// because two builds of one version share it — which is exactly how wave 8's arm X became irreproducible
+    /// from its own recorded `exe` after a later step in the same wave rebuilt that directory. The MVID is
+    /// regenerated on every build, so it is the field that answers "which build".
+    /// </summary>
+    [Test]
+    public void CurrentBuild_IdentifiesTheBUILD_AndTheDetectorContract() {
+        var (buildId, detectorVersion) = OptimizerProvenance.CurrentBuild();
+        Assert.Multiple(() => {
+            Assert.That(buildId, Is.Not.Null.And.Not.Empty);
+            Assert.That(buildId, Has.Length.EqualTo(32), "an MVID formatted \"N\" -- 32 hex digits, no dashes");
+            Assert.That(buildId, Is.Not.EqualTo(new string('0', 32)),
+                "an all-zero MVID means deterministic builds erased the one thing this field exists to carry");
+            Assert.That(detectorVersion, Is.EqualTo(StarDetector.StarDetectorVersion));
+            // It reads the assembly that CONTAINS the detector, so the two values cannot describe different
+            // builds -- the failure mode F53 is about.
+            Assert.That(OptimizerProvenance.CurrentBuild().BuildId, Is.EqualTo(buildId), "stable within a process");
+        });
+    }
+
+    /// <summary>
+    /// F55. The one-liner has to shout when a landing is not comparable to anything, and stay quiet when it is —
+    /// a warning that fires on every run is one nobody reads. Three values, never two: "unknown" is a check that
+    /// could not run, and it must not read as "we were alone".
+    /// </summary>
+    [Test]
+    public void Provenance_ToString_ShoutsAboutConcurrency_AndOnlyThen() {
+        Assert.Multiple(() => {
+            Assert.That(new OptimizerProvenance { Producer = "p", ConcurrencyCheck = "exclusive" }.ToString(),
+                Is.EqualTo("p"), "the quiet case must add nothing at all");
+            Assert.That(new OptimizerProvenance { Producer = "p", ConcurrencyCheck = "concurrent" }.ToString(),
+                Does.Contain("CONCURRENCY=CONCURRENT"));
+            Assert.That(new OptimizerProvenance { Producer = "p", ConcurrencyCheck = "unknown" }.ToString(),
+                Does.Contain("CONCURRENCY=UNKNOWN"),
+                "a check that could not run is reported, not silently treated as a pass");
+            Assert.That(new OptimizerProvenance { Producer = "p" }.ToString(), Is.EqualTo("p"),
+                "a producer that does not check at all says nothing, rather than claiming exclusivity");
+        });
+    }
+
+    [Test]
+    public void FromParams_RoundTripsTheBuildStampAndTheConcurrencyCheck() {
+        var build = OptimizerProvenance.CurrentBuild();
+        var prov = new OptimizerProvenance {
+            Producer = "TestApp optimize", BuildId = build.BuildId,
+            DetectorVersion = build.DetectorVersion, ConcurrencyCheck = "concurrent"
+        };
+        var dto = OptimizedStarDetectionSettings.FromParams(new StarDetectorParams(), 1, 0.0, 0.0, 1, 1, prov);
+        var round = JsonConvert.DeserializeObject<OptimizedStarDetectionSettings>(JsonConvert.SerializeObject(dto));
+
+        Assert.Multiple(() => {
+            Assert.That(round.Provenance.BuildId, Is.EqualTo(build.BuildId));
+            Assert.That(round.Provenance.DetectorVersion, Is.EqualTo(build.DetectorVersion));
+            // The whole point: a scorer can refuse to read this landing WITHOUT anyone having been watching
+            // while it ran, which is what wave 10's accidental double-run showed is needed.
+            Assert.That(round.Provenance.ConcurrencyCheck, Is.EqualTo("concurrent"));
         });
     }
 }

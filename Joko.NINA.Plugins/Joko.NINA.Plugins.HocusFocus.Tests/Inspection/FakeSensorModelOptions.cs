@@ -17,6 +17,13 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.Inspection {
         public double DetailedAnalysisExposureSeconds { get; set; }
         public bool LoopingExposureAnalysisEnabled { get; set; }
         public double MicronsPerFocuserStep { get; set; }
+        public double DriverMicronsPerFocuserStep { get; set; } = -1;
+        public double EffectiveMicronsPerFocuserStep =>
+            MicronsPerFocuserStep > 0 ? MicronsPerFocuserStep
+            : DriverMicronsPerFocuserStep > 0 ? DriverMicronsPerFocuserStep
+            : -1;
+        public bool HasFocuserStepSizeMismatch => false;
+        public bool FocuserIncreasesTowardObjective { get; set; }
         public bool EccentricityColorMapEnabled { get; set; }
         public bool MouseOnChartsEnabled { get; set; }
         public bool SensorCurveModelEnabled { get; set; }
@@ -34,8 +41,6 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.Inspection {
         public bool RejectBadlyFittingMatches { get; set; }
         public double PreviousRunBrightnessDiff { get; set; } = 0.1;
         public double StartingBrightnessDiff { get; set; } = -1;
-        public bool SaveImagesOnReruns { get; set; }
-        public bool SaveAlignmentImages { get; set; }
         public bool FrameReviewEnabled { get; set; }
         public int MaxStarsPerRegion { get; set; } = -1;
         public double AcceptableRSquaredMin { get; set; } = 0.05;

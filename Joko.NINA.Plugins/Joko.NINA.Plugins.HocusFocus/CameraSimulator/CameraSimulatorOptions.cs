@@ -12,6 +12,7 @@
 
 using NINA.Core.Utility;
 using NINA.Joko.Plugins.HocusFocus.AutoFocus;
+using NINA.Joko.Plugins.HocusFocus.CameraSimulator.Rendering;
 using NINA.Joko.Plugins.HocusFocus.CameraSimulator.Sensors;
 using NINA.Joko.Plugins.HocusFocus.Interfaces;
 using NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard;
@@ -98,6 +99,11 @@ namespace NINA.Joko.Plugins.HocusFocus.CameraSimulator {
                 RaisePropertyChanged(nameof(FocuserStepSizeMicrons));
                 // The hint text resolves through the same value, so it moves with it.
                 RaisePropertyChanged(nameof(EffectiveFocuserStepSizeMicrons));
+            } else if (e.PropertyName == nameof(IInspectorOptions.EffectiveMicronsPerFocuserStep)) {
+                // A driver-reported step size moves the render scale WITHOUT touching the override, so this
+                // arrives on its own. FocuserStepSizeMicrons (the editable override) is deliberately not
+                // re-raised here — it did not change.
+                RaisePropertyChanged(nameof(EffectiveFocuserStepSizeMicrons));
             }
         }
 
@@ -135,6 +141,40 @@ namespace NINA.Joko.Plugins.HocusFocus.CameraSimulator {
         /// throwing out of <see cref="Rendering.DefocusModel"/>, which rejects a non-positive k.
         /// </summary>
         public const double DefaultFocuserStepSizeMicrons = 2.0;
+
+        /// <summary>
+        /// Shipped corner curvature effect (µm). Nonzero on purpose: with it at zero the field-astigmatism
+        /// model has nothing to work from and a user enabling aberrations would see only round stars. 50 µm is
+        /// ≈ 0.75× the critical focus zone at f/7 on a full frame — visible but not caricatured — and
+        /// corresponds to a 1 mm spacer error under the nominal flattener the spacing inference assumes.
+        /// </summary>
+        public const double DefaultBackfocusErrorMicrons = 50.0;
+
+        /// <summary>
+        /// Shipped design-residual corner astigmatism (µm). No real corrector leaves a perfectly stigmatic
+        /// field, and this residual is what a tilted sensor reveals — with it at zero, tilt produces only a
+        /// defocus gradient and stars stay round however extreme the tilt. A defensible rule of thumb is
+        /// roughly a quarter of the depth of focus, λN²/2 ≈ 13 µm at f/7; 15 µm is that, rounded.
+        /// <b>Signed</b>: the sign selects which spacing direction elongates radially, which is a property of
+        /// the corrector's design.
+        /// </summary>
+        public const double DefaultCornerAstigmatismMicrons = 15.0;
+
+        /// <summary>
+        /// c_t — the fraction of the tilt that also appears as astigmatic split rather than as pure defocus.
+        ///
+        /// <para>0 would model a crooked <i>detector</i> in a square adapter, where tilt only moves focus
+        /// around and any corner can still be brought to a perfect point. Most real tilt is not that: a
+        /// sagging focuser or a non-square thread tilts the <b>corrector</b> along with the camera, and a
+        /// tilted corrector displaces the astigmatic node off-axis, adding a split that grows with the tilt.
+        /// The visible consequence is that the axis ratio settles at (1+c_t)/(1−c_t) whatever the tilt
+        /// magnitude, instead of washing back to round, and a tilted corner never focuses sharp.</para>
+        ///
+        /// <para>0.25 is chosen to give a 1.67:1 corner at any tilt — clearly eccentric without being a line
+        /// focus. The exact coupling is a property of the individual corrector and its mount, so this is a
+        /// calibration knob rather than a derived constant; that is stated plainly rather than dressed up.</para>
+        /// </summary>
+        public const double DefaultTiltAstigmatismFraction = 0.25;
 
         /// <summary>The stored value meaning "unset — infer it". Matches the plugin's <c>DoubleNegativeToEmptyStringConverter</c> convention.</summary>
         private const double Unset = -1.0;
@@ -251,9 +291,12 @@ namespace NINA.Joko.Plugins.HocusFocus.CameraSimulator {
             enableAberrations = optionsAccessor.GetValueBoolean(nameof(EnableAberrations), false);
             tiltAngleDegrees = optionsAccessor.GetValueDouble(nameof(TiltAngleDegrees), 0.0);
             tiltAmountMicrons = optionsAccessor.GetValueDouble(nameof(TiltAmountMicrons), 0.0);
-            backfocusErrorMicrons = optionsAccessor.GetValueDouble(nameof(BackfocusErrorMicrons), 0.0);
+            backfocusErrorMicrons = optionsAccessor.GetValueDouble(nameof(BackfocusErrorMicrons), DefaultBackfocusErrorMicrons);
             opticalAxisOffsetXMicrons = optionsAccessor.GetValueDouble(nameof(OpticalAxisOffsetXMicrons), 0.0);
             opticalAxisOffsetYMicrons = optionsAccessor.GetValueDouble(nameof(OpticalAxisOffsetYMicrons), 0.0);
+            enableFieldAstigmatism = optionsAccessor.GetValueBoolean(nameof(EnableFieldAstigmatism), true);
+            cornerAstigmatismMicrons = optionsAccessor.GetValueDouble(nameof(CornerAstigmatismMicrons), DefaultCornerAstigmatismMicrons);
+            tiltAstigmatismFraction = optionsAccessor.GetValueDouble(nameof(TiltAstigmatismFraction), DefaultTiltAstigmatismFraction);
             // Heal a stored screw count outside 3|4 (a hand-edited or legacy profile). SimulatedTiltAdapter rejects
             // anything else, so an unhealed value would surface as a panel-construction crash rather than a 3.
             simScrewCount = optionsAccessor.GetValueInt32(nameof(SimScrewCount), 3) == 4 ? 4 : 3;
@@ -297,9 +340,12 @@ namespace NINA.Joko.Plugins.HocusFocus.CameraSimulator {
             EnableAberrations = false;
             TiltAngleDegrees = 0.0;
             TiltAmountMicrons = 0.0;
-            BackfocusErrorMicrons = 0.0;
+            BackfocusErrorMicrons = DefaultBackfocusErrorMicrons;
             OpticalAxisOffsetXMicrons = 0.0;
             OpticalAxisOffsetYMicrons = 0.0;
+            EnableFieldAstigmatism = true;
+            CornerAstigmatismMicrons = DefaultCornerAstigmatismMicrons;
+            TiltAstigmatismFraction = DefaultTiltAstigmatismFraction;
             SimScrewCount = 3;
             SimScrewNumberingClockwise = true;
             SimScrew1AngleDegrees = 0.0;
@@ -348,7 +394,13 @@ namespace NINA.Joko.Plugins.HocusFocus.CameraSimulator {
             get {
                 // `> 0` and not `!(<= 0)`: NaN fails BOTH comparisons, so the `<=` form would wave it through into
                 // DefocusModel and produce an all-NaN frame with no error anywhere (see DefocusModel's ctor guards).
-                var configured = inspectorOptions.MicronsPerFocuserStep;
+                //
+                // Reads the Inspector's EFFECTIVE value, so a driver-reported step size reaches the render too.
+                // It has to: the simulator RENDERS defocus at k and the inspector RECOVERS tilt at k, the same k
+                // on both sides of an inverse. If the render used only the override while the inspector resolved
+                // through the driver, the inject⇄recover loop would break by exactly their ratio, silently — the
+                // original two-copies bug in a new disguise. The simulator's own default is last in the chain.
+                var configured = inspectorOptions.EffectiveMicronsPerFocuserStep;
                 return configured > 0.0 ? configured : DefaultFocuserStepSizeMicrons;
             }
         }
@@ -664,6 +716,45 @@ namespace NINA.Joko.Plugins.HocusFocus.CameraSimulator {
                 if (backfocusErrorMicrons != value) {
                     backfocusErrorMicrons = value;
                     optionsAccessor.SetValueDouble(nameof(BackfocusErrorMicrons), backfocusErrorMicrons);
+                    RaisePropertyChanged();
+                }
+            }
+        }
+
+        private bool enableFieldAstigmatism;
+
+        public bool EnableFieldAstigmatism {
+            get => enableFieldAstigmatism;
+            set {
+                if (enableFieldAstigmatism != value) {
+                    enableFieldAstigmatism = value;
+                    optionsAccessor.SetValueBoolean(nameof(EnableFieldAstigmatism), enableFieldAstigmatism);
+                    RaisePropertyChanged();
+                }
+            }
+        }
+
+        private double cornerAstigmatismMicrons;
+
+        public double CornerAstigmatismMicrons {
+            get => cornerAstigmatismMicrons;
+            set {
+                if (cornerAstigmatismMicrons != value) {
+                    cornerAstigmatismMicrons = value;
+                    optionsAccessor.SetValueDouble(nameof(CornerAstigmatismMicrons), cornerAstigmatismMicrons);
+                    RaisePropertyChanged();
+                }
+            }
+        }
+
+        private double tiltAstigmatismFraction;
+
+        public double TiltAstigmatismFraction {
+            get => tiltAstigmatismFraction;
+            set {
+                if (tiltAstigmatismFraction != value) {
+                    tiltAstigmatismFraction = value;
+                    optionsAccessor.SetValueDouble(nameof(TiltAstigmatismFraction), tiltAstigmatismFraction);
                     RaisePropertyChanged();
                 }
             }

@@ -10,9 +10,12 @@
 
 #endregion "copyright"
 
+using NINA.Core.Utility;
 using NINA.Joko.Plugins.HocusFocus.Interfaces;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -36,6 +39,92 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
         /// Phase-B stops halving a Continuous variable's step once it drops below InitialStep × this fraction.
         /// </summary>
         public double StepFloorFraction { get; set; } = 0.125;
+
+        /// <summary>
+        /// F35 — when set, <see cref="StarDetectorParams.MinHFR"/> is lowered to this value on the seed before the
+        /// search reads θ0, so a rig whose stars are smaller than the shipped gate starts somewhere with a
+        /// gradient instead of on the plateau where <c>J</c> is identically zero (F20).
+        ///
+        /// <para><b>The caller decides, the engine applies.</b> The trigger is
+        /// <c>BestFit.Minimum.Y &lt;= MinHFR</c> from a fit taken BEFORE the search, and
+        /// <see cref="RunEvaluationMetrics"/> — all this engine sees of an evaluation — carries the vertex X only
+        /// (<c>BestFocusPosition</c>), never its Y. So the two callers that already hold a pre-search
+        /// <c>RunEvaluationResult</c> compute the rule via <see cref="MinHfrSeed.Resolve"/> and pass the answer
+        /// here; the clamp lives in one place, ahead of θ0, so the seeded value flows into the seed evaluation,
+        /// into the never-regress floor, and into <c>RevertNeutralAxes</c>' notion of the seed.</para>
+        ///
+        /// <para>Null (the default) leaves every caller bit-identical — which is deliberately the case for
+        /// <c>synth-validate</c> and <c>tilt</c>, neither of which fits a curve before optimizing.</para>
+        /// </summary>
+        public double? MinHfrSeedFloor { get; set; }
+
+        /// <summary>
+        /// F32 — the smallest fraction of the SEED's accepted-star count a candidate may keep and still be
+        /// eligible to win. Null (the default) leaves every caller bit-identical.
+        ///
+        /// <para><b>Why this is a constraint and not a term.</b> The optimizer is not mis-scoring: on the real
+        /// bank σ_focus improves on 10 of 10 star-shedding runs (median ratio 0.320) and R² on 9 of 10 — it is
+        /// genuinely buying a better fit with the stars it discards. What is missing is a bound on the PRICE.
+        /// Measured, the trade is 5.7:1 by construction: <see cref="OptimizationObjective.SStars"/> hard-clamps
+        /// at nMin ≥ 8 / nMedian ≥ 20 (a starvation detector, not a star-count reward), so the only unsaturating
+        /// star term is the tie-breaker's 0.6·nMean/(nMean+20) at Wtie = 0.02 — worth at most 0.012 of J across
+        /// the entire range from zero stars to infinite stars, while a 10% σ tightening buys +0.0037. Halving
+        /// 300 stars to 150 costs 0.00066. Real landings gave up a median 0.243 of recall for a median ΔJ of
+        /// +0.0125; `toml999` gave up 46 points of recall for two ten-thousandths of J.</para>
+        ///
+        /// <para><b>Why not the two alternatives.</b> RESCALING J is provably a no-op for the search — a monotone
+        /// transform preserves the argmax, so every landing would be identical; it buys human legibility and not
+        /// one different decision. RAISING <c>Wtie</c> has already lost this fight once: it was raised 1e-3 → 0.02
+        /// specifically to out-vote this corner (see <see cref="ObjectiveConstants"/>), calibrated against a
+        /// plateau σ-wiggle of ≲4e-3, and the real shedders' σ gains are far larger.</para>
+        ///
+        /// <para><b>Applied as a feasibility REJECTION, never as a multiplier on J.</b> An infeasible candidate is
+        /// discarded ahead of the <c>j &gt; bestJ</c> compare, so every reported BaselineJ/FinalJ/SeedJ/BestJ
+        /// keeps the numeric meaning it has in every prior arm and landings stay directly comparable. Scaling J
+        /// instead would silently re-anchor the whole measurement history.</para>
+        ///
+        /// <para>The seed is feasible by construction (keep = 1.0), so the feasible set is never empty and the
+        /// never-regress floor is preserved: worst case the search returns the seed.</para>
+        /// </summary>
+        public double? MinDetectionKeepFraction { get; set; }
+
+        /// <summary>
+        /// F32 — the per-run accepted-star totals the keep fraction is measured against. Null (the default) means
+        /// "use this call's own seed evaluation", which is correct for a single-pass optimization.
+        ///
+        /// <para><b>It exists to close the multi-pass ratchet.</b> Both multi-pass callers re-invoke
+        /// <see cref="StarDetectionOptimizer.OptimizeAsync"/> with <c>seed = the previous pass's best</c> — TestApp's
+        /// <c>--continue-rounds</c> and the wizard's Continue button. A cap measured against EACH CALL's own seed
+        /// therefore compounds: at a floor of 0.5, two continue rounds permit 0.25 of the original, three permit
+        /// 0.125. That is the constraint paid in installments. Multi-pass callers capture
+        /// <see cref="OptimizationResult.SeedRunDetectionTotals"/> from the FIRST pass and pass it here for every
+        /// later round, so the floor always refers to where the user actually started.</para>
+        /// </summary>
+        public IReadOnlyList<long> DetectionKeepBaselineTotals { get; set; }
+    }
+
+    /// <summary>
+    /// One evaluated candidate: its objective value, whether it satisfies the F32 detection-keep floor, and the
+    /// keep fraction itself.
+    ///
+    /// <para><b><see cref="J"/> is the unmodified objective</b> — identical with and without a floor in force.
+    /// Feasibility is carried alongside it, never folded into it, so a landing's J stays comparable to every
+    /// landing produced before the constraint existed.</para>
+    /// </summary>
+    public readonly struct CandidateEvaluation {
+
+        public CandidateEvaluation(double j, bool feasible, double keepFraction) {
+            J = j;
+            Feasible = feasible;
+            KeepFraction = keepFraction;
+        }
+
+        public double J { get; }
+
+        public bool Feasible { get; }
+
+        /// <summary>Accepted stars kept relative to the baseline, MIN over runs. NaN when unmeasurable.</summary>
+        public double KeepFraction { get; }
     }
 
     /// <summary>Progress payload emitted during <see cref="StarDetectionOptimizer.OptimizeAsync"/>.</summary>
@@ -51,6 +140,55 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
         public double BestSigmaFocus { get; set; } = double.NaN;
 
         public string Phase { get; set; }
+
+        /// <summary>
+        /// F52 — wall time since the parameter search started. The progress COUNTER cannot convey this: "300 / 500"
+        /// says nothing about whether that took five minutes or ninety, and a real field session spent <b>two
+        /// hours</b> here while the log recorded exactly one line and the UI showed only a bar.
+        /// </summary>
+        public TimeSpan Elapsed { get; set; }
+
+        /// <summary>
+        /// F52 — observed mean seconds per COMPLETED evaluation (cache hits excluded; they cost nothing and would
+        /// flatter the figure). NaN before the first evaluation finishes. This is what turns elapsed time into a
+        /// decision: a user who can see 40 s/evaluation against a 500-evaluation budget knows what they are
+        /// committing to, and one who cannot has no basis for aborting or waiting.
+        /// </summary>
+        public double SecondsPerEvaluation { get; set; } = double.NaN;
+
+        /// <summary>
+        /// F79 — true when the step this report describes rebuilds every frame's early
+        /// <c>DetectionContext</c> from scratch instead of re-scoring the cached one.
+        ///
+        /// <para>An EARLY-axis move (StructureLayers, NoiseClippingMultiplier, DetectionBinning, …) both rebuilds
+        /// AND evicts the per-frame context, so it costs a full detection per frame per run — one to two orders of
+        /// magnitude more than a LATE gate-only move, which is a pure cache hit. The search alternates blocks of
+        /// each, so the UI freezes for minutes at a time with no explanation unless it is told which kind of step
+        /// it is waiting on.</para>
+        ///
+        /// <para>Reported BEFORE an expensive evaluation starts as well as after it completes, so the panel can
+        /// say what it is doing at the start of the wait rather than after it.</para>
+        /// </summary>
+        public bool StepIsExpensive { get; set; }
+
+        /// <summary>F79 — whether this search's variable set contains any EARLY axis at all. Constant for a
+        /// search. False (only reachable through the narrowed feedback path) means every step costs the same, and
+        /// there a projected duration is honest; true means the remaining mix is unknowable and no projection may
+        /// be shown.</summary>
+        public bool ExpensiveStepsPossible { get; set; }
+
+        /// <summary>F79 — mean seconds per cache-hit (LATE) evaluation; NaN until one completes.</summary>
+        public double SecondsPerCheapEvaluation { get; set; } = double.NaN;
+
+        /// <summary>F79 — mean seconds per context-rebuilding (EARLY) evaluation; NaN until one completes.</summary>
+        public double SecondsPerExpensiveEvaluation { get; set; } = double.NaN;
+
+        // F52's "which knob made it expensive" CostNote used to live here. It was keyed to the structure-layer
+        // depth, whose legacy dense-SepFilter2D residual cost ~2× per layer; the sparse AtrousWaveletFast
+        // implementation made per-layer cost nearly flat (whole-detect 648/670/738 ms at layers 4/6/8, 26 MP),
+        // so the note's premise — and the note — were retired with the swap (docs/atrous-wavelet-fast-design.md).
+        // The F52(c) "abort and re-expose" ADVICE remains blocked on F19 regardless (the shipped exposure
+        // statistic reports "exposure is not the limit" on exactly the rich fields that gain most).
     }
 
     /// <summary>Outcome of an optimization run.</summary>
@@ -61,6 +199,23 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
         public int Evaluations { get; set; }
         public bool ImprovedOverSeed { get; set; }
         public IReadOnlyList<(string Name, double SeedValue, double BestValue)> ChangedVariables { get; set; }
+
+        /// <summary>F32 — per-run accepted-star totals of the SEED evaluation, in run order. A multi-pass caller
+        /// captures this from its FIRST pass and feeds it back through
+        /// <see cref="OptimizerSettings.DetectionKeepBaselineTotals"/> so the keep floor cannot ratchet.</summary>
+        public IReadOnlyList<long> SeedRunDetectionTotals { get; set; }
+
+        /// <summary>F32 — the winning candidate's keep fraction (MIN over runs) against the baseline totals. NaN
+        /// only when the evaluator reported no star counts to measure. Reported, never scored: it is the number
+        /// that makes a landing's cost legible next to its ΔJ, and it is measured whether or not a floor is in
+        /// force — the counts are already in hand, and this is exactly the "keep%" F32 computes by hand from
+        /// stored landings.</summary>
+        public double LandingKeepFraction { get; set; } = double.NaN;
+
+        /// <summary>F32 — how many evaluated candidates the keep floor rejected. Zero with no floor in force, and
+        /// zero WITH a floor means the constraint never bound — worth distinguishing, because a landing that
+        /// simply never wanted to shed is a different result from one the constraint held back.</summary>
+        public int CandidatesRejectedByKeepFloor { get; set; }
     }
 
     /// <summary>
@@ -107,6 +262,23 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             }
             settings = settings ?? new OptimizerSettings();
 
+            // F35 — seed MinHFR beneath the gate BEFORE θ0 is read, so the search starts from the lowered value
+            // rather than merely being allowed to reach it. Only ever lowers: the objective rewards star count, so
+            // nothing pulls a seeded MinHFR back up, and raising a gate a caller deliberately set lower would be a
+            // knob with no gradient to climb back down. See MinHfrSeed for why the value is a sampling constant
+            // and not derived from any measured HFR.
+            //
+            // CLONE, DO NOT MUTATE THE CALLER'S SEED. Callers reuse one StarDetectorParams across many runs --
+            // TestApp `optimize --per-run` builds a single RunDetectionContext outside its per-dataset loop, and
+            // the wizard passes a live reference to runs[0].Seed. An in-place write here leaks the first run's
+            // seeded gate into every subsequent run, which silently re-gates datasets whose fit never triggered.
+            // Measured: it took the whole 17-dataset synthetic bank to MinHFR 0.3 off ONE firing on D01, including
+            // D05 -- the control whose entire job is to be left alone.
+            if (settings.MinHfrSeedFloor is double minHfrFloor && minHfrFloor < seed.MinHFR) {
+                seed = seed.Clone();
+                seed.MinHFR = minHfrFloor;
+            }
+
             var ctx = new SearchContext(this, seed, variables, evaluator, settings, progress, token);
 
             // θ0 = read each variable from the seed.
@@ -115,8 +287,12 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
                 theta0[i] = variables[i].Quantize(variables[i].Read(seed));
             }
 
-            // Seed evaluation; this is the initial incumbent and the never-regress floor.
-            var seedJ = await ctx.EvalJ(theta0).ConfigureAwait(false);
+            // Seed evaluation; this is the initial incumbent and the never-regress floor. isSeed: true also
+            // establishes the F32 keep-fraction baseline (unless the caller supplied one). It is passed
+            // EXPLICITLY rather than inferred from "the first EvalJ call is θ0 by construction": that inference
+            // is true today and is exactly the kind of implicit call-order coupling that produced the wave-3
+            // seed leak, where one run's genuine firing silently re-gated the other sixteen.
+            var seedJ = (await ctx.EvalJ(theta0, isSeed: true).ConfigureAwait(false)).J;
             var bestTheta = (double[])theta0.Clone();
             var bestJ = seedJ;
 
@@ -127,6 +303,9 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
 
             // Phase B — compass/pattern search.
             (bestTheta, bestJ) = await ctx.PatternSearch(bestTheta, bestJ, seedJ).ConfigureAwait(false);
+
+            // Phase C — revert every axis that did not earn its change (see RevertNeutralAxes).
+            (bestTheta, bestJ) = await ctx.RevertNeutralAxes(theta0, bestTheta, bestJ, seedJ).ConfigureAwait(false);
 
             // Materialize the winning params.
             var bestParams = ctx.Materialize(bestTheta);
@@ -145,7 +324,10 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
                 SeedJ = seedJ,
                 Evaluations = ctx.Evaluations,
                 ImprovedOverSeed = bestJ > seedJ,
-                ChangedVariables = changed
+                ChangedVariables = changed,
+                SeedRunDetectionTotals = ctx.BaselineRunTotals,
+                LandingKeepFraction = ctx.KeepFractionFor(bestTheta),
+                CandidatesRejectedByKeepFloor = ctx.CandidatesRejectedByKeepFloor
             };
         }
 
@@ -156,6 +338,12 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
         private sealed class SearchContext {
             // Fixed compass directions tried for every variable each sweep: + then −, deterministic order.
             private static readonly double[] Directions = { +1.0, -1.0 };
+
+            /// <summary>Phase-C pull-back fractions along incumbent → seed, MOST SEED-WARD FIRST so the first
+            /// accepted one is the nearest-to-seed neutral point. Four coarse steps rather than a bisection: the
+            /// question is "is this axis inert over a wide region", which does not need sub-step resolution, and a
+            /// fixed ladder keeps the phase deterministic and its cost bounded at ≤4 evals per changed axis.</summary>
+            private static readonly double[] PullBackFractions = { 1.0, 0.75, 0.5, 0.25 };
 
             private readonly StarDetectionOptimizer owner;
             private readonly StarDetectorParams seed;
@@ -171,6 +359,18 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             // re-evaluating, and without threading a second value through every search stage.
             private readonly Dictionary<string, double> memoSigma = new Dictionary<string, double>(StringComparer.Ordinal);
 
+            // F32 keep fraction of every evaluated candidate, keyed exactly like memo. Filled alongside J on a
+            // cache miss (free — the counts are already in the metrics).
+            private readonly Dictionary<string, double> memoKeep = new Dictionary<string, double>(StringComparer.Ordinal);
+
+            // F32 — per-run accepted-star totals the keep fraction is measured against. Seeded either from the
+            // caller (a multi-pass round pinning its FIRST pass's seed) or from this search's own seed evaluation.
+            private IReadOnlyList<long> baselineRunTotals;
+
+            // This search's OWN seed totals, always recorded even when the baseline came from the caller, so a
+            // multi-pass caller can still see where each round started.
+            private IReadOnlyList<long> seedRunTotals;
+
             // Phase-B staging partition (T14): the curated axes split into EARLY (members of
             // StarDetector.EarlyCacheKeyProperties — each move both rebuilds AND evicts the per-frame early
             // DetectionContext, a ~1.65s full detection) and LATE (everything else, including the synthetic
@@ -181,6 +381,65 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             private readonly int[] lateIndices;
 
             public int Evaluations { get; private set; }
+
+            // F52 — the search's own wall clock, plus the running total of time spent INSIDE the evaluator. The two
+            // are separate on purpose: the second divided by Evaluations is the honest per-evaluation cost, while
+            // elapsed/Evaluations would silently fold in the seed load and every cache hit and read low.
+            private readonly Stopwatch searchClock = Stopwatch.StartNew();
+            private double evaluatorSeconds;
+
+            // F79 — the same clock, SPLIT by what the evaluation actually cost. One blended mean is the reason the
+            // old "at most N more" bound was not a bound: the search opens with the seed and a coarse grid that
+            // are all cache hits, so the mean is tiny right up to the moment the first EARLY stage multiplies the
+            // true remaining cost by ~10.
+            private double cheapEvaluatorSeconds, expensiveEvaluatorSeconds;
+
+            private int cheapEvaluations, expensiveEvaluations;
+
+            // The early cache key of the last evaluation that actually invoked the evaluator. A candidate whose
+            // early key differs from it forces every frame's context to be rebuilt (and the previous one evicted),
+            // which IS the definition of an expensive step — so this, rather than a second copy of the staging
+            // logic, is what classifies a step. Memo hits run no detection and therefore do not move it.
+            private string lastEvaluatedEarlyKey;
+
+            /// <summary>F79 — whether the step currently in flight (or the last one completed) rebuilds contexts.</summary>
+            private bool stepIsExpensive;
+
+            // The last (phase, J, σ) a caller Reported. A periodic in-search report reuses it so the readout can
+            // refresh TIME every few evaluations without pretending J moved: J and σ genuinely only change at the
+            // points the search compares candidates, and inventing fresher-looking values would be worse than
+            // showing the last real ones.
+            private string lastPhase;
+            private double lastBestJ, lastSeedJ, lastBestSigma = double.NaN;
+            private int lastLoggedEvaluations;
+
+            // Whether a real Report has established an incumbent yet. Until it has there is no J or σ to describe,
+            // and a refresh carrying NaN σ would briefly blank the wizard's live focus-precision readout.
+            private bool hasReportedIncumbent;
+
+            /// <summary>How often (in completed evaluations) a long search emits an INFO line and refreshes the
+            /// live time readout. Small enough that a two-hour run is traceable minute-by-minute, large enough that
+            /// a fast run adds a handful of lines rather than hundreds.</summary>
+            internal const int ProgressEvaluationInterval = 10;
+
+            /// <summary>F52 — mean seconds per COMPLETED evaluation; NaN before the first one finishes. Cache hits
+            /// are excluded (they cost nothing and would flatter the figure).</summary>
+            public double SecondsPerEvaluation => Evaluations > 0 ? evaluatorSeconds / Evaluations : double.NaN;
+
+            /// <summary>F79 — mean seconds per cache-hit evaluation; NaN until one completes.</summary>
+            public double SecondsPerCheapEvaluation =>
+                cheapEvaluations > 0 ? cheapEvaluatorSeconds / cheapEvaluations : double.NaN;
+
+            /// <summary>F79 — mean seconds per context-rebuilding evaluation; NaN until one completes.</summary>
+            public double SecondsPerExpensiveEvaluation =>
+                expensiveEvaluations > 0 ? expensiveEvaluatorSeconds / expensiveEvaluations : double.NaN;
+
+            /// <summary>F79 — true when this search has at least one EARLY axis to move, i.e. when an expensive
+            /// step can still occur. Constant for the search.</summary>
+            public bool ExpensiveStepsPossible => earlyIndices.Length > 0;
+
+            public TimeSpan Elapsed => searchClock.Elapsed;
+
 
             public SearchContext(
                 StarDetectionOptimizer owner,
@@ -197,6 +456,7 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
                 this.settings = settings;
                 this.progress = progress;
                 this.token = token;
+                this.baselineRunTotals = settings.DetectionKeepBaselineTotals;
 
                 var early = new List<int>();
                 var late = new List<int>();
@@ -224,17 +484,63 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             /// Memoized objective. Materializes params, keys on <see cref="StarDetector.ComputeCacheKey"/>, and
             /// only invokes the evaluator on a cache MISS (incrementing the eval counter then). J is the
             /// multi-run aggregate <see cref="OptimizationObjective.JTotal"/> over per-run J. Honors cancellation.
+            ///
+            /// <para>Returns the F32 keep fraction and feasibility alongside J. <b>J itself is never modified by
+            /// the constraint</b> — the caller rejects an infeasible candidate ahead of its own compare, so the
+            /// numbers this returns are identical with and without a floor in force.</para>
+            ///
+            /// <para><paramref name="isSeed"/> establishes the keep-fraction baseline from this evaluation (and
+            /// makes it unconditionally feasible). Exactly one call per search passes it.</para>
             /// </summary>
-            public async Task<double> EvalJ(double[] theta) {
+            public async Task<CandidateEvaluation> EvalJ(double[] theta, bool isSeed = false) {
                 token.ThrowIfCancellationRequested();
                 var p = Materialize(theta);
                 var key = StarDetector.ComputeCacheKey(p);
                 if (memo.TryGetValue(key, out var cached)) {
-                    return cached;
+                    return Judge(cached, memoKeep.TryGetValue(key, out var k) ? k : double.NaN, isSeed);
                 }
 
+                // F79 — classify BEFORE running it. A candidate whose early cache key differs from the last
+                // evaluated one rebuilds (and evicts) every frame's DetectionContext; one that matches re-scores
+                // the cached context. That is the whole cheap/expensive distinction, measured at its actual cause.
+                var earlyKey = StarDetector.ComputeEarlyCacheKey(p);
+                // The SEED is never classified. Whether it rebuilds or hits a warm cache depends entirely on what
+                // the caller did before calling — the wizard pre-warms it through AnalyzeWithProgressAsync (and
+                // shows its own "Analyzing frames" phase for that), TestApp does not — so it is a sample of
+                // neither class, and announcing it as a slow step would be wrong on the path users actually see.
+                // It does establish the key every later candidate is compared against.
+                var expensive = !isSeed && !string.Equals(earlyKey, lastEvaluatedEarlyKey, StringComparison.Ordinal);
+                lastEvaluatedEarlyKey = earlyKey;
+                stepIsExpensive = expensive;
+
+                // F79 — announce an expensive step at the START of the wait. The evaluation that follows can take
+                // minutes, and until it completes nothing else reports, so without this the panel goes silent
+                // with no explanation and reads as a hang.
+                if (expensive) {
+                    ReportInFlight();
+                }
+
+                // F52 — time the evaluator itself, not the surrounding bookkeeping, so SecondsPerEvaluation is the
+                // number a user can multiply by the remaining budget.
+                var evalStart = searchClock.Elapsed;
                 var runMetrics = await evaluator(p, token).ConfigureAwait(false);
+                var evalSeconds = (searchClock.Elapsed - evalStart).TotalSeconds;
+                evaluatorSeconds += evalSeconds;
                 Evaluations++;
+                // F79 — the SEED contributes to neither split rate. Whether it rebuilds contexts or hits a warm
+                // cache depends entirely on what the caller did before calling (the wizard pre-warms through
+                // AnalyzeWithProgressAsync; TestApp does not), so it is a sample of neither class and would
+                // mis-scale whichever one it landed in.
+                if (!isSeed) {
+                    if (expensive) {
+                        expensiveEvaluatorSeconds += evalSeconds;
+                        expensiveEvaluations++;
+                    } else {
+                        cheapEvaluatorSeconds += evalSeconds;
+                        cheapEvaluations++;
+                    }
+                }
+                ReportEvaluationCompleted();
 
                 double j;
                 if (runMetrics == null || runMetrics.Count == 0) {
@@ -246,10 +552,105 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
                     j = OptimizationObjective.JTotal(perRunJ, owner.constants);
                 }
 
+                if (isSeed && baselineRunTotals == null) {
+                    // The caller may have supplied a baseline (multi-pass ratchet guard); only derive one here
+                    // when it did not. Either way the seed's own totals are reported back so a multi-pass caller
+                    // has something to supply on its NEXT round.
+                    baselineRunTotals = RunTotals(runMetrics);
+                }
+                if (isSeed) {
+                    seedRunTotals = RunTotals(runMetrics);
+                }
+
                 memo[key] = j;
                 memoSigma[key] = MeanFiniteSigmaFocus(runMetrics);
-                return j;
+                memoKeep[key] = KeepFraction(runMetrics);
+                return Judge(j, memoKeep[key], isSeed);
             }
+
+            /// <summary>Applies the F32 floor to an already-computed (J, keep) pair. The seed is feasible by
+            /// construction — it is the never-regress floor, and a search whose starting point is infeasible has
+            /// no feasible set at all.</summary>
+            private CandidateEvaluation Judge(double j, double keep, bool isSeed) {
+                if (isSeed || !(settings.MinDetectionKeepFraction is double floor)) {
+                    return new CandidateEvaluation(j, true, keep);
+                }
+                // NaN keep => no baseline to measure against (no run reported counts); do not reject on absence
+                // of evidence, which would silently freeze the search at the seed for any evaluator that does not
+                // populate FrameStarCounts (synth-validate and tilt both go through this engine).
+                var feasible = !double.IsFinite(keep) || keep >= floor;
+                if (!feasible) {
+                    CandidatesRejectedByKeepFloor++;
+                }
+                return new CandidateEvaluation(j, feasible, keep);
+            }
+
+            /// <summary>Per-run accepted-star totals, in run order. Null when the evaluator reported nothing.</summary>
+            private static IReadOnlyList<long> RunTotals(IReadOnlyList<RunEvaluationMetrics> runMetrics) {
+                if (runMetrics == null || runMetrics.Count == 0) {
+                    return null;
+                }
+                var totals = new long[runMetrics.Count];
+                for (var i = 0; i < runMetrics.Count; i++) {
+                    var counts = runMetrics[i]?.FrameStarCounts;
+                    long sum = 0;
+                    if (counts != null) {
+                        foreach (var c in counts) {
+                            sum += c;
+                        }
+                    }
+                    totals[i] = sum;
+                }
+                return totals;
+            }
+
+            /// <summary>
+            /// The F32 keep fraction: MIN over runs of (candidate total ÷ baseline total). NaN when there is no
+            /// baseline or no metrics to measure.
+            ///
+            /// <para><b>Min over runs, not the pooled sum.</b> Pooling lets one dense run's gains mask another
+            /// being gutted. For the headless one-run-per-call case the two are identical, so no bank measurement
+            /// turns on the choice; it only bites in the wizard's N&gt;1 blend, where min is the safer reading.</para>
+            ///
+            /// <para><b>A run whose baseline total is 0 is EXEMPT</b> (contributes keep 1.0), because the ratio is
+            /// undefined and rejecting on it would re-gate exactly the F20/F35 population — a rig whose seed
+            /// legitimately detects nothing is the case the MinHFR seeding exists to rescue, and it must be free
+            /// to climb from zero.</para>
+            /// </summary>
+            private double KeepFraction(IReadOnlyList<RunEvaluationMetrics> runMetrics) {
+                var baseline = baselineRunTotals;
+                if (baseline == null || runMetrics == null || runMetrics.Count == 0) {
+                    return double.NaN;
+                }
+                var candidate = RunTotals(runMetrics);
+                if (candidate == null) {
+                    return double.NaN;
+                }
+                var n = Math.Min(baseline.Count, candidate.Count);
+                if (n == 0) {
+                    return double.NaN;
+                }
+                var worst = double.PositiveInfinity;
+                for (var i = 0; i < n; i++) {
+                    if (baseline[i] <= 0) {
+                        continue; // undefined ratio => exempt, see the remarks above
+                    }
+                    var keep = (double)candidate[i] / baseline[i];
+                    if (keep < worst) {
+                        worst = keep;
+                    }
+                }
+                return double.IsPositiveInfinity(worst) ? 1.0 : worst;
+            }
+
+            /// <summary>The memoized keep fraction of an already-evaluated point. NaN if never evaluated.</summary>
+            public double KeepFractionFor(double[] theta) =>
+                memoKeep.TryGetValue(StarDetector.ComputeCacheKey(Materialize(theta)), out var k) ? k : double.NaN;
+
+            /// <summary>Per-run seed totals, for a multi-pass caller to feed back as the next round's baseline.</summary>
+            public IReadOnlyList<long> BaselineRunTotals => seedRunTotals;
+
+            public int CandidatesRejectedByKeepFloor { get; private set; }
 
             /// <summary>Mean σ over the runs that produced a finite focus σ; NaN when none did. Mirrors the wizard's
             /// baseline/best σ aggregation so the reported σ is directly comparable to the summary's.</summary>
@@ -276,14 +677,83 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
             public bool BudgetExhausted => Evaluations >= settings.MaxEvaluations;
 
             public void Report(string phase, double[] bestTheta, double bestJ, double seedJ) {
+                lastPhase = phase;
+                lastBestJ = bestJ;
+                lastSeedJ = seedJ;
+                lastBestSigma = SigmaFor(bestTheta);
+                hasReportedIncumbent = true;
+                Emit(phase, bestJ, seedJ, lastBestSigma);
+            }
+
+            /// <summary>The one place an <see cref="OptimizationProgress"/> is built, so every report — phase
+            /// boundary, in-flight announcement, per-evaluation refresh — carries the same timing fields.</summary>
+            private void Emit(string phase, double bestJ, double seedJ, double bestSigma) {
                 progress?.Report(new OptimizationProgress {
                     Evaluations = Evaluations,
                     MaxEvaluations = settings.MaxEvaluations,
                     BestJ = bestJ,
                     SeedJ = seedJ,
-                    BestSigmaFocus = SigmaFor(bestTheta),
-                    Phase = phase
+                    BestSigmaFocus = bestSigma,
+                    Phase = phase,
+                    Elapsed = Elapsed,
+                    SecondsPerEvaluation = SecondsPerEvaluation,
+                    StepIsExpensive = stepIsExpensive,
+                    ExpensiveStepsPossible = ExpensiveStepsPossible,
+                    SecondsPerCheapEvaluation = SecondsPerCheapEvaluation,
+                    SecondsPerExpensiveEvaluation = SecondsPerExpensiveEvaluation
                 });
+            }
+
+            /// <summary>F79 — emitted just before a long evaluation begins, carrying the counts and J of the last
+            /// real report plus <see cref="OptimizationProgress.StepIsExpensive"/>. Nothing about the search has
+            /// changed yet; what has changed is that the user is now waiting, and is entitled to know on what.</summary>
+            private void ReportInFlight() {
+                if (hasReportedIncumbent) {
+                    Emit(lastPhase, lastBestJ, lastSeedJ, lastBestSigma);
+                }
+            }
+
+            /// <summary>
+            /// F52/F79 — called after EVERY completed evaluation. Refreshes the live readout each time; emits an
+            /// INFO log line only once per <see cref="ProgressEvaluationInterval"/>.
+            ///
+            /// <para><b>Why the readout refreshes every time (F79).</b> The two cadences answer different
+            /// questions. The log is read afterwards, where one line per ten evaluations is enough to reconstruct
+            /// where the time went. The panel is read WHILE waiting, and at ten evaluations per report a block of
+            /// expensive steps freezes the counter for minutes — which is indistinguishable from a hang. A report
+            /// is a <c>Progress&lt;T&gt;</c> post; doing it per evaluation costs nothing worth measuring.</para>
+            ///
+            /// <para><b>Why this exists at all (F52).</b> The search used to report only at PHASE boundaries, and a
+            /// phase can run for over an hour. A real field session spent two hours here and the NINA log recorded
+            /// a single line for the whole duration, so "where did the time go?" was not answerable afterwards by
+            /// anyone, with any tool.</para>
+            ///
+            /// <para>J and σ are carried over from the last real <see cref="Report"/> rather than recomputed: they
+            /// only change where the search compares candidates, and showing a fresher-looking number than the
+            /// search has actually produced would be worse than showing the last true one. What IS fresh — the
+            /// evaluation count, the elapsed time, and the per-evaluation costs — is exactly what was missing.</para>
+            /// </summary>
+            private void ReportEvaluationCompleted() {
+                // Not before the first real Report: the seed evaluation completes with no incumbent recorded yet,
+                // and a refresh carrying NaN J/σ there would blank the live focus-precision readout for an instant.
+                // Report("Seed", …) follows it immediately, so nothing is lost by waiting for it.
+                if (hasReportedIncumbent) {
+                    Emit(lastPhase, lastBestJ, lastSeedJ, lastBestSigma);
+                }
+
+                if (Evaluations - lastLoggedEvaluations < ProgressEvaluationInterval) {
+                    return;
+                }
+                lastLoggedEvaluations = Evaluations;
+                var budget = settings.MaxEvaluations > 0
+                    ? $"/{settings.MaxEvaluations.ToString(CultureInfo.InvariantCulture)}"
+                    : string.Empty;
+                Logger.Info(
+                    $"Optimizer progress: phase '{lastPhase ?? "search"}', evaluation {Evaluations}{budget}, "
+                    + $"elapsed {Elapsed:hh\\:mm\\:ss}, {SecondsPerEvaluation:0.0}s/evaluation "
+                    + $"(cache-hit {SecondsPerCheapEvaluation:0.0}s x{cheapEvaluations}, "
+                    + $"rebuild {SecondsPerExpensiveEvaluation:0.0}s x{expensiveEvaluations}), "
+                    + $"best J {lastBestJ:0.######}");
             }
 
             /// <summary>
@@ -308,14 +778,89 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
                         if (axisB >= 0) {
                             candidate[axisB] = variables[axisB].Quantize(GridValue(variables[axisB], ib, levels));
                         }
-                        var j = await EvalJ(candidate).ConfigureAwait(false);
-                        if (j > bestJ) {
-                            bestJ = j;
+                        var eval = await EvalJ(candidate).ConfigureAwait(false);
+                        if (eval.Feasible && eval.J > bestJ) {
+                            bestJ = eval.J;
                             bestTheta = candidate;
                         }
                     }
                 }
                 Report("CoarseGrid", bestTheta, bestJ, seedJ);
+                return (bestTheta, bestJ);
+            }
+
+            /// <summary>
+            /// Phase C. For every axis the search moved, try putting it BACK to its seed value and keep the
+            /// revert when doing so costs no J. Deterministic order (variable order), one pass, at most one
+            /// evaluation per changed axis — and most are memo hits, since the seed value on that axis was
+            /// usually visited during the search.
+            ///
+            /// <para><b>Why this is needed.</b> An axis that cannot move J at all is a FREE RIDER: Phase A grids
+            /// Sensitivity × StarClippingMultiplier with Sensitivity as the OUTER loop and level 0 = <c>Lower</c>,
+            /// so the winning StarClip is first discovered in the <c>Sensitivity = Lower</c> row and drags
+            /// Sensitivity to its lower bound. Later rows re-test the same StarClip at higher Sensitivity, score
+            /// EXACTLY the same, and are refused by the strict <c>j &gt; bestJ</c> — so nothing can ever undo it.
+            /// Phase B cannot undo it either: <see cref="CompassStage"/> moves one axis at a time and also demands
+            /// strict improvement, so a flat axis is frozen wherever Phase A left it.</para>
+            ///
+            /// <para>Measured on a real 3800 mm run: sweeping the Sensitivity gate over 0–15 produced BIT-IDENTICAL
+            /// star counts and median HFRs on all 11 frames (the gate rejected 0 of ~1300 candidates), yet the
+            /// optimizer reported <c>Sensitivity: 33.3→0</c>. That spurious floor is user-visible — it raises the
+            /// "star acceptance gate is at the bottom of its range" banner and drives
+            /// <see cref="ExposureRecommender"/> to answer a question about exposure that the run never posed.</para>
+            ///
+            /// <para><b>Exact ties only.</b> The comparison is <c>j &gt;= bestJ</c> with no tolerance: a genuinely
+            /// inert axis produces a bit-identical J (identical detector inputs ⇒ identical metrics), so no epsilon
+            /// is required to catch it, and introducing one would let this phase trade away real, if small,
+            /// improvements. This can never regress the result — a revert is kept only when J does not drop, and
+            /// <see cref="OptimizationResult.BestJ"/> is updated to the (equal-or-better) reverted value.</para>
+            ///
+            /// <para>Axes are pulled back INDEPENDENTLY and greedily, each against the current incumbent, so a
+            /// pull-back that is only neutral BECAUSE an earlier axis already moved is still caught; conversely two
+            /// axes that are individually neutral but jointly matter cannot both move, because the second is
+            /// evaluated against the first's already-updated incumbent.</para>
+            ///
+            /// <para><b>Graded, not all-or-nothing.</b> Reverting only to the seed exactly is not enough: the flat
+            /// region is a PLATEAU, and the seed can sit outside it. On the measured run the plateau was
+            /// Sensitivity ∈ [0, 15] while the seed was 33.3 — a full revert genuinely costs J and is correctly
+            /// refused, which would strand the axis at 0 and keep raising the false floor banner. So each axis is
+            /// tried at a few fixed fractions along the path from the incumbent BACK toward the seed, most
+            /// seed-ward first, and the first that costs no J wins: the axis ends at the point nearest its seed
+            /// that the data cannot distinguish from the search's answer.</para>
+            /// </summary>
+            public async Task<(double[] theta, double j)> RevertNeutralAxes(double[] theta0, double[] bestTheta, double bestJ, double seedJ) {
+                var moved = false;
+                for (var i = 0; i < variables.Count; i++) {
+                    if (bestTheta[i] == theta0[i]) {
+                        continue; // never moved
+                    }
+                    foreach (var t in PullBackFractions) {
+                        if (BudgetExhausted) {
+                            break;
+                        }
+                        // t = 1 is the seed itself; smaller t stays nearer the search's answer.
+                        var value = variables[i].Quantize(bestTheta[i] + t * (theta0[i] - bestTheta[i]));
+                        if (value == bestTheta[i]) {
+                            continue; // quantized back onto the incumbent: nothing to test
+                        }
+                        var candidate = (double[])bestTheta.Clone();
+                        candidate[i] = value;
+                        // The feasibility test applies here too. Pulling BACK toward the seed usually RAISES the
+                        // star count, so this site rarely rejects — but "usually" is not "always" (a seed-ward
+                        // move on one axis can tighten a different gate), and one uniform rule at all three
+                        // accept sites is a single invariant instead of three separate arguments.
+                        var eval = await EvalJ(candidate).ConfigureAwait(false);
+                        if (eval.Feasible && eval.J >= bestJ) {
+                            bestTheta = candidate;
+                            bestJ = eval.J;
+                            moved = true;
+                            break; // most seed-ward neutral point for this axis; go to the next axis
+                        }
+                    }
+                }
+                if (moved) {
+                    Report("RevertNeutral", bestTheta, bestJ, seedJ);
+                }
                 return (bestTheta, bestJ);
             }
 
@@ -414,9 +959,9 @@ namespace NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization {
                             if (candidate == null) {
                                 continue; // move produced no change (e.g. already at bound, or boolean no-op)
                             }
-                            var j = await EvalJ(candidate).ConfigureAwait(false);
-                            if (j > improvedJ) {
-                                improvedJ = j;
+                            var eval = await EvalJ(candidate).ConfigureAwait(false);
+                            if (eval.Feasible && eval.J > improvedJ) {
+                                improvedJ = eval.J;
                                 improvedTheta = candidate;
                             }
                         }

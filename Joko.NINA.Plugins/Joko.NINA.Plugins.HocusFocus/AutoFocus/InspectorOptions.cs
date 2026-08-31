@@ -61,7 +61,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                 optionsAccessor.SetValueInt32(nameof(StepCount), stepCount);
             }
             stepSize = optionsAccessor.GetValueInt32(nameof(StepSize), -1);
-            signalAmplification = Math.Max(1, optionsAccessor.GetValueInt32(nameof(SignalAmplification), 2));
+            signalAmplification = Math.Max(1, optionsAccessor.GetValueInt32(nameof(SignalAmplification), 1));
             centerFocuserBeforeRun = optionsAccessor.GetValueBoolean(nameof(CenterFocuserBeforeRun), false);
             framesPerPoint = optionsAccessor.GetValueInt32(nameof(FramesPerPoint), -1);
             timeoutSeconds = optionsAccessor.GetValueInt32(nameof(TimeoutSeconds), -1);
@@ -70,6 +70,11 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             numRegionsWide = optionsAccessor.GetValueInt32(nameof(NumRegionsWide), 7);
             loopingExposureAnalysisEnabled = optionsAccessor.GetValueBoolean(nameof(LoopingExposureAnalysisEnabled), false);
             micronsPerFocuserStep = optionsAccessor.GetValueDouble(nameof(MicronsPerFocuserStep), -1);
+            // Not loaded — it has no accessor key. Assigned to the FIELD, not the property, because the
+            // property's setter rejects non-positive values by design. This runs on construction and on every
+            // ProfileChanged, which is exactly where "a different rig, so forget the last focuser" belongs.
+            driverMicronsPerFocuserStep = -1;
+            focuserIncreasesTowardObjective = optionsAccessor.GetValueBoolean(nameof(FocuserIncreasesTowardObjective), false);
             eccentricityColorMapEnabled = optionsAccessor.GetValueBoolean(nameof(EccentricityColorMapEnabled), true);
             mouseOnChartsEnabled = optionsAccessor.GetValueBoolean(nameof(MouseOnChartsEnabled), true);
             sensorCurveModelEnabled = optionsAccessor.GetValueBoolean(nameof(SensorCurveModelEnabled), false);
@@ -86,8 +91,6 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             useRANSAC = optionsAccessor.GetValueBoolean(nameof(UseRANSAC), true);
             useAffineAlignment = optionsAccessor.GetValueBoolean(nameof(UseAffineAlignment), false);
             astigmaticCurvatureEnabled = optionsAccessor.GetValueBoolean(nameof(AstigmaticCurvatureEnabled), false);
-            saveImagesOnReruns = optionsAccessor.GetValueBoolean(nameof(SaveImagesOnReruns), false);
-            saveAlignmentImages = optionsAccessor.GetValueBoolean(nameof(SaveAlignmentImages), false);
             frameReviewEnabled = optionsAccessor.GetValueBoolean(nameof(FrameReviewEnabled), false);
             maxStarsPerRegion = optionsAccessor.GetValueInt32(nameof(MaxStarsPerRegion), -1);
             acceptableRSquaredMin = optionsAccessor.GetValueDouble(nameof(AcceptableRSquaredMin), SensorAberrationCalculator.DefaultAcceptableRSquaredMin);
@@ -96,7 +99,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
         public void ResetDefaults() {
             StepCount = -1;
             StepSize = -1;
-            SignalAmplification = 2;
+            SignalAmplification = 1;
             CenterFocuserBeforeRun = false;
             FramesPerPoint = -1;
             TimeoutSeconds = -1;
@@ -104,6 +107,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             NumRegionsWide = 7;
             LoopingExposureAnalysisEnabled = false;
             MicronsPerFocuserStep = -1;
+            FocuserIncreasesTowardObjective = false;
             EccentricityColorMapEnabled = true;
             MouseOnChartsEnabled = true;
             SensorCurveModelEnabled = false;
@@ -153,8 +157,12 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
         // Signal amplification factor for sensor-model / tilt calibration sweeps: divides the focuser step size and
         // multiplies the step count by this factor, so a live run captures more, finer-spaced points over the same
         // range. More points => more signal and smaller defocus jumps between adjacent frames (easier RANSAC
-        // alignment). Clamped to >= 1; 1 disables amplification. Applied only to live captures, never on replay.
-        private int signalAmplification = 2;
+        // alignment), at proportionally more exposures per sweep. Clamped to >= 1.
+        //
+        // Defaults to 1 (off): the extra frames cost real time on every sweep, and a calibration is seven of them,
+        // so amplification is opt-in for the faint fields and poor seeing that actually need it. Applied only to
+        // live captures, never on replay.
+        private int signalAmplification = 1;
 
         public int SignalAmplification {
             get => signalAmplification;
@@ -264,12 +272,90 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
 
         private double micronsPerFocuserStep;
 
+        /// <inheritdoc cref="IInspectorOptions.MicronsPerFocuserStep"/>
         public double MicronsPerFocuserStep {
             get => micronsPerFocuserStep;
             set {
                 if (micronsPerFocuserStep != value) {
                     micronsPerFocuserStep = value;
                     optionsAccessor.SetValueDouble(nameof(MicronsPerFocuserStep), micronsPerFocuserStep);
+                    RaisePropertyChanged();
+                    RaiseFocuserStepSizeDerivedChanged();
+                }
+            }
+        }
+
+        private double driverMicronsPerFocuserStep = -1;
+
+        /// <inheritdoc cref="IInspectorOptions.DriverMicronsPerFocuserStep"/>
+        /// <remarks>
+        /// No accessor key, by design — see the interface doc. The setter's guard IS the stickiness mechanism:
+        /// a disconnected focuser reports 0, the write is dropped, and the last known value stands. Keep the
+        /// filtering here and nowhere else, so the single writer stays a plain unconditional assignment and the
+        /// two cannot drift apart.
+        ///
+        /// <para><c>&gt; 0</c> and not <c>!(&lt;= 0)</c>: NaN fails BOTH comparisons, so only the positive form
+        /// rejects it. A NaN step size waved through here yields an all-NaN sensor model with no error
+        /// anywhere — the same trap documented on
+        /// <c>CameraSimulatorOptions.EffectiveFocuserStepSizeMicrons</c>.</para>
+        /// </remarks>
+        public double DriverMicronsPerFocuserStep {
+            get => driverMicronsPerFocuserStep;
+            set {
+                if (!(value > 0.0) || double.IsInfinity(value)) {
+                    return;
+                }
+                if (driverMicronsPerFocuserStep != value) {
+                    driverMicronsPerFocuserStep = value;
+                    RaisePropertyChanged();
+                    RaiseFocuserStepSizeDerivedChanged();
+                }
+            }
+        }
+
+        /// <inheritdoc cref="IInspectorOptions.EffectiveMicronsPerFocuserStep"/>
+        public double EffectiveMicronsPerFocuserStep =>
+            micronsPerFocuserStep > 0.0 ? micronsPerFocuserStep
+            : driverMicronsPerFocuserStep > 0.0 ? driverMicronsPerFocuserStep
+            : -1.0;
+
+        /// <summary>
+        /// How far the override may sit from the driver's reported step size before
+        /// <see cref="HasFocuserStepSizeMismatch"/> flags it, as a fraction of the driver's value.
+        ///
+        /// <para>Relative rather than absolute because real rigs span roughly 0.1–10 µm/step. 1% is loose
+        /// enough that a genuine calibration landing near the driver's round number stays quiet, and tight
+        /// enough to catch what this check exists for: a driver reporting steps rather than microns, or a 2×
+        /// error.</para>
+        /// </summary>
+        public const double FocuserStepSizeMismatchFraction = 0.01;
+
+        /// <inheritdoc cref="IInspectorOptions.HasFocuserStepSizeMismatch"/>
+        public bool HasFocuserStepSizeMismatch =>
+            micronsPerFocuserStep > 0.0 && driverMicronsPerFocuserStep > 0.0 &&
+            Math.Abs(micronsPerFocuserStep - driverMicronsPerFocuserStep) / driverMicronsPerFocuserStep
+                > FocuserStepSizeMismatchFraction;
+
+        // Both derived values read the override AND the driver value, so either input changing must re-raise
+        // both. Bindings (the hint text, the mismatch flag) depend on this.
+        private void RaiseFocuserStepSizeDerivedChanged() {
+            RaisePropertyChanged(nameof(EffectiveMicronsPerFocuserStep));
+            RaisePropertyChanged(nameof(HasFocuserStepSizeMismatch));
+        }
+
+        private bool focuserIncreasesTowardObjective;
+
+        /// <summary>
+        /// The focuser direction convention k. DISPLAY-ONLY — see
+        /// <see cref="IInspectorOptions.FocuserIncreasesTowardObjective"/> for the full contract and the two
+        /// sanctioned exceptions.
+        /// </summary>
+        public bool FocuserIncreasesTowardObjective {
+            get => focuserIncreasesTowardObjective;
+            set {
+                if (focuserIncreasesTowardObjective != value) {
+                    focuserIncreasesTowardObjective = value;
+                    optionsAccessor.SetValueBoolean(nameof(FocuserIncreasesTowardObjective), focuserIncreasesTowardObjective);
                     RaisePropertyChanged();
                 }
             }
@@ -516,32 +602,6 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
         }
 
         public string BrightnessToleranceHint { get { return $"(auto: {PreviousRunBrightnessDiff:0.##})"; } }
-
-        private bool saveImagesOnReruns = false;
-
-        public bool SaveImagesOnReruns {
-            get => saveImagesOnReruns;
-            set {
-                if (saveImagesOnReruns != value) {
-                    saveImagesOnReruns = value;
-                    optionsAccessor.SetValueBoolean(nameof(SaveImagesOnReruns), saveImagesOnReruns);
-                    RaisePropertyChanged();
-                }
-            }
-        }
-
-        private bool saveAlignmentImages = false;
-
-        public bool SaveAlignmentImages {
-            get => saveAlignmentImages;
-            set {
-                if (saveAlignmentImages != value) {
-                    saveAlignmentImages = value;
-                    optionsAccessor.SetValueBoolean(nameof(SaveAlignmentImages), saveAlignmentImages);
-                    RaisePropertyChanged();
-                }
-            }
-        }
 
         private bool frameReviewEnabled = false;
 

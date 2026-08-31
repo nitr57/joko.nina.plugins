@@ -36,12 +36,14 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             double topLeftPosition,
             double topRightPosition,
             double bottomLeftPosition,
-            double bottomRightPosition) {
+            double bottomRightPosition,
+            double pixelSizeMicrons = double.NaN) {
             if (imageSize.Width <= 0 || imageSize.Height <= 0) {
                 throw new ArgumentException($"ImageSize ({imageSize.Width}, {imageSize.Height}) dimensions must be positive");
             }
 
             ImageSize = imageSize;
+            PixelSizeMicrons = pixelSizeMicrons;
             A = a;
             B = b;
             C = c;
@@ -76,6 +78,23 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
         }
 
         public System.Drawing.Size ImageSize { get; private set; }
+
+        /// <summary>
+        /// The pixel pitch, in microns, of ONE PIXEL OF <see cref="ImageSize"/> — i.e. the camera's native
+        /// pixel size multiplied by the binning the frame was captured at. NaN when the producer did not know
+        /// it (nothing derives physical units from such a model; callers fall back to their own source).
+        ///
+        /// It travels with the model because <see cref="A"/>/<see cref="B"/> are per-NORMALIZED image
+        /// coordinate, so recovering a physical gradient (microns of focuser travel per micron of sensor
+        /// displacement) needs the sensor's physical extent — <c>ImageSize.Width * PixelSizeMicrons</c> — and
+        /// that product is only correct if the two factors describe the SAME frame. Under NINA's Auto Focus
+        /// Binning of N the frame is N× coarser in both axes, so pairing this (binned) ImageSize with the
+        /// profile's native <c>CameraSettings.PixelSize</c> under-reports the sensor by N and inflates every
+        /// derived gradient — and therefore the tilt wizard's recovered thread pitch / stepper step size — by
+        /// exactly N. Keeping the pitch on the model is what makes that pairing impossible to get wrong.
+        /// </summary>
+        public double PixelSizeMicrons { get; private set; }
+
         public double A { get; private set; }
         public double B { get; private set; }
         public double C { get; private set; }
@@ -116,10 +135,16 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             var topRightFocuser = result.RegionResults[3].EstimatedFinalFocuserPosition;
             var bottomLeftFocuser = result.RegionResults[4].EstimatedFinalFocuserPosition;
             var bottomRightFocuser = result.RegionResults[5].EstimatedFinalFocuserPosition;
+            // The corner-region samples sit at the REGION CENTERS (±1/3 normalized with default ROI), not at the
+            // frame corners. Regress against where the samples actually are, or A/B are attenuated by 2·|center|.
+            var tlBoundary = result.RegionResults[2].Region.OuterBoundary;
+            double cornerXNorm = Math.Abs(tlBoundary.StartX + tlBoundary.Width / 2.0 - 0.5);
+            double cornerYNorm = Math.Abs(tlBoundary.StartY + tlBoundary.Height / 2.0 - 0.5);
             var tiltPlaneModel = Create(
                 imageSize: result.ImageSize, fRatio: fRatio,
                 focuserStepSizeMicrons: focuserStepSizeMicrons, centerFocuser: centerFocuser, topLeftFocuser: topLeftFocuser,
-                topRightFocuser: topRightFocuser, bottomLeftFocuser: bottomLeftFocuser, bottomRightFocuser: bottomRightFocuser);
+                topRightFocuser: topRightFocuser, bottomLeftFocuser: bottomLeftFocuser, bottomRightFocuser: bottomRightFocuser,
+                cornerXNorm: cornerXNorm, cornerYNorm: cornerYNorm);
 
             tiltPlaneModel.Center.RSquared = result.RegionResults[1].Fittings.GetRSquared();
             tiltPlaneModel.TopLeft.RSquared = result.RegionResults[2].Fittings.GetRSquared();
@@ -137,17 +162,20 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             double topLeftFocuser,
             double topRightFocuser,
             double bottomLeftFocuser,
-            double bottomRightFocuser) {
+            double bottomRightFocuser,
+            double cornerXNorm = 0.5,
+            double cornerYNorm = 0.5,
+            double pixelSizeMicrons = double.NaN) {
             var ols = new OrdinaryLeastSquares() {
                 UseIntercept = true
             };
 
             double[][] inputs =
             {
-                new double[] { -0.5, -0.5 },
-                new double[] { 0.5, -0.5 },
-                new double[] { -0.5, 0.5 },
-                new double[] { 0.5, 0.5 },
+                new double[] { -cornerXNorm, -cornerYNorm },
+                new double[] { cornerXNorm, -cornerYNorm },
+                new double[] { -cornerXNorm, cornerYNorm },
+                new double[] { cornerXNorm, cornerYNorm },
             };
             double[] outputs = { topLeftFocuser, topRightFocuser, bottomLeftFocuser, bottomRightFocuser };
 
@@ -161,7 +189,8 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                 imageSize: imageSize, fRatio: fRatio,
                 a: a, b: b, c: c, mean: mean, focuserStepSizeMicrons: focuserStepSizeMicrons, centerPosition: centerFocuser,
                 topLeftPosition: topLeftFocuser, topRightPosition: topRightFocuser,
-                bottomLeftPosition: bottomLeftFocuser, bottomRightPosition: bottomRightFocuser);
+                bottomLeftPosition: bottomLeftFocuser, bottomRightPosition: bottomRightFocuser,
+                pixelSizeMicrons: pixelSizeMicrons);
         }
     }
 
@@ -200,7 +229,8 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
         }
 
         public void UpdateTiltModel(AutoFocusResult result, double fRatio, double backfocusFocuserPositionDelta) {
-            var micronsPerFocuserStep = inspectorOptions.MicronsPerFocuserStep > 0 ? inspectorOptions.MicronsPerFocuserStep : double.NaN;
+            var effective = inspectorOptions.EffectiveMicronsPerFocuserStep;
+            var micronsPerFocuserStep = effective > 0 ? effective : double.NaN;
             var tiltModel = TiltPlaneModel.Create(result, fRatio: fRatio, focuserStepSizeMicrons: micronsPerFocuserStep);
             UpdateTiltMeasurementsTable(tiltModel, backfocusFocuserPositionDelta);
         }

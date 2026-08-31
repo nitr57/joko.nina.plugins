@@ -10,7 +10,6 @@
 
 #endregion "copyright"
 
-using Accord.Imaging.Filters;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using Newtonsoft.Json;
@@ -41,6 +40,7 @@ using NINA.Joko.Plugins.HocusFocus.Scottplot;
 using NINA.Joko.Plugins.HocusFocus.StarDetection;
 using NINA.Joko.Plugins.HocusFocus.StarDetection.Optimization.Review;
 using NINA.Joko.Plugins.HocusFocus.TiltAdapterDevices;
+using NINA.Joko.Plugins.HocusFocus.TiltAdapterDevices.Manual;
 using NINA.Joko.Plugins.HocusFocus.TiltAdapterDevices.AsgEat;
 using NINA.Joko.Plugins.HocusFocus.TiltAdapterDevices.Prompt;
 using NINA.Joko.Plugins.HocusFocus.TiltAdapterWizard;
@@ -58,7 +58,6 @@ using System;
 using System.Collections.Generic;
 using System.ComponentModel.Composition;
 using System.Diagnostics;
-using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -67,7 +66,6 @@ using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Input;
 using System.Windows.Media;
-using System.Windows.Media.Imaging;
 using static NINA.Joko.Plugins.HocusFocus.Inspection.SensorModel;
 using AsyncRelayCommand = CommunityToolkit.Mvvm.Input.AsyncRelayCommand;
 using DrawingColor = System.Drawing.Color;
@@ -103,6 +101,8 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
         private readonly IApplicationDispatcher applicationDispatcher;
         private readonly IProgress<ApplicationStatus> progress;
         private readonly ITiltAdapterOptions tiltAdapterOptions;
+        // Reads tiltAdapterOptions live, so it tracks device changes and label edits without rewiring.
+        private readonly IScrewLabelProvider screwLabels;
         private readonly IPerFilterStarDetectionStore perFilterStarDetectionStore;
 
         // Shared motorized-device connection singleton (HocusFocusPlugin.TiltDeviceConnectionService in
@@ -222,12 +222,24 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             RegionLineFittings = new AsyncObservableCollection<TrendlineFitting>(Enumerable.Range(0, 6).Select(i => (TrendlineFitting)null));
             TiltModel = new TiltModel(inspectorOptions);
             SensorModel = new SensorModel(profileService, inspectorOptions, autoFocusOptions, alglibAPI);
+            // Selecting a history row is what populates the return panel, and UpdateModel clears the selection on
+            // every completed analysis -- which is also what makes the panel self-dismiss rather than offering a
+            // stale target.
+            SensorModel.PropertyChanged += SensorModel_PropertyChanged;
 
             inspectorOptions.PropertyChanged += (s, e) => {
                 if (e.PropertyName == nameof(IInspectorOptions.SignalAmplification) ||
                     e.PropertyName == nameof(IInspectorOptions.StepCount) ||
                     e.PropertyName == nameof(IInspectorOptions.FramesPerPoint)) {
                     RaisePropertyChanged(nameof(SignalAmplificationSummary));
+                }
+                if (e.PropertyName == nameof(IInspectorOptions.FocuserIncreasesTowardObjective)) {
+                    // k is display-only, so this refreshes WORDS AND ARROWS ONLY: the backfocus
+                    // TOWARDS/AWAY FROM verdict, and the guidance's motion arrows. Every number, glyph and
+                    // total RebuildTiltGuidance produces is k-free by construction and comes out identical —
+                    // pinned by the invariance guards in InspectorVMFocuserDirectionTests.
+                    BackfocusDirection = BackfocusDirectionFor(BackfocusFocuserPositionDelta);
+                    RebuildTiltGuidance();
                 }
             };
             // SignalAmplificationSummary also reads the active profile's FocuserSettings (offset steps /
@@ -247,6 +259,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             };
 
             this.tiltAdapterOptions = tiltAdapterOptions;
+            this.screwLabels = TiltScrewLabels.For(tiltAdapterOptions);
             this.tiltDeviceConnectionService = tiltDeviceConnectionService;
             this.confirmPromptAsync = confirmPromptAsync ?? ShowYesNoPromptAsync;
             this.showAdjustmentPromptAsync = showAdjustmentPromptAsync ?? DefaultShowAdjustmentPromptAsync;
@@ -275,6 +288,9 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             CancelSlewToZenithCommand = new RelayCommand(() => slewToZenithCts?.Cancel());
             ReviewFramesCommand = new RelayCommand(ShowFrameReview, canExecute: () => ReviewFramesAvailable);
             AutomaticAdjustmentCommand = new AsyncRelayCommand(RunAutomaticAdjustmentAsync, CanExecuteAutomaticAdjustmentNow);
+            ReturnToRunCommand = new AsyncRelayCommand(ReturnToSelectedRunAsync, CanExecuteReturnToRunNow);
+            RevertLastAdjustmentCommand = new AsyncRelayCommand(RevertLastAdjustmentAsync, CanExecuteRevertLastAdjustmentNow);
+            DismissWorseningBannerCommand = new RelayCommand(ClearWorseningBanner);
         }
 
         private bool AnalysisRunning() {
@@ -296,8 +312,19 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
         // Adapter Wizard reads this to record each calibration step's saved location for later replay.
         public string LastSaveFolder { get; private set; }
 
-        public async Task<bool> AnalyzeAutoFocus(CancellationToken token, bool captureCameraBlock = false, AutoFocusSaveOverride saveOverride = null) {
-            var task = AnalyzeAutoFocusImpl(captureCameraBlock, saveOverride);
+        /// <summary>
+        /// Runs the full Aberration Inspector analysis: the multi-region AutoFocus sweep, the sensor model fitted
+        /// from it, and — unless <paramref name="includeExposureAnalysis"/> is false — a final validation exposure
+        /// analyzed for the FWHM-contour and eccentricity panels.
+        ///
+        /// <para><paramref name="includeExposureAnalysis"/> exists for callers that consume only the fitted sensor
+        /// model, the Tilt Adapter Wizard's calibration steps above all: that validation exposure costs a further
+        /// <c>SimpleExposureSeconds</c> plus a full-frame PSF-modeling detection on EVERY step of a calibration run,
+        /// for panels the wizard neither reads nor shows — and, because a failure here fails the whole call, it
+        /// could also fail a calibration step whose sensor model had already been fitted successfully.</para>
+        /// </summary>
+        public async Task<bool> AnalyzeAutoFocus(CancellationToken token, bool captureCameraBlock = false, AutoFocusSaveOverride saveOverride = null, bool includeExposureAnalysis = true) {
+            var task = AnalyzeAutoFocusImpl(captureCameraBlock, saveOverride, includeExposureAnalysis);
             token.Register(() => analyzeCts?.Cancel());
             return await task;
         }
@@ -357,7 +384,6 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             }
 
             Logger.Info($"Rerunning auto focus attempt from {folderPath}");
-            bool suppressAuxiliaryFiles = saveOverride?.SuppressAuxiliaryFiles == true;
             localAnalyzeTask = Task.Run(async () => {
                 // A rerun re-analyzes existing frames and never captures, so the engine cannot write raw frames to a
                 // new location. Leave the engine save OFF (no annotated/JSON artifacts) and, on success, copy the
@@ -375,7 +401,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
 
                 autoFocusEngine.Started += AutoFocusEngine_Started;
                 autoFocusEngine.Failed += AutoFocusEngine_Failed;
-                autoFocusEngine.Completed += AutoFocusEngine_CompletedNoReport;
+                autoFocusEngine.Completed += AutoFocusEngine_CompletedReplay;
                 autoFocusEngine.MeasurementPointCompleted += AutoFocusEngine_MeasurementPointCompleted;
                 autoFocusEngine.SubMeasurementPointCompleted += AutoFocusEngine_SubMeasurementPointCompleted;
 
@@ -392,7 +418,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                     return false;
                 }
 
-                var analysisResult = await AnalyzeAutoFocusResult(options, result, sensorCurveModelEnabled: sensorCurveModelEnabled, ct: localAnalyzeCts.Token, forRerun: true, suppressRegisteredImages: suppressAuxiliaryFiles);
+                var analysisResult = await AnalyzeAutoFocusResult(options, result, sensorCurveModelEnabled: sensorCurveModelEnabled, ct: localAnalyzeCts.Token);
                 if (!analysisResult) {
                     Notification.ShowError("AutoFocus Analysis Failed");
                     InspectorErrorText = "AutoFocus Analysis Failed";
@@ -456,7 +482,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             }
         }
 
-        private async Task<bool> AnalyzeAutoFocusImpl(bool captureCameraBlock, AutoFocusSaveOverride saveOverride = null) {
+        private async Task<bool> AnalyzeAutoFocusImpl(bool captureCameraBlock, AutoFocusSaveOverride saveOverride = null, bool includeExposureAnalysis = true) {
             var localAnalyzeTask = analyzeTask;
             if (localAnalyzeTask != null && !localAnalyzeTask.IsCompleted) {
                 Notification.ShowError("Analysis still in progress");
@@ -488,8 +514,8 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                         if (options.Save) {
                             // Mirror GetAutoFocusEngineOptions: keep exposures so the run can be re-analyzed later.
                             options.PreserveExposures = true;
-                            // A saved calibration run keeps only the raw frames — no per-region annotated TIFFs /
-                            // detection-result JSONs (and, below, no registered/alignment images).
+                            // A saved calibration run keeps only the raw frames — no per-region
+                            // detection-result JSONs.
                             options.SaveExposuresOnly = suppressAuxiliaryFiles;
                         }
                     }
@@ -521,7 +547,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                     if (inspectorOptions.CenterFocuserBeforeRun) {
                         try {
                             var centeringEngine = autoFocusEngineFactory.Create();
-                            var centeringOptions = centeringEngine.GetOptions();
+                            var centeringOptions = centeringEngine.GetOptions(imagingFilter: imagingFilter);
                             centeringOptions.Save = false;
                             centeringOptions.PreserveExposures = false;
                             this.progress.Report(new ApplicationStatus() { Status = "Centering focuser before sensor model run" });
@@ -544,7 +570,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                     }
                     LastSaveFolder = result.SaveFolder;
 
-                    var autoFocusAnalysisResult = await AnalyzeAutoFocusResult(options, result, sensorCurveModelEnabled: sensorCurveModelEnabled, ct: localAnalyzeCts.Token, suppressRegisteredImages: suppressAuxiliaryFiles);
+                    var autoFocusAnalysisResult = await AnalyzeAutoFocusResult(options, result, sensorCurveModelEnabled: sensorCurveModelEnabled, ct: localAnalyzeCts.Token);
                     if (!autoFocusAnalysisResult) {
                         InspectorErrorText = "AutoFocus Analysis Failed. View saved AF report in the AutoFocus tab.";
                         Notification.ShowError("AutoFocus Analysis Failed. View saved AF report in the AutoFocus tab.");
@@ -552,14 +578,21 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                         return false;
                     }
                     ActivateTiltMeasurement();
-                    var exposureAnalysisResult = await TakeAndAnalyzeExposureImpl(autoFocusEngine, analyzeCts.Token);
-                    if (!exposureAnalysisResult) {
-                        InspectorErrorText = "Exposure Analysis Failed. View saved AF report in the AutoFocus tab.";
-                        Notification.ShowError("Exposure Analysis Failed");
-                        DeactivateAutoFocusAnalysis();
-                        return false;
+                    if (includeExposureAnalysis) {
+                        var exposureAnalysisResult = await TakeAndAnalyzeExposureImpl(autoFocusEngine, analyzeCts.Token);
+                        if (!exposureAnalysisResult) {
+                            InspectorErrorText = "Exposure Analysis Failed. View saved AF report in the AutoFocus tab.";
+                            Notification.ShowError("Exposure Analysis Failed");
+                            DeactivateAutoFocusAnalysis();
+                            return false;
+                        }
+                        ActivateExposureAnalysis();
+                    } else {
+                        // Hidden rather than left showing: those panels would otherwise still be displaying the
+                        // PREVIOUS run's validation exposure next to a freshly fitted sensor model, which reads as
+                        // if they belonged to it.
+                        DeactivateExposureAnalysis();
                     }
-                    ActivateExposureAnalysis();
                     Notification.ShowInformation("Aberration Inspection Complete");
                     return true;
                 } finally {
@@ -616,9 +649,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             AutoFocusEngineOptions options,
             AutoFocusResult result,
             bool sensorCurveModelEnabled,
-            CancellationToken ct,
-            bool forRerun = false,
-            bool suppressRegisteredImages = false) {
+            CancellationToken ct) {
             if (result == null || !result.Succeeded) {
                 Logger.Error("Inspection analysis failed, due to failed AutoFocus");
                 return false;
@@ -633,7 +664,9 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             // Resolve the definitive review request from the SAME flag that gates this block (capture-time flag on replay).
             frameReviewRequestedForRun = IsFrameReviewRequested(inspectorOptions.FrameReviewEnabled, sensorCurveModelEnabled);
             if (sensorCurveModelEnabled) {
-                double focuserSizeMicrons = SensorModelFocuserSizeOverrideMicrons ?? InspectorOptions.MicronsPerFocuserStep;
+                // Layer 1 (a replay's captured step size) over the resolver's layers 2-4 (override, driver,
+                // unset) - docs/focuser-step-size-driver-design.md §2.
+                double focuserSizeMicrons = SensorModelFocuserSizeOverrideMicrons ?? InspectorOptions.EffectiveMicronsPerFocuserStep;
                 if (double.IsNaN(focuserSizeMicrons) || focuserSizeMicrons <= 0.0) {
                     if (!focuserStepSizeWarningShowed) {
                         Notification.ShowWarning("Focuser Step Size not set. Assuming 1 micron per focuser step. This message won't be shown again.");
@@ -652,17 +685,14 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                         finalFocusPosition: finalFocuserPosition,
                         stepSize: result.StepSize,
                         progress,
-                        ct: ct);
+                        ct: ct,
+                        adapterState: CaptureAdapterState());
 
-                    if (!suppressRegisteredImages && ((!forRerun) || (inspectorOptions.SaveImagesOnReruns))) {
-                        if (!String.IsNullOrEmpty(result.SaveFolder)) {
-                            await SaveRegisteredImages(result.SaveFolder,
-                                SensorModel.SensorModelResult.RegisteredStars,
-                                SensorModel.TrianglesByImage,
-                                SensorModel.ReferenceImage,
-                                inspectorOptions.SaveAlignmentImages);
-                        }
-                    }
+                    // Annotated registration/alignment TIFFs are no longer written to the run folder. "Review
+                    // Frames" re-renders the same overlays live (from the raw frames plus the capture-time
+                    // settings on a replay), so a baked-in copy per frame was redundant output that also cost a
+                    // full-frame 16→8bpp conversion, draw and TIFF encode for every frame of every run. Same
+                    // reasoning already retired the per-region annotated TIFFs in AutoFocusEngine.
                 } finally {
                     // Build the Review Frames snapshot even if UpdateModel threw (failed/poor fit): the per-frame
                     // detections + bitmaps are exactly what the user needs to "see why the fit looks wrong". The
@@ -705,221 +735,6 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             applicationDispatcher.PostSynchronizationContext(() => AutomaticAdjustmentCommand?.NotifyCanExecuteChanged());
             AutoFocusCompleted = true;
             return true;
-        }
-
-        private async Task SaveRegisteredImages(
-            String saveFolder,
-            SensorModel.RegisteredStar[] registeredStars,
-            Dictionary<int, List<RANSACRegistration.StarTriangle>> trianglesByImage,
-            int referenceImage,
-            bool saveAlignmentImages) {
-            if (string.IsNullOrWhiteSpace(saveFolder)) {
-                Logger.Error("SavePath empty. Not saving registered images");
-                return;
-            }
-            if (!Directory.Exists(saveFolder)) {
-                Logger.Error($"SavePath {saveFolder} does not exist. Not saving registered images");
-                return;
-            }
-
-            Logger.Info($"Saving registered images to {saveFolder}");
-            var colors = new System.Windows.Media.Color[] { Colors.Blue, Colors.Red, Colors.Purple, Colors.Green, Colors.Yellow, Colors.Orange };
-            Dictionary<int, int> outputIndexMap = FullSensorDetectedStars
-                .Select((stars, sourceIdx) => (stars, sourceIdx))
-                .OrderBy(x => x.stars.FocuserPosition)
-                .Select((kv, idx) => (kv.sourceIdx, idx))
-                .ToDictionary();
-
-            await Task.WhenAll(Enumerable.Range(0, FullSensorDetectedStars.Count).Select(imageIndex => Task.Run(() => {
-                var detectedStars = FullSensorDetectedStars[imageIndex];
-                var imageToAnnotate = detectedStars.Image.Image;
-                if (imageToAnnotate.Format == PixelFormats.Rgb48) {
-                    using (var source = ImageUtility.BitmapFromSource(imageToAnnotate, System.Drawing.Imaging.PixelFormat.Format48bppRgb)) {
-                        using (var img = new Grayscale(0.2125, 0.7154, 0.0721).Apply(source)) {
-                            imageToAnnotate = ImageUtility.ConvertBitmap(img, PixelFormats.Gray16);
-                            imageToAnnotate.Freeze();
-                        }
-                    }
-                }
-
-                var brushes = colors.Select(c => new SolidBrush(c.ToDrawingColor())).ToArray();
-                var pens = brushes.Select(b => new System.Drawing.Pen(b)).ToArray();
-                var annotationFont = new Font(
-                    starAnnotatorOptions.AnnotationFontFamily.ToDrawingFontFamily(),
-                    starAnnotatorOptions.AnnotationFontSizePoints,
-                    System.Drawing.FontStyle.Regular,
-                    GraphicsUnit.Point);
-
-                var infoBrush = new SolidBrush(Colors.White.ToDrawingColor());
-                var triPenUnmatched = new System.Drawing.Pen(Colors.DarkCyan.ToDrawingColor());
-                var triPenMatched = new System.Drawing.Pen(Colors.Yellow.ToDrawingColor());
-                var triPenReferenceColor = Colors.White.ToDrawingColor();
-                var triPenReferenceBrush = new SolidBrush(triPenReferenceColor);
-                var triPenReference = new System.Drawing.Pen(triPenReferenceBrush);
-                try {
-                    using (var bmp = ImageUtility.Convert16BppTo8Bpp(imageToAnnotate)) {
-                        if (saveAlignmentImages) {
-                            SaveAlignmentImage(saveFolder, referenceImage, imageIndex, outputIndexMap, detectedStars, bmp);
-                        }
-                        SaveRegisteredImage(saveFolder, registeredStars, trianglesByImage, referenceImage, imageIndex, outputIndexMap, detectedStars, brushes, pens, annotationFont, infoBrush, triPenMatched, triPenReferenceBrush, triPenReference, bmp);
-                    }
-                } finally {
-                    foreach (var p in pens) {
-                        p.Dispose();
-                    }
-                    foreach (var b in brushes) {
-                        b.Dispose();
-                    }
-                    annotationFont.Dispose();
-                }
-            })));
-        }
-
-        private static void SaveRegisteredImage(
-            string saveFolder,
-            RegisteredStar[] registeredStars,
-            Dictionary<int, List<RANSACRegistration.StarTriangle>> trianglesByImage,
-            int referenceImage,
-            int imageIndex,
-            Dictionary<int, int> outputIndexMap,
-            SensorDetectedStars detectedStars,
-            SolidBrush[] brushes,
-            System.Drawing.Pen[] pens,
-            Font annotationFont,
-            SolidBrush infoBrush,
-            System.Drawing.Pen triPenMatched,
-            SolidBrush triPenReferenceBrush,
-            System.Drawing.Pen triPenReference,
-            Bitmap bmp) {
-            using (var newBitmap = new Bitmap(bmp.Width, bmp.Height, System.Drawing.Imaging.PixelFormat.Format24bppRgb)) {
-                Graphics graphics = Graphics.FromImage(newBitmap);
-                graphics.DrawImage(bmp, 0, 0);
-                graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.HighQuality;
-
-                // indicate RANSAC output by showing the transformed points
-                foreach (var star in detectedStars.StarDetectionResult.StarList) {
-                    float starX = star.Position.X, starY = star.Position.Y;
-                    var xLength = 20;
-                    var yLength = 20;
-
-                    graphics.DrawLine(triPenReference, starX - xLength, starY - yLength, starX + xLength, starY + yLength);
-                    graphics.DrawLine(triPenReference, starX + xLength, starY - yLength, starX - xLength, starY + yLength);
-                }
-
-                for (int starIdx = 0; starIdx < registeredStars.Length; starIdx++) {
-                    var star = registeredStars[starIdx];
-                    var starCenterPen = pens[starIdx % pens.Length];
-                    var annotationBrush = brushes[starIdx % pens.Length];
-                    bool done = false;
-                    foreach (var matchedStar in star.MatchedStars) {
-                        if (matchedStar.ImageIndex == imageIndex) {
-                            var boundingBox = matchedStar.Star.BoundingBox;
-                            float starX = matchedStar.Star.Position.X, starY = matchedStar.Star.Position.Y;
-                            var xLength = Math.Max(1.0f, Math.Min(starX - boundingBox.Left, boundingBox.Right - starX)) / 2.0f;
-                            var yLength = Math.Max(1.0f, Math.Min(starY - boundingBox.Top, boundingBox.Bottom - starY)) / 2.0f;
-
-                            graphics.DrawLine(starCenterPen, starX - xLength, starY, starX + xLength, starY);
-                            graphics.DrawLine(starCenterPen, starX, starY - yLength, starX, starY + yLength);
-                            graphics.DrawString(starIdx.ToString(), annotationFont, annotationBrush, new PointF(matchedStar.Star.Position.X, matchedStar.Star.Position.Y - yLength));
-
-                            if (matchedStar.Star.OriginalPosition.X > 0 || matchedStar.Star.OriginalPosition.Y > 0) {
-                                if (referenceImage != matchedStar.ImageIndex) {
-                                    // image has been aligned with reference - draw line
-                                    Rectangle rectOriginal = new Rectangle(
-                                        (int)(matchedStar.Star.OriginalPosition.X - matchedStar.Star.BoundingBox.Width / 2),
-                                        (int)(matchedStar.Star.OriginalPosition.Y - matchedStar.Star.BoundingBox.Height / 2),
-                                        matchedStar.Star.BoundingBox.Width,
-                                        matchedStar.Star.BoundingBox.Height);
-
-                                    graphics.DrawEllipse(starCenterPen, rectOriginal);
-                                    graphics.DrawLine(starCenterPen, starX, starY, matchedStar.Star.OriginalPosition.X, matchedStar.Star.OriginalPosition.Y);
-                                }
-                            }
-                            break;
-                        }
-                    }
-                    if (done) break;
-                }
-                if (!detectedStars.HasBeenAligned) {
-                    graphics.DrawString($"Image: {imageIndex}, Not aligned", annotationFont, infoBrush, new PointF(0, 0));
-                } else {
-                    if (referenceImage == imageIndex) {
-                        graphics.DrawString($"Image: {imageIndex}, Reference image", annotationFont, infoBrush, new PointF(0, 0));
-                    } else {
-                        graphics.DrawString($"Image: {imageIndex}, Ref: {referenceImage}", annotationFont, infoBrush, new PointF(0, 0));
-                        graphics.DrawString($"Transform: {detectedStars.AlignmentTransform.ToFullString()}", new Font("Arial", 12), new SolidBrush(DrawingColor.White), new PointF(0, 20));
-                    }
-                }
-
-                if ((trianglesByImage != null) && (trianglesByImage.Count > imageIndex)) {
-                    foreach (var tri in trianglesByImage[imageIndex].Where(t => !t.IsReference && t.Matched)) {
-                        graphics.DrawLine(triPenMatched, tri.P1.AsPointF(), tri.P2.AsPointF());
-                        graphics.DrawLine(triPenMatched, tri.P2.AsPointF(), tri.P3.AsPointF());
-                        graphics.DrawLine(triPenMatched, tri.P3.AsPointF(), tri.P1.AsPointF());
-                        graphics.DrawString(tri.MatchString, annotationFont, triPenReferenceBrush, tri.P1.AsPointF());
-                        graphics.DrawString(tri.MatchString, annotationFont, triPenReferenceBrush, tri.P2.AsPointF());
-                        graphics.DrawString(tri.MatchString, annotationFont, triPenReferenceBrush, tri.P3.AsPointF());
-                    }
-                    foreach (var tri in trianglesByImage[imageIndex].Where(t => t.IsReference)) {
-                        graphics.DrawLine(triPenReference, tri.P1.AsPointF(), tri.P2.AsPointF());
-                        graphics.DrawLine(triPenReference, tri.P2.AsPointF(), tri.P3.AsPointF());
-                        graphics.DrawLine(triPenReference, tri.P3.AsPointF(), tri.P1.AsPointF());
-                        graphics.DrawString(tri.MatchString, annotationFont, triPenReferenceBrush, tri.P1.AsPointF());
-                        graphics.DrawString(tri.MatchString, annotationFont, triPenReferenceBrush, tri.P2.AsPointF());
-                        graphics.DrawString(tri.MatchString, annotationFont, triPenReferenceBrush, tri.P3.AsPointF());
-                    }
-                }
-
-                var img = ImageUtility.ConvertBitmap(newBitmap, PixelFormats.Bgr24);
-                img.Freeze();
-
-                var suffix = imageIndex == referenceImage ? "_ref" : "";
-                var filename = $"Registered_Index{outputIndexMap[imageIndex]:00}_Focuser{detectedStars.FocuserPosition}{suffix}.tiff";
-                var targetPath = Path.Combine(saveFolder, filename);
-                using (var fileStream = new FileStream(targetPath, FileMode.Create)) {
-                    BitmapEncoder encoder = new TiffBitmapEncoder();
-                    encoder.Frames.Add(BitmapFrame.Create(img));
-                    encoder.Save(fileStream);
-                }
-                Logger.Info($"Image {imageIndex}: Saved registered image {filename}");
-            }
-        }
-
-        private static void SaveAlignmentImage(string saveFolder, int referenceImage, int imageIndex, Dictionary<int, int> outputIndexMap, SensorDetectedStars detectedStars, Bitmap bmp) {
-            using (var newBitmap = new Bitmap(bmp.Width, bmp.Height, System.Drawing.Imaging.PixelFormat.Format24bppRgb)) {
-                Graphics graphics = Graphics.FromImage(newBitmap);
-                graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.HighQuality;
-
-                // indicate RANSAC output by showing the transformed points
-                foreach (var star in detectedStars.StarDetectionResult.StarList) {
-                    float starX = star.Position.X, starY = star.Position.Y;
-
-                    Point2D ptCenter = new Point2D(star.Position);
-
-                    graphics.FillEllipse(new SolidBrush(DrawingColor.FromArgb((int)(Math.Min(64 + (star.AverageBrightness * 50 * 191), 255)), DrawingColor.White)), star.BoundingBox);
-                }
-
-                graphics.DrawString($"Image: {imageIndex}, {(detectedStars.HasBeenAligned ? $"Aligned to Ref: {referenceImage}" : "Not aligned")}", new Font("Arial", 12), new SolidBrush(DrawingColor.White), new PointF(0, 0));
-                if (detectedStars.HasBeenAligned) {
-                    if (imageIndex == referenceImage) {
-                        graphics.DrawString($"Reference image", new Font("Arial", 12), new SolidBrush(DrawingColor.White), new PointF(0, 20));
-                    } else {
-                        graphics.DrawString($"Transform: {detectedStars.AlignmentTransform.ToFullString()}", new Font("Arial", 12), new SolidBrush(DrawingColor.White), new PointF(0, 20));
-                    }
-                }
-
-                var img = ImageUtility.ConvertBitmap(newBitmap, PixelFormats.Bgr24);
-                img.Freeze();
-
-                var suffix = imageIndex == referenceImage ? "_ref" : "";
-                var filename = $"StarAlignment_Index{outputIndexMap[imageIndex]:00}_Focuser{detectedStars.FocuserPosition}{suffix}.tiff";
-                var targetPath = Path.Combine(saveFolder, filename);
-                using (var fileStream = new FileStream(targetPath, FileMode.Create)) {
-                    BitmapEncoder encoder = new TiffBitmapEncoder();
-                    encoder.Frames.Add(BitmapFrame.Create(img));
-                    encoder.Save(fileStream);
-                }
-            }
         }
 
         private Task<bool> TakeAndAnalyzeExposure(IAutoFocusEngine autoFocusEngine, CancellationToken token) {
@@ -1131,7 +946,9 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
         }
 
         private AutoFocusEngineOptions GetAutoFocusEngineOptions(IAutoFocusEngine autoFocusEngine, SavedAutoFocusAttempt savedAutoFocusAttempt = null) {
-            var options = autoFocusEngine.GetOptions(savedAutoFocusAttempt);
+            // Pass the filter so a per-filter sweep-geometry override applies. Harmless on the replay path, where
+            // the saved attempt short-circuits the lookup entirely.
+            var options = autoFocusEngine.GetOptions(savedAutoFocusAttempt, imagingFilter: GetImagingFilter());
             if (inspectorOptions.FramesPerPoint > 0) {
                 options.FramesPerPoint = inspectorOptions.FramesPerPoint;
             }
@@ -1289,7 +1106,6 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                 return false;
             }
 
-            string outputFolder = null;
             localAnalyzeTask = Task.Run(async () => {
                 var options = resolution.Options;
                 // The regions to analyze (and the sensor-curve-model flag that shapes them) are an Inspector
@@ -1305,7 +1121,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
 
                 autoFocusEngine.Started += AutoFocusEngine_Started;
                 autoFocusEngine.Failed += AutoFocusEngine_Failed;
-                autoFocusEngine.Completed += AutoFocusEngine_CompletedNoReport;
+                autoFocusEngine.Completed += AutoFocusEngine_CompletedReplay;
                 autoFocusEngine.MeasurementPointCompleted += AutoFocusEngine_MeasurementPointCompleted;
                 autoFocusEngine.SubMeasurementPointCompleted += AutoFocusEngine_SubMeasurementPointCompleted;
 
@@ -1321,14 +1137,11 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                     return false;
                 }
 
-                outputFolder = result.SaveFolder;
-
                 var autoFocusAnalysisResult = await AnalyzeAutoFocusResult(
                     options,
                     result,
                     sensorCurveModelEnabled: sensorCurveModelEnabled,
-                    ct: localAnalyzeCts.Token,
-                    true);
+                    ct: localAnalyzeCts.Token);
                 if (!autoFocusAnalysisResult) {
                     Notification.ShowError("AutoFocus Analysis Failed");
                     InspectorErrorText = "AutoFocus Analysis Failed";
@@ -1387,14 +1200,6 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                 DeactivateAutoFocusAnalysis();
                 return false;
             } catch (Exception e) {
-                if ((inspectorOptions.SaveImagesOnReruns) && (outputFolder != null)) {
-                    await SaveRegisteredImages(outputFolder,
-                        SensorModel.SensorModelResult.RegisteredStars,
-                        SensorModel.TrianglesByImage,
-                        SensorModel.ReferenceImage,
-                        inspectorOptions.SaveAlignmentImages);
-                }
-
                 Notification.ShowError($"Inspection auto focus rerun analysis failed: {e.Message}");
                 InspectorErrorText = $"Inspection AutoFocus Rerun analysis failed\n{e.Message}";
                 Logger.Error("Inspection auto focus rerun analysis failed", e);
@@ -1458,7 +1263,12 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             }
         }
 
-        private void GenerateReport(AutoFocusCompletedEventArgs e) {
+        /// <summary>
+        /// Builds one <see cref="HocusFocusReport"/> per Inspector region from a completed run. Indexes
+        /// <see cref="AutoFocusFinishedEventArgsBase.RegionHFRs"/> up to <see cref="RegionFocusPoints"/>'s length, so
+        /// callers must first confirm the run carries the Inspector grid (see <see cref="HasInspectorRegionLayout"/>).
+        /// </summary>
+        private HocusFocusReport[] BuildRegionReports(AutoFocusCompletedEventArgs e) {
             var regionReports = new HocusFocusReport[RegionFocusPoints.Length];
             for (int regionIndex = 0; regionIndex < RegionFocusPoints.Length; ++regionIndex) {
                 var region = e.RegionHFRs[regionIndex];
@@ -1469,7 +1279,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                     Timestamp = DateTime.Now,
                     Filter = e.Filter
                 };
-                var report = HocusFocusReport.GenerateReport(
+                regionReports[regionIndex] = HocusFocusReport.GenerateReport(
                     profileService: this.profileService,
                     starDetector: starDetectionSelector.GetBehavior(),
                     focusPoints: RegionFocusPoints[regionIndex],
@@ -1485,16 +1295,29 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                     hocusFocusStarDetectionOptions: this.starDetectionOptions,
                     hocusFocusAutoFocusOptions: this.autoFocusOptions,
                     duration: e.Duration);
-                regionReports[regionIndex] = report;
             }
+            return regionReports;
+        }
 
+        /// <summary>
+        /// Writes <c>attemptNN/autofocus_report_Region{index}.json</c> for every supplied region report under
+        /// <paramref name="saveFolder"/>. Creates the attempt folder rather than assuming the engine already made it:
+        /// the engine only creates it while saving frames, which a rerun over already-saved frames never does.
+        /// </summary>
+        internal static void SaveRegionReports(string saveFolder, int iteration, IReadOnlyList<HocusFocusReport> regionReports) {
+            var attemptFolder = Path.Combine(saveFolder, $"attempt{iteration:00}");
+            Directory.CreateDirectory(attemptFolder);
+            for (int regionIndex = 0; regionIndex < regionReports.Count; ++regionIndex) {
+                var regionReportText = JsonConvert.SerializeObject(regionReports[regionIndex], Formatting.Indented);
+                var targetFilePath = Path.Combine(attemptFolder, $"autofocus_report_Region{regionIndex}.json");
+                File.WriteAllText(targetFilePath, regionReportText);
+            }
+        }
+
+        private void GenerateReport(AutoFocusCompletedEventArgs e) {
+            var regionReports = BuildRegionReports(e);
             if (!string.IsNullOrEmpty(e.SaveFolder)) {
-                for (int regionIndex = 0; regionIndex < RegionFocusPoints.Length; ++regionIndex) {
-                    var regionReport = regionReports[regionIndex];
-                    var regionReportText = JsonConvert.SerializeObject(regionReport, Formatting.Indented);
-                    var targetFilePath = Path.Combine(e.SaveFolder, $"attempt{e.Iteration:00}", $"autofocus_report_Region{regionIndex}.json");
-                    File.WriteAllText(targetFilePath, regionReportText);
-                }
+                SaveRegionReports(e.SaveFolder, e.Iteration, regionReports);
             }
 
             var reportText = JsonConvert.SerializeObject(regionReports[0], Formatting.Indented);
@@ -1513,38 +1336,39 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             GenerateReport(e);
         }
 
-        private void MaybeSaveFailedAutoFocusReports(AutoFocusFailedEventArgs e) {
-            if (!string.IsNullOrEmpty(e.SaveFolder)) {
-                for (int regionIndex = 0; regionIndex < RegionFocusPoints.Length; ++regionIndex) {
-                    var region = e.RegionHFRs[regionIndex];
-                    var finalFocusPoint = new DataPoint(-1.0d, 0.0d);
-                    var lastAutoFocusPoint = new ReportAutoFocusPoint {
-                        Focuspoint = finalFocusPoint,
-                        Temperature = e.Temperature,
-                        Timestamp = DateTime.Now,
-                        Filter = e.Filter
-                    };
-                    var report = HocusFocusReport.GenerateReport(
-                        profileService: this.profileService,
-                        starDetector: starDetectionSelector.GetBehavior(),
-                        focusPoints: RegionFocusPoints[regionIndex],
-                        fittings: region.Fittings,
-                        initialFocusPosition: e.InitialFocusPosition,
-                        initialHFR: region.InitialHFR ?? 0.0d,
-                        finalHFR: region.FinalHFR ?? region.EstimatedFinalHFR,
-                        filter: e.Filter,
-                        temperature: e.Temperature,
-                        focusPoint: finalFocusPoint,
-                        lastFocusPoint: lastAutoFocusPoint,
-                        region: region.Region,
-                        hocusFocusStarDetectionOptions: this.starDetectionOptions,
-                        hocusFocusAutoFocusOptions: this.autoFocusOptions,
-                        duration: e.Duration);
-                    var reportText = JsonConvert.SerializeObject(report, Formatting.Indented);
-                    var targetFilePath = Path.Combine(e.SaveFolder, $"attempt{e.Iteration:00}", $"autofocus_report_Region{regionIndex}.json");
-                    File.WriteAllText(targetFilePath, reportText);
-                }
+        /// <summary>
+        /// Completion handler for the replay paths (re-analyzing an already-saved run). A replay must NOT broadcast a
+        /// successful-AF run to the focuser mediator or drop a report into NINA's watched report directory the way
+        /// <see cref="GenerateReport"/> does — both would announce a focus event that never happened. It does still
+        /// write the per-region reports when the engine created a save folder (AF Options -> Save), so a re-analysis
+        /// is as inspectable as the live run that produced the frames. Best-effort: the analysis has already
+        /// succeeded by the time this runs, so a write failure is logged rather than surfaced through the engine.
+        /// </summary>
+        private void AutoFocusEngine_CompletedReplay(object sender, AutoFocusCompletedEventArgs e) {
+            AutoFocusEngine_CompletedNoReport(sender, e);
+            if (string.IsNullOrEmpty(e.SaveFolder)) {
+                return;
             }
+            // Same grid requirement as CompletedNoReport, which has already logged the mismatch by this point.
+            if (e.RegionHFRs == null || !HasInspectorRegionLayout(e.RegionHFRs.Count)) {
+                return;
+            }
+            try {
+                SaveRegionReports(e.SaveFolder, e.Iteration, BuildRegionReports(e));
+            } catch (Exception ex) {
+                Logger.Error(ex, $"Failed to save per-region AutoFocus reports to {e.SaveFolder}");
+            }
+        }
+
+        private void MaybeSaveFailedAutoFocusReports(AutoFocusFailedEventArgs e) {
+            if (string.IsNullOrEmpty(e.SaveFolder)) {
+                return;
+            }
+            var regionReports = new HocusFocusReport[RegionFocusPoints.Length];
+            for (int regionIndex = 0; regionIndex < RegionFocusPoints.Length; ++regionIndex) {
+                regionReports[regionIndex] = GenerateReportForRegion(e, regionIndex);
+            }
+            SaveRegionReports(e.SaveFolder, e.Iteration, regionReports);
         }
 
         private void AutoFocusEngine_IterationFailed(object sender, AutoFocusFailedEventArgs e) {
@@ -1605,25 +1429,59 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
 
             var fRatio = profileService.ActiveProfile.TelescopeSettings.FocalRatio;
             CriticalFocusMicrons = 2.44 * fRatio * fRatio * 0.55;
-            InnerFocuserPosition = centerFocuser;
-            OuterFocuserPosition = outerFocuserPositionSum / 4;
-            BackfocusFocuserPositionDelta = OuterFocuserPosition - InnerFocuserPosition;
-            if (BackfocusFocuserPositionDelta > 0) {
-                BackfocusDirection = "TOWARDS";
-            } else {
-                BackfocusDirection = "AWAY FROM";
-            }
-            if (InspectorOptions.MicronsPerFocuserStep > 0) {
-                BackfocusMicronDelta = BackfocusFocuserPositionDelta * InspectorOptions.MicronsPerFocuserStep;
-            } else {
-                BackfocusMicronDelta = double.NaN;
-            }
-
-            BackfocusWithinCFZ = Math.Abs(BackfocusMicronDelta) < criticalFocusMicrons;
+            ApplyBackfocusMeasurement(inner: centerFocuser, outer: outerFocuserPositionSum / 4);
             InnerHFR = centerHFR;
             OuterHFR = outerHFRSum / 4;
             BackfocusHFR = OuterHFR - InnerHFR;
         }
+
+        /// <summary>
+        /// Everything derived from the inner/outer best-focus positions: the raw focuser delta, the
+        /// TOWARDS/AWAY FROM wording, the micron conversion, and the critical-focus-zone verdict.
+        ///
+        /// <para>Extracted so the k-invariance guard and the focuser step-size tests drive the same derivation
+        /// the real run does, rather than a partial re-implementation that can silently disagree with it.</para>
+        ///
+        /// <para>The micron conversion reads the EFFECTIVE µm/step (override, else the driver's reported step
+        /// size, else unknown). Unknown stays NaN — the readout drops out rather than showing a fabricated
+        /// number, which is the same graceful degradation this had before the driver became a source.</para>
+        /// </summary>
+        private void ApplyBackfocusMeasurement(double inner, double outer) {
+            InnerFocuserPosition = inner;
+            OuterFocuserPosition = outer;
+            BackfocusFocuserPositionDelta = OuterFocuserPosition - InnerFocuserPosition;
+            BackfocusDirection = BackfocusDirectionFor(BackfocusFocuserPositionDelta);
+            var micronsPerStep = InspectorOptions.EffectiveMicronsPerFocuserStep;
+            BackfocusMicronDelta = micronsPerStep > 0
+                ? BackfocusFocuserPositionDelta * micronsPerStep
+                : double.NaN;
+            BackfocusWithinCFZ = Math.Abs(BackfocusMicronDelta) < criticalFocusMicrons;
+        }
+
+        /// <summary>
+        /// The display-only focuser convention as a sign: +1 standard (increasing focuser position moves the
+        /// camera away from the objective), −1 reversed. Resolved fresh at each presentation call site; it
+        /// never leaves them (docs/focuser-direction-convention-design.md §2.2).
+        /// </summary>
+        internal int FocuserSign => inspectorOptions != null && inspectorOptions.FocuserIncreasesTowardObjective ? -1 : 1;
+
+        /// <summary>
+        /// "Move sensor TOWARDS / AWAY FROM the flattener" for a given outer-minus-inner focuser delta.
+        /// A positive delta means the outer regions focus at a higher position than the center, i.e. the
+        /// curvature effect E_z &gt; 0 — which calls for reducing the spacing only when a higher focuser
+        /// position means "farther from the objective". Hence sign(k)·E_z, which at the default k = +1 is
+        /// exactly the previous unconditional test (design §3, site 4).
+        /// </summary>
+        private string BackfocusDirectionFor(double focuserPositionDelta) =>
+            FocuserSign * focuserPositionDelta > 0 ? "TOWARDS" : "AWAY FROM";
+
+        /// <summary>
+        /// Test seam: the backfocus panel is normally filled by <see cref="UpdateBackfocusMeasurements"/> from a
+        /// completed AutoFocus result. This supplies the same two measured positions directly and runs the real
+        /// derivation, so tests exercise the shipping code rather than a copy of it.
+        /// </summary>
+        internal void SetBackfocusMeasurementForTest(double inner, double outer) =>
+            ApplyBackfocusMeasurement(inner, outer);
 
         // The Inspector region report indexes RegionHFRs[1..5] (center = 1, corners = 2..5), so it needs the full
         // Inspector grid of at least 6 regions. Extracted + internal so the precondition is unit-testable.
@@ -1795,6 +1653,9 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                 ClearAnalysesCommand?.NotifyCanExecuteChanged();
                 SlewToZenithEastCommand?.NotifyCanExecuteChanged();
                 SlewToZenithWestCommand?.NotifyCanExecuteChanged();
+                // Automatic Adjustment is analysis-gated too: its measurement-generation counter only advances
+                // when a run COMPLETES, so without this the button stays live for the whole duration of a sweep.
+                AutomaticAdjustmentCommand?.NotifyCanExecuteChanged();
             });
         }
 
@@ -1946,6 +1807,327 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
 
         public TiltAdapterGuidanceVM TiltGuidance { get; private set; }
 
+        private TiltRunReturnVM runReturn = TiltRunReturnVM.Hidden;
+
+        /// <summary>
+        /// The "Return to this run" panel under the sensor-model history grid. Swapped whole, like
+        /// <see cref="TiltGuidance"/>. Hidden unless a non-newest history row is selected.
+        /// </summary>
+        public TiltRunReturnVM RunReturn {
+            get => runReturn;
+            private set {
+                runReturn = value ?? TiltRunReturnVM.Hidden;
+                RaisePropertyChanged();
+            }
+        }
+
+        /// <summary>
+        /// Set while a past run is being VIEWED, to defuse the one real collision in this UI: selecting an old row
+        /// switches the guidance table to that run's flatten-from-there numbers, which reads far too easily as
+        /// "how to get back there".
+        /// </summary>
+        public string ViewingPastRunNotice { get; private set; } = string.Empty;
+
+        public bool HasViewingPastRunNotice => !string.IsNullOrEmpty(ViewingPastRunNotice);
+
+        public IAsyncRelayCommand ReturnToRunCommand { get; private set; }
+
+        /// <summary>
+        /// Recomputes the return panel and the viewing notice for the currently selected history row. Posted,
+        /// like every other rebuild here, because it is reachable from the device poll thread via the options'
+        /// PropertyChanged and because a command requery off the UI thread throws.
+        /// </summary>
+        private void RebuildRunReturn() {
+            applicationDispatcher.PostSynchronizationContext(() => {
+                var selected = SensorModel?.SelectedTiltHistoryModel;
+                var history = SensorModel?.SensorTiltHistoryModels;
+                if (selected == null || history == null) {
+                    RunReturn = TiltRunReturnVM.Hidden;
+                    ViewingPastRunNotice = string.Empty;
+                    RaiseViewingPastRunNoticeChanged();
+                    ReturnToRunCommand?.NotifyCanExecuteChanged();
+                    return;
+                }
+
+                bool isNewest = history.Count > 0 && ReferenceEquals(history[0], selected);
+                ViewingPastRunNotice = isNewest
+                    ? string.Empty
+                    : $"Viewing run #{selected.HistoryId}. The guidance above flattens the sensor FROM run #{selected.HistoryId}'s state — it is not how to get back to it. " +
+                      "To return the adapter to that state, use \u201cReturn to this run\u201d under Sensor Model Tilt Measurement History.";
+                RaiseViewingPastRunNoticeChanged();
+
+                var options = tiltAdapterOptions;
+                var service = tiltDeviceConnectionService;
+                bool isMotorized = options?.AdjustmentType == TiltAdjustmentType.StepperMotors;
+                var target = TiltRevertPlanFactory.Build(
+                    selected,
+                    SensorModel?.LatestSensorModel,
+                    options,
+                    service?.CurrentPositions,
+                    service?.PositionsKnown ?? false,
+                    options?.DeviceName,
+                    IsCalibrationDeviceLinked(options),
+                    options?.CalibrationIsReliable ?? false);
+
+                RunReturn = TiltRunReturnVM.Build(
+                    selected,
+                    target,
+                    isNewestRun: isNewest,
+                    isMotorized: isMotorized,
+                    deviceConnected: service?.Connected ?? false,
+                    deviceBusy: service?.IsOperationActive ?? false,
+                    angleUnit: options?.AngleDisplayUnit ?? TiltGuidanceAngleUnit.Turns,
+                    labels: screwLabels);
+                ReturnToRunCommand?.NotifyCanExecuteChanged();
+            });
+        }
+
+
+        // --- "Tilt got worse" banner ---------------------------------------------------------------------
+        //
+        // Replaces a modal that appeared after the confirming re-run and asked for a revert decision with none of
+        // the numbers visible. The journal and the controller identity have to survive past
+        // RunAutomaticAdjustmentAsync's return so the banner's button can still act.
+
+        private IReadOnlyList<TiltAdapterMove> pendingRevertJournal;
+
+        // Held ONLY for a ReferenceEquals test, never invoked. The journal's moves are device-relative, not
+        // controller-relative, so the command resolves the live controller at execution time; a stale reference
+        // used to send would be a whole class of bug.
+        private object pendingRevertControllerIdentity;
+
+        public bool TiltWorseningBannerVisible { get; private set; }
+
+        public string TiltWorseningBannerText { get; private set; } = string.Empty;
+
+        /// <summary>Non-empty when the revert cannot run right now; shown in place of the button, saying why.</summary>
+        public string TiltWorseningRevertBlockedReason { get; private set; } = string.Empty;
+
+        public bool CanShowWorseningRevertButton => TiltWorseningBannerVisible
+            && (pendingRevertJournal?.Count ?? 0) > 0
+            && string.IsNullOrEmpty(TiltWorseningRevertBlockedReason);
+
+        public string TiltWorseningRevertButtonText => (pendingRevertJournal?.Count ?? 0) == 1
+            ? "Revert the 1 move"
+            : $"Revert the {pendingRevertJournal?.Count ?? 0} moves";
+
+        public IAsyncRelayCommand RevertLastAdjustmentCommand { get; private set; }
+
+        public ICommand DismissWorseningBannerCommand { get; private set; }
+
+        internal int PendingRevertMoveCountForTest => pendingRevertJournal?.Count ?? 0;
+
+        /// <summary>Pure so the wording can be asserted without driving a whole adjustment.</summary>
+        internal static string BuildWorseningBannerText(double beforeMagnitude, double afterMagnitude, int moveCount) {
+            var moves = moveCount == 1 ? "1 move" : $"{moveCount} moves";
+            return $"Tilt magnitude rose from {beforeMagnitude:0.####} to {afterMagnitude:0.####} after the {moves} " +
+                   "Automatic Adjustment sent. This can indicate a stale calibration, a rotated camera or adapter, or an " +
+                   "incorrect screw-direction setting — investigate before adjusting again.";
+        }
+
+        private void RaiseWorseningBanner(
+                IReadOnlyList<TiltAdapterMove> journal, ITiltMotionController controller, double before, double after) {
+            pendingRevertJournal = journal?.ToArray() ?? Array.Empty<TiltAdapterMove>();
+            pendingRevertControllerIdentity = controller;
+            TiltWorseningBannerVisible = true;
+            TiltWorseningBannerText = BuildWorseningBannerText(before, after, pendingRevertJournal.Count);
+            TiltWorseningRevertBlockedReason = string.Empty;
+            RaiseWorseningBannerChanged();
+        }
+
+        /// <summary>
+        /// Clears the banner. Called on dismiss, after a revert, when a new analysis completes, and by
+        /// ClearAnalyses — a banner describes exactly one measurement PAIR, so once a newer measurement exists its
+        /// claim is stale and offering a revert against fresh numbers would be dangerous.
+        /// </summary>
+        private void ClearWorseningBanner() {
+            if (!TiltWorseningBannerVisible && pendingRevertJournal == null) {
+                return;
+            }
+            pendingRevertJournal = null;
+            pendingRevertControllerIdentity = null;
+            TiltWorseningBannerVisible = false;
+            TiltWorseningBannerText = string.Empty;
+            TiltWorseningRevertBlockedReason = string.Empty;
+            RaiseWorseningBannerChanged();
+        }
+
+        private void RaiseWorseningBannerChanged() {
+            applicationDispatcher.PostSynchronizationContext(() => {
+                RaisePropertyChanged(nameof(TiltWorseningBannerVisible));
+                RaisePropertyChanged(nameof(TiltWorseningBannerText));
+                RaisePropertyChanged(nameof(TiltWorseningRevertBlockedReason));
+                RaisePropertyChanged(nameof(CanShowWorseningRevertButton));
+                RaisePropertyChanged(nameof(TiltWorseningRevertButtonText));
+                RevertLastAdjustmentCommand?.NotifyCanExecuteChanged();
+                // While an offer is outstanding the adjustment button is dead regardless of generation. This term
+                // is what replaces the lock the modal used to provide implicitly by blocking the thread.
+                AutomaticAdjustmentCommand?.NotifyCanExecuteChanged();
+            });
+        }
+
+        /// <summary>A device disconnect does NOT clear the banner — the warning is still true and still useful.</summary>
+        private void RefreshWorseningRevertAvailability() {
+            if (!TiltWorseningBannerVisible) {
+                return;
+            }
+            var service = tiltDeviceConnectionService;
+            string reason;
+            if (service?.Connected != true || service.Controller == null) {
+                reason = "Device disconnected — reconnect the tilt adapter to revert these moves.";
+            } else if (!ReferenceEquals(service.Controller, pendingRevertControllerIdentity)) {
+                reason = "The device reconnected since these moves were sent; verify its position before reverting.";
+            } else {
+                reason = string.Empty;
+            }
+            if (reason != TiltWorseningRevertBlockedReason) {
+                TiltWorseningRevertBlockedReason = reason;
+                RaiseWorseningBannerChanged();
+            }
+        }
+
+        private bool CanExecuteRevertLastAdjustmentNow() {
+            var service = tiltDeviceConnectionService;
+            return CanShowWorseningRevertButton
+                && (service?.Connected ?? false)
+                && service.Controller != null
+                && !service.IsOperationActive
+                && !AnalysisRunning();
+        }
+
+        private async Task RevertLastAdjustmentAsync() {
+            var journal = pendingRevertJournal;
+            var service = tiltDeviceConnectionService;
+            var controller = service?.Controller;
+            if (journal == null || journal.Count == 0 || service == null || controller == null) {
+                return;
+            }
+
+            using var operationToken = service.TryBeginOperation("Revert Adjustment");
+            if (operationToken == null) {
+                Notification.ShowWarning("The tilt adapter device is busy with another operation; try the revert again once it finishes.");
+                return;
+            }
+            if (!service.Connected) {
+                Notification.ShowError("The tilt adapter device disconnected before the revert could execute; nothing was sent.");
+                return;
+            }
+
+            try {
+                await RevertJournalAsync(controller, new List<TiltAdapterMove>(journal), "post-adjustment worsening");
+            } finally {
+                // The confirming re-run already moved measurementGeneration forward, but that measurement was of
+                // the PRE-revert state. Left unbumped, the gate would immediately re-enable Automatic Adjustment
+                // against numbers that no longer describe the device. Consume it so a genuinely NEW analysis is
+                // required. (Verbatim semantics of what the modal path did.)
+                lastExecutedMeasurementGeneration = measurementGeneration;
+                // A partial failure leaves the remaining journal no longer a valid inverse, so it is dropped
+                // either way rather than offered for a second click.
+                ClearWorseningBanner();
+                this.progress.Report(new ApplicationStatus { Status = string.Empty });
+            }
+        }
+
+        private void RaiseViewingPastRunNoticeChanged() {
+            RaisePropertyChanged(nameof(ViewingPastRunNotice));
+            RaisePropertyChanged(nameof(HasViewingPastRunNotice));
+        }
+
+        private void SensorModel_PropertyChanged(object sender, System.ComponentModel.PropertyChangedEventArgs e) {
+            if (e.PropertyName == nameof(Inspection.SensorModel.LatestSensorModel)) {
+                // A newer measurement exists, so the banner's claim about one specific pair of runs is stale.
+                ClearWorseningBanner();
+            }
+            if (e.PropertyName == nameof(Inspection.SensorModel.SelectedTiltHistoryModel)
+                || e.PropertyName == nameof(Inspection.SensorModel.LatestSensorModel)) {
+                RebuildRunReturn();
+            }
+        }
+
+        private bool CanExecuteReturnToRunNow() {
+            var service = tiltDeviceConnectionService;
+            return RunReturn.ShowDriveButton
+                && (service?.Connected ?? false)
+                && service.Controller != null
+                && !service.IsOperationActive
+                && !AnalysisRunning();
+        }
+
+        /// <summary>
+        /// Drives the adapter back to the selected run's recorded motor positions.
+        ///
+        /// <para>The inline panel above has already shown the target, the per-corner delta and any twist warning,
+        /// so the click is informed — but this still confirms before sending. The motion is irreversible and
+        /// EEPROM-persisted, and the approval dialog is also where a plan that trips the device's travel limit can
+        /// be narrowed by dropping the backfocus group.</para>
+        /// </summary>
+        private async Task ReturnToSelectedRunAsync() {
+            var panel = RunReturn;
+            var service = tiltDeviceConnectionService;
+            var options = tiltAdapterOptions;
+            var controller = service?.Controller;
+            if (!panel.IsVisible || panel.Target == null || service == null || options == null || controller == null) {
+                return;
+            }
+
+            var sPerScrew = panel.Target.StepsPerScrew.ToArray();
+            var unitMicrons = panel.Target.UnitMicrons;
+            int maxStepsPerCommand = options.TiltDeviceMaxStepsPerCommand;
+
+            TiltDevicePlanPreview Replanner(bool includeTilt, bool includeBackfocus) =>
+                BuildPlanPreview(sPerScrew, includeTilt, includeBackfocus, unitMicrons, maxStepsPerCommand, controller);
+
+            var choice = await showAdjustmentPromptAsync(
+                Replanner,
+                options.ScrewInwardCurvatureSignIsMeasured,
+                TiltGuidance?.PitchMismatchWarning ?? string.Empty,
+                !service.PositionsKnown,
+                unitMicrons);
+            if (!choice.Proceed) {
+                return;
+            }
+
+            var moves = choice.FinalPlan?.Moves ?? Array.Empty<TiltAdapterMove>();
+            if (moves.Count == 0) {
+                Notification.ShowInformation("Return to run: no moves were needed for the approved groups.");
+                return;
+            }
+
+            using var operationToken = service.TryBeginOperation("Revert to Measurement");
+            if (operationToken == null) {
+                Notification.ShowWarning("The tilt adapter device is busy with another operation; try again once it finishes.");
+                return;
+            }
+            if (!service.Connected || !ReferenceEquals(service.Controller, controller)) {
+                Notification.ShowError("The tilt adapter device disconnected before the return could execute; nothing was sent.");
+                return;
+            }
+
+            var journal = new List<TiltAdapterMove>();
+            try {
+                var statusPrefix = $"Return to run #{panel.TargetRun.HistoryId}";
+                var failure = await SendMovesAsync(controller, moves, statusPrefix, journal, CancellationToken.None);
+
+                if (journal.Count > 0) {
+                    // The device has physically moved, so the fitted model on screen no longer describes it --
+                    // exactly the reason Automatic Adjustment consumes its measurement after sending.
+                    lastExecutedMeasurementGeneration = measurementGeneration;
+                    AutomaticAdjustmentCommand?.NotifyCanExecuteChanged();
+                }
+
+                if (failure != null) {
+                    Logger.Error(failure, "Return to run: move execution failed");
+                    await HandleExecutionFailureAsync(controller, journal, failure);
+                    return;
+                }
+
+                Notification.ShowInformation(
+                    $"Return to run #{panel.TargetRun.HistoryId} complete: {journal.Count} move(s) sent. Re-run the Inspector to confirm.");
+            } finally {
+                this.progress.Report(new ApplicationStatus { Status = string.Empty });
+            }
+        }
+
         // Two-way bound by the Tilt Adapter Guidance dropdown. Writing it flips the persisted option,
         // whose PropertyChanged is already subscribed to RebuildTiltGuidance() (see the constructor),
         // so the numeric strings + legend regenerate in the new unit automatically.
@@ -1980,11 +2162,22 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             int n = HasTiltAdapterCalibration ? tiltAdapterOptions.CalibratedScrewCount : 3;
             var guidance = new TiltAdapterGuidanceVM { ScrewCount = n };
 
+            // Column headings, before any of the amounts: the table names its columns whether or not there
+            // is guidance to put under them. Filled here rather than in the XAML because the names depend on
+            // the selected device and on what the user typed, and this DTO is swapped wholesale (it raises no
+            // per-property notifications), so the headings must travel with the object that carries the values.
+            guidance.FillHeaders(screwLabels, n);
+
             if (HasTiltAdapterCalibration) {
                 // σ resolved for the arrow rows; FillNumericGuidance resolves the same 0→default
                 // rule for the numeric rows.
                 int curvatureSign = tiltAdapterOptions.ScrewInwardCurvatureSign;
                 int resolvedSign = curvatureSign == 0 ? TiltScrewGeometry.DefaultScrewInwardCurvatureSign : curvatureSign;
+                // The display-only focuser convention. It touches the MOTION ARROWS only — the arrows are the
+                // one part of this panel that claims a physical direction ("toward the objective"), and
+                // translating a z-space quantity into that claim needs k. Everything else below (turns,
+                // glyphs, totals, the legend) is σ-frame and must not read it.
+                int focuserSign = FocuserSign;
 
                 var tiltPlane = TiltModel?.TiltPlaneModel;
                 if (tiltPlane != null) {
@@ -2013,8 +2206,10 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                                 tiltArrows[i] = "—";
                             } else {
                                 // turns[i] is CW-positive (the stored response-convention angles encode
-                                // the rig direction), so adapter MOTION toward the objective = −σ·turns.
-                                double ratio = (-resolvedSign * turns[i]) / maxAbs;
+                                // the rig direction). A CW turn drives the plate toward the camera iff
+                                // m = σ·sign(k) = +1, so adapter MOTION toward the objective is
+                                // −σ·sign(k)·turns — which at the default k = +1 is the previous −σ·turns.
+                                double ratio = (-resolvedSign * focuserSign * turns[i]) / maxAbs;
                                 if (ratio >= GuidanceLargeArrowThreshold) tiltArrows[i] = "⬆";
                                 else if (ratio >= GuidanceMinArrowThreshold) tiltArrows[i] = "↑";
                                 else if (ratio <= -GuidanceLargeArrowThreshold) tiltArrows[i] = "⬇";
@@ -2030,11 +2225,13 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                     }
                 }
 
-                // Backfocus row: adapter MOTION needed to null the curvature effect. Toward the
-                // objective ⇔ the local best-focus position must decrease; the σ in "which rotation
-                // is needed" and the σ in "what a rotation does" cancel, so the motion arrow is
-                // sign(CurvatureEffectMicrons) — rig-independent physics (see
-                // docs/tilt-guidance-motion-arrows-design.md).
+                // Backfocus row: adapter MOTION needed to null the curvature effect. The σ in "which
+                // rotation is needed" and the σ in "what a rotation does" cancel, so the arrow does not
+                // depend on the adapter at all — but naming the resulting motion "toward the objective"
+                // still needs the focuser convention, so the test is sign(k)·E_z > 0. At the default
+                // k = +1 that is the previous sign(CurvatureEffectMicrons) (see
+                // docs/tilt-guidance-motion-arrows-design.md and
+                // docs/focuser-direction-convention-design.md §3, site 6).
                 if (SensorModel?.DisplayedSensorModel != null) {
                     double curvatureEffectMicrons = SensorModel.SensorModelResult.CurvatureEffectMicrons;
                     double absMicrons = Math.Abs(curvatureEffectMicrons);
@@ -2043,7 +2240,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                     if (absMicrons < BackfocusNoiseThresholdMicrons) {
                         backfocusArrow = "—";
                     } else {
-                        bool towardObjective = curvatureEffectMicrons > 0;
+                        bool towardObjective = focuserSign * curvatureEffectMicrons > 0;
                         string bigArrow = towardObjective ? "⬆" : "⬇";
                         string smallArrow = towardObjective ? "↑" : "↓";
                         backfocusArrow = absMicrons >= BackfocusLargeArrowThresholdMicrons ? bigArrow : smallArrow;
@@ -2090,6 +2287,12 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                 // canExecute here so they never go stale.
                 RaisePropertyChanged(nameof(AutomaticAdjustmentRemediationVisible));
                 RaisePropertyChanged(nameof(AutomaticAdjustmentRemediationText));
+                // The 2x2 position grid's headings carry the screw names too, and this method already runs on
+                // every tiltAdapterOptions change -- including a device swap and a label edit.
+            RaisePropertyChanged(nameof(ScrewPositionTopRightHeading));
+            RaisePropertyChanged(nameof(ScrewPositionTopLeftHeading));
+            RaisePropertyChanged(nameof(ScrewPositionBottomLeftHeading));
+            RaisePropertyChanged(nameof(ScrewPositionBottomRightHeading));
                 AutomaticAdjustmentCommand?.NotifyCanExecuteChanged();
             });
         }
@@ -2203,6 +2406,9 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
 
         public bool IsTiltDeviceConnected => tiltDeviceConnectionService?.Connected ?? false;
 
+        /// <summary>The shared idle auto-disconnect banner. Null in tests and headless hosts, where it renders nothing.</summary>
+        public TiltDeviceIdleCountdownVM IdleCountdown => HocusFocusPlugin.TiltDeviceIdleCountdown;
+
         // Live per-motor stepper positions for the connected motorized adapter, shown in the Tilt Adapter
         // Guidance section. Device motor order matches the wizard's convention (TR=1, TL=2, BR=3, BL=4); there
         // is no calibration-run baseline here, so — unlike the wizard — these carry no Δ.
@@ -2213,6 +2419,14 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
         public string ScrewPositionBottomRightDisplay => TiltDevicePositionDisplay(2);
 
         public string ScrewPositionBottomLeftDisplay => TiltDevicePositionDisplay(3);
+
+        // Headings for the 2x2 live position grid. Each cell names its corner (how the device's own reports
+        // and the vendor app identify the motor) plus whatever the user calls that screw; the caption beneath
+        // it, static in the XAML, carries the motor and wizard-screw numbers.
+        public string ScrewPositionTopRightHeading => TiltAdapterCorner.ForWizardScrew(1).HeadingWith(screwLabels);
+        public string ScrewPositionTopLeftHeading => TiltAdapterCorner.ForWizardScrew(2).HeadingWith(screwLabels);
+        public string ScrewPositionBottomLeftHeading => TiltAdapterCorner.ForWizardScrew(3).HeadingWith(screwLabels);
+        public string ScrewPositionBottomRightHeading => TiltAdapterCorner.ForWizardScrew(4).HeadingWith(screwLabels);
 
         private string TiltDevicePositionDisplay(int deviceMotorIndex) {
             var svc = tiltDeviceConnectionService;
@@ -2242,10 +2456,24 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             IsTiltDeviceConnected &&
             (!IsCalibrationDeviceLinked(tiltAdapterOptions) || !(tiltAdapterOptions?.CalibrationIsReliable ?? false));
 
-        public string AutomaticAdjustmentRemediationText =>
-            !IsCalibrationDeviceLinked(tiltAdapterOptions)
-                ? "This calibration is not linked to the connected device. Re-run calibration with the device connected."
-                : "This calibration is low-confidence (it did not pass quality validation). Re-run calibration to enable Automatic Adjustment.";
+        public string AutomaticAdjustmentRemediationText => AutomaticAdjustmentRemediationTextFor(tiltAdapterOptions);
+
+        /// <summary>
+        /// Pure form of <see cref="AutomaticAdjustmentRemediationText"/>, so the wording is unit-testable
+        /// without a live VM. Names MANUAL ENTRY explicitly when that is the cause: the previous copy said only
+        /// "not linked to the connected device", which is true but gave a user who had just corrected an angle
+        /// by hand no way to connect the message to what they did, and no remedy but a full re-run.
+        /// </summary>
+        internal static string AutomaticAdjustmentRemediationTextFor(ITiltAdapterOptions options) {
+            if (!IsCalibrationDeviceLinked(options)) {
+                return (options?.CalibrationIsManual ?? false)
+                    ? "This calibration was entered or edited by hand, so Automatic Adjustment is disabled — HocusFocus can't " +
+                      "confirm your screw numbering matches the device's motor wiring. Re-run calibration with the " +
+                      "device connected, or trust it explicitly in the Tilt Adapter Wizard."
+                    : "This calibration is not linked to the connected device. Re-run calibration with the device connected.";
+            }
+            return "This calibration is low-confidence (it did not pass quality validation). Re-run calibration to enable Automatic Adjustment.";
+        }
 
         /// <summary>
         /// [CRITICAL GATE] True only when the stored calibration was produced by a completed, connected
@@ -2274,6 +2502,12 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
         /// correspondence) yet still be noise-dominated (measurement noise rivaling the screw-move signal) —
         /// both must hold before automation may run unattended.
         /// </summary>
+        /// <remarks>
+        /// <paramref name="analysisRunning"/> is optional so the existing pure-helper call sites keep compiling.
+        /// It closes a gap the generation counter does not cover: the counter only advances when an analysis
+        /// COMPLETES, so between "sweep started" and "sweep finished" the gate still saw the previous
+        /// measurement as fresh and would happily move the adapter out from under the run in progress.
+        /// </remarks>
         internal static bool CanExecuteAutomaticAdjustment(
             bool serviceConnected,
             bool controllerAvailable,
@@ -2282,13 +2516,17 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             bool hasNumericGuidance,
             bool isOperationActive,
             int currentGeneration,
-            int lastExecutedGeneration) {
+            int lastExecutedGeneration,
+            bool analysisRunning = false,
+            bool revertPending = false) {
             return serviceConnected
                 && controllerAvailable
                 && deviceLinked
                 && calibrationIsReliable
                 && hasNumericGuidance
                 && !isOperationActive
+                && !analysisRunning
+                && !revertPending
                 && currentGeneration > lastExecutedGeneration;
         }
 
@@ -2302,8 +2540,34 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                 hasNumericGuidance: TiltGuidance?.HasNumericGuidance ?? false,
                 isOperationActive: service?.IsOperationActive ?? false,
                 currentGeneration: measurementGeneration,
-                lastExecutedGeneration: lastExecutedMeasurementGeneration);
+                lastExecutedGeneration: lastExecutedMeasurementGeneration,
+                analysisRunning: AnalysisRunning(),
+                revertPending: TiltWorseningBannerVisible);
         }
+
+        /// <summary>
+        /// What the tilt adapter looks like right now, recorded with the run being analysed so the user can later
+        /// ask to be driven back to it.
+        ///
+        /// <para>Reads the SERVICE's CurrentPositions rather than the controller's LastKnownPositions: that is the
+        /// number the panel is showing, and it is the one kept correct in both regimes — fresh from the 5 s poll
+        /// during an ordinary run, and advanced by the PublishControllerPositions call after each move during an
+        /// adjustment lease (which spans the confirming re-run), i.e. exactly the post-move state that produced
+        /// the measurement.</para>
+        /// </summary>
+        private TiltAdapterStateSnapshot CaptureAdapterState() {
+            var svc = tiltDeviceConnectionService;
+            var now = DateTime.UtcNow;
+            var presetName = tiltAdapterOptions?.DeviceName;
+            if (svc == null || !svc.Connected || !svc.PositionsKnown) {
+                return TiltAdapterStateSnapshot.Unknown(now, presetName);
+            }
+            return new TiltAdapterStateSnapshot(now, svc.CurrentPositions, positionsKnown: true, devicePresetName: presetName);
+        }
+
+        // AnalyzeAutoFocusResult needs a full AutoFocusResult that the fixtures already call impractical to build,
+        // so tests exercise the capture directly -- mirroring MeasurementGenerationForTest.
+        internal TiltAdapterStateSnapshot CaptureAdapterStateForTest() => CaptureAdapterState();
 
         /// <summary>Dimensionless tilt magnitude sqrt(Gx² + Gy²) — used for the before/after worsening check.</summary>
         internal static double TiltMagnitude(SensorParaboloidModel model) =>
@@ -2366,14 +2630,10 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
         }
 
         /// <summary>
-        /// Builds one replanner invocation's preview: plans the moves for the given group toggles, then asks
-        /// the controller (via the interface — never a downcast) to order them for minimal peak excursion so
-        /// the approval dialog shows the EXACT execution order (WYSIWYG). A TiltDeviceLimitException from the
-        /// ordering call means either a single move exceeds the per-command cap or every ordering would
-        /// exceed the max excursion — surfaced as a blocking preview (unordered moves shown, matching the
-        /// design doc) rather than propagated, so the dialog can display it instead of crashing. Residuals,
-        /// twist, and the time estimate are unaffected by ordering, so they carry over unchanged from the
-        /// original plan.
+        /// Builds one replanner invocation's preview. The implementation lives in
+        /// <see cref="TiltDevicePlanPreviewBuilder.Build"/> because the wizard's Manual Adjustment panel drives
+        /// the device from a target vector too, and the two surfaces must mean exactly the same thing by "the
+        /// plan"; this stays as the Automatic Adjustment call site's name for it.
         /// </summary>
         internal static TiltDevicePlanPreview BuildPlanPreview(
             IReadOnlyList<double> sPerScrew,
@@ -2382,41 +2642,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             double unitMicrons,
             int maxStepsPerCommand,
             ITiltMotionController controller) {
-            var plan = TiltMovePlanner.Plan(sPerScrew, includeTilt, includeBackfocus, unitMicrons, maxStepsPerCommand);
-            try {
-                var ordered = controller.OrderForMinimalPeakExcursion(plan.Moves);
-                // The controller may PREPEND a backfocus bias so a differential tilt correction never drives a
-                // motor below 0. That bias is a genuine piston -- it shifts backfocus -- so the residual has to
-                // be recomputed from what will actually be sent. Carrying the unbiased plan's residual here
-                // would silently under-report the very backfocus error the bias introduces.
-                var applied = new double[4];
-                foreach (var move in ordered) {
-                    for (int i = 0; i < 4; ++i) {
-                        applied[i] += move.PerCornerSteps[i];
-                    }
-                }
-                var residual = new double[4];
-                for (int i = 0; i < 4; ++i) {
-                    residual[i] = (applied[i] - sPerScrew[i]) * unitMicrons;
-                }
-
-                // The bias is the uniform surplus the controller added on top of what was planned; it lands
-                // equally on all four corners (it is a piston), so the smallest per-corner surplus is it.
-                var planned = new double[4];
-                foreach (var move in plan.Moves) {
-                    for (int i = 0; i < 4; ++i) {
-                        planned[i] += move.PerCornerSteps[i];
-                    }
-                }
-                int biasSteps = (int)Math.Round(Enumerable.Range(0, 4).Min(i => applied[i] - planned[i]));
-                // A prepended bias also adds real execution time; scale the estimate by the per-move rate the
-                // planner used rather than carrying a move count that no longer matches.
-                double perMoveSeconds = plan.Moves.Count > 0 ? plan.EstimatedSeconds / plan.Moves.Count : 0.0;
-                var orderedPlan = new TiltAdapterMovePlan(ordered, residual, plan.TwistResidualSteps, ordered.Count * perMoveSeconds, Math.Max(0, biasSteps));
-                return new TiltDevicePlanPreview(orderedPlan, hardLimitViolated: false, limitWarning: string.Empty);
-            } catch (TiltDeviceLimitException ex) {
-                return new TiltDevicePlanPreview(plan, hardLimitViolated: true, limitWarning: ex.Message);
-            }
+            return TiltDevicePlanPreviewBuilder.Build(sPerScrew, includeTilt, includeBackfocus, unitMicrons, maxStepsPerCommand, controller);
         }
 
         private async Task RunAutomaticAdjustmentAsync() {
@@ -2436,7 +2662,11 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                 return;
             }
 
-            var model = SensorModel?.DisplayedSensorModel;
+            // LatestSensorModel, NOT DisplayedSensorModel: selecting a row in the history grid rewrites the
+            // displayed model with that past run's fit, while the measurement-generation gate still reports
+            // "fresh" — so planning from the display let a completed run + a history click drive the device
+            // from a stale measurement. Only the newest measurement describes the sensor as it is now.
+            var model = SensorModel?.LatestSensorModel;
             if (model == null) {
                 Notification.ShowError("No fitted sensor model is available for Automatic Adjustment.");
                 return;
@@ -2512,73 +2742,101 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             }
 
             var journal = new List<TiltAdapterMove>();
-            Exception failure = null;
-            var moveProgress = new Progress<string>(text => this.progress.Report(new ApplicationStatus { Status = $"Automatic Adjustment: {text}" }));
 
-            for (int i = 0; i < moves.Count; i++) {
-                var move = moves[i];
-                this.progress.Report(new ApplicationStatus { Status = $"Automatic Adjustment: move {i + 1} of {moves.Count} — {move.Description}" });
-                try {
-                    await controller.ExecuteMoveAsync(move, moveProgress, CancellationToken.None);
-                    journal.Add(move);
-                } catch (Exception ex) {
-                    failure = ex;
-                    break;
-                }
-            }
+            // Everything below reports transient per-move status text, and NINA's status bar shows the last
+            // reported line until something reports an empty one (.claude/docs/mvvm-patterns.md, "Status-bar
+            // lines don't clear themselves"). EVERY exit from here — success, cancellation, a failed plan, a
+            // revert, or a revert that itself failed partway — must therefore land in this finally, or the
+            // last "move N of M" / "reverting move N of M" line hangs in the corner of NINA forever.
+            try {
+                Exception failure = await SendMovesAsync(controller, moves, "Automatic Adjustment", journal, CancellationToken.None);
 
-            // Consumed once execution has STARTED (>= 1 move sent), regardless of what happens next (success,
-            // failure, or a later revert) — the same measurement can never drive a second plan.
-            if (journal.Count > 0) {
-                lastExecutedMeasurementGeneration = capturedGeneration;
-                AutomaticAdjustmentCommand?.NotifyCanExecuteChanged();
-            }
-
-            if (failure != null) {
-                Logger.Error(failure, "Automatic Adjustment: move execution failed");
-                await HandleExecutionFailureAsync(controller, journal, failure);
-                return;
-            }
-
-            this.progress.Report(new ApplicationStatus { Status = "Automatic Adjustment: complete" });
-            Notification.ShowInformation($"Automatic Adjustment complete: {journal.Count} move(s) sent.");
-
-            bool confirmRerun = await confirmPromptAsync(
-                "Automatic Adjustment finished sending the approved moves. Re-run the Aberration Inspector to confirm the improvement?",
-                "Confirm Adjustment");
-            if (!confirmRerun) {
-                return;
-            }
-
-            bool analyzed = await reRunAnalysisAsync(CancellationToken.None);
-            if (!analyzed) {
-                Notification.ShowWarning("The confirming Aberration Inspector run did not complete; verify the result manually before adjusting again.");
-                return;
-            }
-
-            var afterModel = SensorModel?.DisplayedSensorModel;
-            double afterTiltMagnitude = TiltMagnitude(afterModel);
-            if (TiltWorsened(beforeTiltMagnitude, afterTiltMagnitude)) {
-                Notification.ShowError(
-                    "Tilt got WORSE after this Automatic Adjustment. This can indicate a stale calibration, a rotated camera/adapter, " +
-                    "or an incorrect curvature-sign setting — investigate before adjusting again.");
-                bool confirmRevert = await confirmPromptAsync(
-                    "Tilt appears WORSE after the moves just applied. Revert them now (send the inverse of each move, in reverse order)?",
-                    "Tilt Worsened — Revert?");
-                if (confirmRevert) {
-                    await RevertJournalAsync(controller, journal, "post-adjustment worsening");
-
-                    // The confirming re-run above incremented measurementGeneration (a new completed
-                    // analysis), but lastExecutedMeasurementGeneration is still stamped with the PRE-revert
-                    // generation this plan was computed from. Left unbumped, the canExecute gate
-                    // (currentGeneration > lastExecutedGeneration) would immediately re-enable the button
-                    // against the STALE, now-reverted DisplayedSensorModel — a second plan computed before
-                    // the user has looked at fresh (post-revert) numbers could over-correct an already-reverted
-                    // device. Consume the confirming measurement so a genuinely NEW analysis is required.
-                    lastExecutedMeasurementGeneration = measurementGeneration;
+                // Consumed once execution has STARTED (>= 1 move sent), regardless of what happens next (success,
+                // failure, or a later revert) — the same measurement can never drive a second plan.
+                if (journal.Count > 0) {
+                    lastExecutedMeasurementGeneration = capturedGeneration;
                     AutomaticAdjustmentCommand?.NotifyCanExecuteChanged();
                 }
+
+                if (failure != null) {
+                    Logger.Error(failure, "Automatic Adjustment: move execution failed");
+                    await HandleExecutionFailureAsync(controller, journal, failure);
+                    return;
+                }
+
+                this.progress.Report(new ApplicationStatus { Status = "Automatic Adjustment: complete" });
+                Notification.ShowInformation($"Automatic Adjustment complete: {journal.Count} move(s) sent.");
+
+                bool confirmRerun = await confirmPromptAsync(
+                    "Automatic Adjustment finished sending the approved moves. Re-run the Aberration Inspector to confirm the improvement?",
+                    "Confirm Adjustment");
+                if (!confirmRerun) {
+                    return;
+                }
+
+                bool analyzed = await reRunAnalysisAsync(CancellationToken.None);
+                if (!analyzed) {
+                    Notification.ShowWarning("The confirming Aberration Inspector run did not complete; verify the result manually before adjusting again.");
+                    return;
+                }
+
+                var afterModel = SensorModel?.LatestSensorModel;
+                double afterTiltMagnitude = TiltMagnitude(afterModel);
+                if (TiltWorsened(beforeTiltMagnitude, afterTiltMagnitude)) {
+                    // The toast is kept verbatim: it is the immediate signal. What is gone is the modal that used
+                    // to follow it, which demanded a revert decision with none of the numbers on screen.
+                    Notification.ShowError(
+                        "Tilt got WORSE after this Automatic Adjustment. This can indicate a stale calibration, a rotated camera/adapter, " +
+                        "or an incorrect curvature-sign setting — investigate before adjusting again.");
+                    RaiseWorseningBanner(journal, controller, beforeTiltMagnitude, afterTiltMagnitude);
+                }
+            } finally {
+                this.progress.Report(new ApplicationStatus { Status = string.Empty });
             }
+        }
+
+        /// <summary>
+        /// Sends a plan's moves in order, appending each confirmed move to <paramref name="journal"/> and
+        /// publishing the device's counters after every one. Returns the exception that stopped execution, or
+        /// null when every move succeeded; the journal is the caller's record of what actually reached the
+        /// device, and is what a revert inverts.
+        ///
+        /// <para>The caller owns the operation lease and the status-bar <c>finally</c> — this method only sends.
+        /// It is shared by every path that drives the adapter (Automatic Adjustment, a return to a past run's
+        /// positions, and the worsening-banner revert) so that the "publish after every move, never issue a
+        /// follow-up <c>cp</c>" rule from <c>.claude/docs/tilt-domain.md</c> is implemented exactly once.</para>
+        /// </summary>
+        private async Task<Exception> SendMovesAsync(
+            ITiltMotionController controller,
+            IReadOnlyList<TiltAdapterMove> moves,
+            string statusPrefix,
+            List<TiltAdapterMove> journal,
+            CancellationToken token) {
+            var moveProgress = new Progress<string>(text => this.progress.Report(new ApplicationStatus { Status = $"{statusPrefix}: {text}" }));
+            for (int i = 0; i < moves.Count; i++) {
+                var move = moves[i];
+                this.progress.Report(new ApplicationStatus { Status = $"{statusPrefix}: move {i + 1} of {moves.Count} — {move.Description}" });
+                try {
+                    await controller.ExecuteMoveAsync(move, moveProgress, token);
+                    journal.Add(move);
+                    // The 'cp' poll is suspended for the whole lease, so the panel's motor counters only
+                    // advance if the moves themselves publish them (see PublishControllerPositions).
+                    RefreshDevicePositionDisplays();
+                } catch (Exception ex) {
+                    return ex;
+                }
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Publishes the device's post-move counters to the panel without any extra device round trip (see
+        /// <see cref="TiltDeviceConnectionService.PublishControllerPositions"/>). Called after every move this
+        /// VM sends — forward and revert alike — because position polling stays suspended for the whole
+        /// Automatic Adjustment lease, which spans the plan, the confirming analysis run, and the revert.
+        /// </summary>
+        private void RefreshDevicePositionDisplays() {
+            tiltDeviceConnectionService?.PublishControllerPositions();
         }
 
         private async Task HandleExecutionFailureAsync(ITiltMotionController controller, List<TiltAdapterMove> journal, Exception failure) {
@@ -2615,6 +2873,9 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                 try {
                     this.progress.Report(new ApplicationStatus { Status = $"Automatic Adjustment: reverting move {journal.Count - i} of {journal.Count} — {inverse.Description}" });
                     await controller.ExecuteMoveAsync(inverse, null, CancellationToken.None);
+                    // Same reason as the forward moves: the panel's counters have to walk back down with the
+                    // revert instead of freezing at the pre-revert values until the lease is released.
+                    RefreshDevicePositionDisplays();
                 } catch (Exception ex) {
                     // Revert itself failed partway: the device's tracked position can no longer be trusted.
                     // There is no interface member to force-invalidate a controller's shadow position, so the
@@ -2674,7 +2935,10 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
         // Default answer is No for every caller of confirmPromptAsync in this file — never proceed with an
         // irreversible hardware action (re-run, revert) just because a dialog was dismissed.
         private static Task<bool> ShowYesNoPromptAsync(string message, string title) {
-            var result = MyMessageBox.Show(message, title, MessageBoxButton.YesNo, MessageBoxResult.No);
+            // Wrapped because these messages quote device errors verbatim (a failed command, its 20 s ack
+            // timeout, the state-dirty warning) on one long line, and MyMessageBox does not wrap: the modal
+            // grows past the screen edge and clips the very question the user has to answer. See DialogText.
+            var result = MyMessageBox.Show(DialogText.Wrap(message), title, MessageBoxButton.YesNo, MessageBoxResult.No);
             return Task.FromResult(result == MessageBoxResult.Yes);
         }
 
@@ -2687,7 +2951,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             string pitchMismatchWarning,
             bool positionsUnknown,
             double unitMicrons) {
-            return TiltDeviceAdjustmentPrompt.ShowAsync(windowServiceFactory, replanner, screwInwardCurvatureSignIsMeasured, pitchMismatchWarning, positionsUnknown, unitMicrons);
+            return TiltDeviceAdjustmentPrompt.ShowAsync(windowServiceFactory, replanner, screwInwardCurvatureSignIsMeasured, pitchMismatchWarning, positionsUnknown, unitMicrons, screwLabels);
         }
 
         private void TiltDeviceConnectionService_PropertyChanged(object sender, System.ComponentModel.PropertyChangedEventArgs e) {
@@ -2708,6 +2972,11 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                 if (e.PropertyName == nameof(TiltDeviceConnectionService.IsOperationActive)) {
                     AutomaticAdjustmentCommand?.NotifyCanExecuteChanged();
                 }
+                // A disconnect does NOT dismiss the worsening banner -- the warning is still true and still
+                // useful. It just explains, in place of the button, why the revert cannot run right now.
+                RefreshWorseningRevertAvailability();
+                RevertLastAdjustmentCommand?.NotifyCanExecuteChanged();
+                RebuildRunReturn();
             });
         }
 
@@ -2781,6 +3050,11 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
 
         public void UpdateDeviceInfo(FocuserInfo deviceInfo) {
             FocuserInfo = deviceInfo;
+            // The single writer of the driver-reported focuser step size (this VM is a Shared MEF singleton
+            // registered as the plugin's focuser consumer). Deliberately unconditional: the setter accepts
+            // only finite, positive values, so a disconnect's StepSize = 0 is dropped there and the last
+            // known value stands. Adding a second guard here would let the two drift apart.
+            InspectorOptions.DriverMicronsPerFocuserStep = deviceInfo.StepSize;
         }
 
         private FocuserInfo focuserInfo = DeviceInfo.CreateDefaultInstance<FocuserInfo>();
@@ -3011,6 +3285,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             ResetErrors();
             RebuildTiltGuidance();
             ClearReviewSnapshot();
+            ClearWorseningBanner();
         }
 
         private void ActivateAutoFocusChart() {

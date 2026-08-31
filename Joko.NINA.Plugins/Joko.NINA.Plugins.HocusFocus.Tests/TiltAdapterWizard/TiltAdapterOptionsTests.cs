@@ -39,6 +39,9 @@ public class TiltAdapterOptionsTests {
             Assert.That(options.DeviceName, Is.EqualTo("Manual"));
             Assert.That(options.ScrewInwardCurvatureSignIsMeasured, Is.False);
             Assert.That(options.MeasureCurvatureDuringCalibration, Is.False);
+            // Default ON (Task 6) -- unlike MeasureCurvatureDuringCalibration above, drift-symmetric
+            // referencing of screw 2 is recommended for every calibration, not an opt-in extra.
+            Assert.That(options.MeasureFinalRebaseline, Is.True);
             Assert.That(options.CalibrationIsManual, Is.False);
             Assert.That(options.TiltDeviceSerialPortName, Is.EqualTo(""));
             Assert.That(options.TiltDeviceMaxStepsPerCommand, Is.EqualTo(200));
@@ -56,10 +59,12 @@ public class TiltAdapterOptionsTests {
         var (options, store, _) = Build();
         options.ScrewInwardCurvatureSignIsMeasured = true;
         options.MeasureCurvatureDuringCalibration = true;
+        options.MeasureFinalRebaseline = false; // default is true, so false is the value that actually persists
         options.CalibrationIsManual = true;
         Assert.Multiple(() => {
             Assert.That(store.GetValueBoolean(nameof(TiltAdapterOptions.ScrewInwardCurvatureSignIsMeasured), false), Is.True);
             Assert.That(store.GetValueBoolean(nameof(TiltAdapterOptions.MeasureCurvatureDuringCalibration), false), Is.True);
+            Assert.That(store.GetValueBoolean(nameof(TiltAdapterOptions.MeasureFinalRebaseline), true), Is.False);
             Assert.That(store.GetValueBoolean(nameof(TiltAdapterOptions.CalibrationIsManual), false), Is.True);
         });
     }
@@ -156,6 +161,7 @@ public class TiltAdapterOptionsTests {
     [TestCase(nameof(TiltAdapterOptions.ScrewInwardCurvatureSign), -1)]
     [TestCase(nameof(TiltAdapterOptions.ScrewInwardCurvatureSignIsMeasured), true)]
     [TestCase(nameof(TiltAdapterOptions.MeasureCurvatureDuringCalibration), true)]
+    [TestCase(nameof(TiltAdapterOptions.MeasureFinalRebaseline), false)] // default is true, so false is the value that actually changes it
     [TestCase(nameof(TiltAdapterOptions.CalibrationIsManual), true)]
     [TestCase(nameof(TiltAdapterOptions.AdjustmentType), TiltAdjustmentType.StepperMotors)]
     [TestCase(nameof(TiltAdapterOptions.AngleDisplayUnit), TiltGuidanceAngleUnit.Degrees)]
@@ -178,6 +184,81 @@ public class TiltAdapterOptionsTests {
         var prop = typeof(TiltAdapterOptions).GetProperty(propertyName);
         prop.SetValue(options, Convert.ChangeType(newValue, prop.PropertyType));
         Assert.That(raised, Does.Contain(propertyName));
+    }
+
+    // ---- One-time migration of measured curvature signs ------------------------------------------------
+    //
+    // Every ScrewInwardCurvatureSign a 6-step calibration wrote before 2026-08-04 came from an inverted
+    // ComputeCurvatureSign, so measured values are deterministically negated on load — exactly once per
+    // profile, guarded by a persisted marker (docs/focuser-direction-convention-design.md §5).
+
+    private const string MigratedKey = "CurvatureSignMeasurementMigrated";
+
+    [Test]
+    public void Migration_NegatesAMeasuredSignOnce_AndSetsTheMarker() {
+        var store = new InMemoryPluginOptionsAccessor();
+        store.SetValueInt32(nameof(TiltAdapterOptions.ScrewInwardCurvatureSign), 1);
+        store.SetValueBoolean(nameof(TiltAdapterOptions.ScrewInwardCurvatureSignIsMeasured), true);
+
+        var options = new TiltAdapterOptions(Substitute.For<IProfileService>(), store);
+
+        Assert.Multiple(() => {
+            Assert.That(options.ScrewInwardCurvatureSign, Is.EqualTo(-1), "measured +1 loads as −1");
+            Assert.That(store.GetValueInt32(nameof(TiltAdapterOptions.ScrewInwardCurvatureSign), 0), Is.EqualTo(-1),
+                "and the correction is persisted, not just held in memory");
+            Assert.That(store.GetValueBoolean(MigratedKey, false), Is.True);
+            Assert.That(options.ScrewInwardCurvatureSignIsMeasured, Is.True, "provenance is preserved");
+        });
+
+        // A second construction over the same store must NOT negate again.
+        var reloaded = new TiltAdapterOptions(Substitute.For<IProfileService>(), store);
+        Assert.That(reloaded.ScrewInwardCurvatureSign, Is.EqualTo(-1), "the marker makes it idempotent");
+    }
+
+    [Test]
+    public void Migration_RunsOnlyOnceAcrossAProfileChange() {
+        var profile = Substitute.For<IProfileService>();
+        var store = new InMemoryPluginOptionsAccessor();
+        store.SetValueInt32(nameof(TiltAdapterOptions.ScrewInwardCurvatureSign), -1);
+        store.SetValueBoolean(nameof(TiltAdapterOptions.ScrewInwardCurvatureSignIsMeasured), true);
+
+        var options = new TiltAdapterOptions(profile, store);
+        Assert.That(options.ScrewInwardCurvatureSign, Is.EqualTo(1), "precondition: migrated on construction");
+
+        // ProfileChanged re-runs InitializeOptions; the marker in the (same) store must suppress it.
+        profile.ProfileChanged += Raise.Event<EventHandler>(profile, EventArgs.Empty);
+
+        Assert.That(options.ScrewInwardCurvatureSign, Is.EqualTo(1), "a profile change must not negate again");
+    }
+
+    [Test]
+    public void Migration_LeavesAnUnmeasuredSignAlone_ButStillSetsTheMarker() {
+        var store = new InMemoryPluginOptionsAccessor();
+        store.SetValueInt32(nameof(TiltAdapterOptions.ScrewInwardCurvatureSign), 1);
+        store.SetValueBoolean(nameof(TiltAdapterOptions.ScrewInwardCurvatureSignIsMeasured), false);
+
+        var options = new TiltAdapterOptions(Substitute.For<IProfileService>(), store);
+
+        Assert.Multiple(() => {
+            // Assumed or hand-set by the wizard's direction combo (which clears IsMeasured) — the user's
+            // value, never the buggy formula's.
+            Assert.That(options.ScrewInwardCurvatureSign, Is.EqualTo(1));
+            Assert.That(store.GetValueBoolean(MigratedKey, false), Is.True, "the marker is set regardless");
+        });
+    }
+
+    [Test]
+    public void Migration_LeavesAZeroSignAlone() {
+        var store = new InMemoryPluginOptionsAccessor();
+        store.SetValueInt32(nameof(TiltAdapterOptions.ScrewInwardCurvatureSign), 0);
+        store.SetValueBoolean(nameof(TiltAdapterOptions.ScrewInwardCurvatureSignIsMeasured), true);
+
+        var options = new TiltAdapterOptions(Substitute.For<IProfileService>(), store);
+
+        Assert.Multiple(() => {
+            Assert.That(options.ScrewInwardCurvatureSign, Is.EqualTo(0), "negating the unset sentinel would be a no-op anyway");
+            Assert.That(store.GetValueBoolean(MigratedKey, false), Is.True);
+        });
     }
 
     [Test]
