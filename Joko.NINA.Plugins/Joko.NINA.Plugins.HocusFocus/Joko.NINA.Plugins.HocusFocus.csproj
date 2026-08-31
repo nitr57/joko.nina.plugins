@@ -60,6 +60,7 @@
   </ItemGroup>
   <ItemGroup Condition="$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::Linux)))">
     <!-- WPF/Win32-only helpers consumed exclusively from XAML, which is excluded on Linux -->
+    <Compile Remove="Controls\EdgeJustifiedWrapPanel.cs" />
     <Compile Remove="Controls\IconizedText.cs" />
     <Compile Remove="StarDetection\Optimization\ClampWindowToWorkArea.cs" />
     <Compile Remove="StarDetection\Optimization\Review\ReviewViewportHostBase.cs" />
